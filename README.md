@@ -16,10 +16,11 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
 - **`workers/*`**: Asynchronous background workers, security analysis jobs, and event consumers. *(Planned)*
 - **`packages/*`**: Shared internal libraries, type definitions, security rules, and utility packages.
   - **`packages/types`** (`@vibeshield/types`): Shared domain contracts, enums, and entities. *(Implemented)*
-  - Other shared packages (`database`, `queue`, `config`): *(Planned)*
+  - **`packages/config`** (`@vibeshield/config`): Shared TypeScript presets (`node.json`, `react.json`). *(Implemented)*
+  - Other shared packages (`database`, `queue`): *(Planned)*
 
 > [!NOTE]
-> `@vibeshield/types` is currently the only implemented package. All deployable applications (`apps/*`), background workers (`workers/*`), and other shared packages (`packages/*`) are planned architecture components.
+> `@vibeshield/types` and `@vibeshield/config` are foundational shared packages. All deployable applications (`apps/*`), background workers (`workers/*`), and other shared packages (`packages/*`) are planned architecture components.
 
 ## Prerequisites
 
@@ -45,5 +46,5 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
 
 ## Development Status
 
-- **Status**: Shared domain contracts established (Task 0.4 completed).
-- Foundational pnpm monorepo structure, TypeScript base configuration, and shared domain contracts (`@vibeshield/types`) are active. Application and worker implementations are pending next phases.
+- **Status**: Shared TypeScript configuration presets established (Task 0.5 completed).
+- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), and shared TypeScript presets (`@vibeshield/config`) are active. Application and worker implementations are pending next phases.

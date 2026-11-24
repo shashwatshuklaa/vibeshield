@@ -185,6 +185,8 @@ importers:
 
   .: {}
 
+  packages/config: {}
+
   packages/types:
     devDependencies:
       typescript:

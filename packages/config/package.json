@@ -1,0 +1,13 @@
+{
+  "name": "@vibeshield/config",
+  "version": "0.1.0",
+  "private": true,
+  "files": [
+    "node.json",
+    "react.json"
+  ],
+  "exports": {
+    "./node": "./node.json",
+    "./react": "./react.json"
+  }
+}
