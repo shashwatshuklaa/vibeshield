@@ -10,14 +10,16 @@ VibeShield aims to empower software engineering and security teams with intellig
 
 VibeShield is structured as a **pnpm workspace monorepo** to maintain code modularity, enable efficient code sharing, and provide reproducible builds across all platform components.
 
-### Planned Directory Layout
+### Workspace Layout
 
 - **`apps/*`**: User-facing applications and core services (e.g., Web dashboard, API gateway). *(Planned)*
 - **`workers/*`**: Asynchronous background workers, security analysis jobs, and event consumers. *(Planned)*
-- **`packages/*`**: Shared internal libraries, type definitions, security rules, and utility packages. *(Planned)*
+- **`packages/*`**: Shared internal libraries, type definitions, security rules, and utility packages.
+  - **`packages/types`** (`@vibeshield/types`): Shared domain contracts, enums, and entities. *(Implemented)*
+  - Other shared packages (`database`, `queue`, `config`): *(Planned)*
 
 > [!NOTE]
-> All applications, background workers, and shared packages listed above are planned architecture components. No application code has been implemented yet.
+> `@vibeshield/types` is currently the only implemented package. All deployable applications (`apps/*`), background workers (`workers/*`), and other shared packages (`packages/*`) are planned architecture components.
 
 ## Prerequisites
 
@@ -36,7 +38,12 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
    pnpm install
    ```
 
+3. **Build Workspace Packages**:
+   ```bash
+   pnpm run build
+   ```
+
 ## Development Status
 
-- **Status**: Workspace initialization phase (Task 0.2 completed).
-- Foundational pnpm monorepo structure, TypeScript base configuration, and root workspace controls are established. Application implementation has not yet started.
+- **Status**: Shared domain contracts established (Task 0.4 completed).
+- Foundational pnpm monorepo structure, TypeScript base configuration, and shared domain contracts (`@vibeshield/types`) are active. Application and worker implementations are pending next phases.
