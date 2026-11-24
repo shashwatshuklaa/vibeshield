@@ -32,9 +32,7 @@ export const baseEnvSchema = z.object({
   /**
    * Logging verbosity level.
    */
-  LOG_LEVEL: z
-    .enum(['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'])
-    .default('info'),
+  LOG_LEVEL: z.enum(['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly']).default('info'),
 });
 
 export type BaseEnv = z.infer<typeof baseEnvSchema>;

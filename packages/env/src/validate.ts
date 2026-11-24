@@ -1,4 +1,4 @@
-import type { ZodType, z } from 'zod';
+import type { ZodTypeAny, z } from 'zod';
 import { EnvValidationError } from './error.js';
 
 /**
@@ -9,7 +9,7 @@ import { EnvValidationError } from './error.js';
  * @returns The parsed and typed environment configuration.
  * @throws {EnvValidationError} If validation fails, containing sanitized, non-leaking error messages.
  */
-export function validateEnv<TSchema extends ZodType<any, any, any>>(
+export function validateEnv<TSchema extends ZodTypeAny>(
   schema: TSchema,
   source: Record<string, string | undefined> = process.env
 ): z.infer<TSchema> {

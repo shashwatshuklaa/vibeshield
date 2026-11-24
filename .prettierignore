@@ -1,0 +1,29 @@
+# Package manager & dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts & output
+dist/
+build/
+out/
+.next/
+*.tsbuildinfo
+
+# Coverage & testing
+coverage/
+.nyc_output/
+
+# Environment files & secrets
+.env
+.env.*
+
+# System & IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Documentation (preserve formatting)
+*.md
+
+# Monorepo artifacts
+pnpm-lock.yaml
