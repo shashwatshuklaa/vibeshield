@@ -17,10 +17,11 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
 - **`packages/*`**: Shared internal libraries, type definitions, security rules, and utility packages.
   - **`packages/types`** (`@vibeshield/types`): Shared domain contracts, enums, and entities. *(Implemented)*
   - **`packages/config`** (`@vibeshield/config`): Shared TypeScript presets (`node.json`, `react.json`). *(Implemented)*
+  - **`packages/env`** (`@vibeshield/env`): Secure environment validation and schema utilities with secret redaction. *(Implemented)*
   - Other shared packages (`database`, `queue`): *(Planned)*
 
 > [!NOTE]
-> `@vibeshield/types` and `@vibeshield/config` are foundational shared packages. All deployable applications (`apps/*`), background workers (`workers/*`), and other shared packages (`packages/*`) are planned architecture components.
+> `@vibeshield/types`, `@vibeshield/config`, and `@vibeshield/env` are foundational shared packages. All deployable applications (`apps/*`), background workers (`workers/*`), and other shared packages (`packages/*`) are planned architecture components.
 
 ## Prerequisites
 
@@ -34,17 +35,23 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
    corepack enable pnpm
    ```
 
-2. **Install Workspace Dependencies**:
+2. **Configure Environment Variables**:
+   Copy `.env.example` to `.env` (or configure your deployment environment):
+   ```bash
+   cp .env.example .env
+   ```
+
+3. **Install Workspace Dependencies**:
    ```bash
    pnpm install
    ```
 
-3. **Build Workspace Packages**:
+4. **Build Workspace Packages**:
    ```bash
    pnpm run build
    ```
 
 ## Development Status
 
-- **Status**: Shared TypeScript configuration presets established (Task 0.5 completed).
-- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), and shared TypeScript presets (`@vibeshield/config`) are active. Application and worker implementations are pending next phases.
+- **Status**: Secure environment validation foundation established (Task 0.6 completed).
+- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), and secure environment configuration foundation (`@vibeshield/env`) are active. Application and worker implementations are pending next phases.
