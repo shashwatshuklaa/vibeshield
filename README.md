@@ -12,7 +12,9 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
 
 ### Workspace Layout
 
-- **`apps/*`**: User-facing applications and core services (e.g., Web dashboard, API gateway). *(Planned)*
+- **`apps/*`**: User-facing applications and core services.
+  - **`apps/api`** (`@vibeshield/api`): Modular monolith backend API (Express + Helmet). *(Implemented)*
+  - **`apps/web`**: Security dashboard frontend (React + Vite). *(Planned)*
 - **`workers/*`**: Asynchronous background workers, security analysis jobs, and event consumers. *(Planned)*
 - **`packages/*`**: Shared internal libraries, type definitions, security rules, and utility packages.
   - **`packages/types`** (`@vibeshield/types`): Shared domain contracts, enums, and entities. *(Implemented)*
@@ -21,7 +23,7 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
   - Other shared packages (`database`, `queue`): *(Planned)*
 
 > [!NOTE]
-> `@vibeshield/types`, `@vibeshield/config`, and `@vibeshield/env` are foundational shared packages. All deployable applications (`apps/*`), background workers (`workers/*`), and other shared packages (`packages/*`) are planned architecture components.
+> `@vibeshield/api`, `@vibeshield/types`, `@vibeshield/config`, and `@vibeshield/env` are active workspaces. Web UI and background workers are planned architecture components.
 
 ## Prerequisites
 
@@ -51,7 +53,12 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
    pnpm run build
    ```
 
+5. **Start the API Service (Development)**:
+   ```bash
+   pnpm --filter @vibeshield/api dev
+   ```
+
 ## Development Status
 
-- **Status**: Secure environment validation foundation established (Task 0.6 completed).
-- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), and secure environment configuration foundation (`@vibeshield/env`) are active. Application and worker implementations are pending next phases.
+- **Status**: Backend API foundation established (Task 1.0 completed).
+- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), secure environment configuration (`@vibeshield/env`), and core Express backend service (`@vibeshield/api`) are active. Frontend UI and background worker implementations are pending next phases.
