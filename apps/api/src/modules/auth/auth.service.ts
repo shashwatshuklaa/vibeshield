@@ -190,7 +190,7 @@ export const mongooseAuthStore: AuthStore = {
           expiresAt: input.nextExpiresAt,
         },
       },
-      { new: true }
+      { returnDocument: 'after' }
     );
     return doc
       ? {
@@ -223,7 +223,7 @@ export const mongooseAuthStore: AuthStore = {
       {
         $set: { revokedAt: now },
       },
-      { new: true }
+      { returnDocument: 'after' }
     );
     return Boolean(doc);
   },

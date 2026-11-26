@@ -63,10 +63,22 @@ pnpm --filter @vibeshield/api start
 ```
 
 ### 6. Running Tests
-Run the Vitest unit and integration suite (mocked/in-memory stores, no running MongoDB instance required):
+Run the fast Vitest unit and in-memory integration suites (no running MongoDB instance required):
 ```bash
 pnpm --filter @vibeshield/api test
 ```
+
+Run the **real MongoDB replica-set integration tests** (from the repository root, requires Docker or `MONGODB_INTEGRATION_URI` + `MONGODB_STANDALONE_URI`):
+```bash
+pnpm run test:integration
+```
+
+`scripts/run-mongo-integration.mjs` automatically starts ephemeral single-node MongoDB replica-set (`--replSet rs0`) and standalone containers on free localhost ports, runs `vitest.integration.config.mts`, and removes the containers afterward. In GitHub Actions CI, `test:integration` runs with `MONGO_IMAGE_TAG=7`.
+
+#### Test Coverage Distinction
+- **Real MongoDB replica-set integration tests** ([organizations.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/organizations.integration.test.ts), [transaction.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/packages/database/src/__tests__/transaction.integration.test.ts)): Exercise actual Mongoose `ClientSession` transactions, WiredTiger `WriteConflict` serialization, rollbacks, unique index `E11000` enforcement, and standalone MongoDB transaction rejection.
+- **In-memory snapshot-simulator & store tests** ([organizations.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/organizations.test.ts), [auth.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/auth.test.ts)): Exercise HTTP routing, Zod schemas, RBAC matrix, CSRF/Origin checks, and simulated snapshot isolation without requiring a database process.
+- **Unit tests** (`auth-crypto.test.ts`, `env.test.ts`, `health.test.ts`, `server.test.ts`, `app.test.ts`): Test cryptography, JWT validation, env parsing, health probes, and HTTP lifecycle.
 
 ## Authentication Architecture
 
@@ -122,4 +134,4 @@ pnpm --filter @vibeshield/api test
   - **Mandatory Contract for Future Project Creation**: Any future operation creating a `Project` inside an organization **must** acquire `acquireOrganizationMutationLock(organizationId, session)` inside its MongoDB transaction before inserting the `Project` document; otherwise concurrent project creation and `deleteOrganization` could commit disjoint writes and leave orphaned projects.
   - **Replica-Set Requirement**: `runInTransaction` relies on MongoDB multi-document transactions, which require a **MongoDB replica set or sharded cluster** (no fallback to non-transactional writes; transient `WriteConflict` retries are handled by MongoDB's bounded `session.withTransaction`).
   - Future scan, finding, and repository services must always resolve `OrganizationAuthContext` first and scope every database query by `organizationId`.
-  - **Known Limitations**: Email invitation delivery and project CRUD are deferred to upcoming tasks; current tests use a snapshot-isolation in-memory simulator (without a global mutex) rather than a live MongoDB replica set, so live WiredTiger `WriteConflict` retries and replica-set transaction behavior still require integration testing against a running MongoDB replica set.
+  - **Known Limitations**: Email invitation delivery and project CRUD are deferred to upcoming tasks. Single-node replica-set integration tests verify real MongoDB transactions, rollbacks, `WriteConflict` locking, and unique indexes, while multi-node replica-set failover and network-partition behavior are outside single-node integration scope.

@@ -8,6 +8,13 @@ export default defineConfig({
       'apps/**/*.{test,spec}.ts',
       'workers/**/*.{test,spec}.ts',
     ],
-    exclude: ['**/node_modules/**', '**/dist/**', '**/build/**', '**/.turbo/**', '**/.next/**'],
+    exclude: [
+      '**/node_modules/**',
+      '**/dist/**',
+      '**/build/**',
+      '**/.turbo/**',
+      '**/.next/**',
+      '**/*.integration.{test,spec}.ts',
+    ],
   },
 });

@@ -211,7 +211,7 @@ export const mongooseOrganizationStore: OrganizationStore = {
     const doc = await OrganizationModel.findOneAndUpdate(
       { _id: organizationId },
       { $set: updates },
-      { new: true, runValidators: true, ...(session ? { session } : {}) }
+      { returnDocument: 'after', runValidators: true, ...(session ? { session } : {}) }
     );
     return doc ? toPublicOrganization(doc) : null;
   },
@@ -389,7 +389,7 @@ export const mongooseOrganizationStore: OrganizationStore = {
     const doc = await OrganizationMembershipModel.findOneAndUpdate(
       { _id: membershipId, organizationId },
       { $set: updates },
-      { new: true, runValidators: true, ...(session ? { session } : {}) }
+      { returnDocument: 'after', runValidators: true, ...(session ? { session } : {}) }
     );
     return doc ? toStoredMembership(doc) : null;
   },

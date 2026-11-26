@@ -102,7 +102,7 @@ export async function acquireOrganizationMutationLock(
   const updated = await OrganizationModel.findOneAndUpdate(
     { _id: organizationId },
     { $inc: { membershipVersion: 1 } },
-    { new: true, session }
+    { returnDocument: 'after', session }
   );
 
   return Boolean(updated);

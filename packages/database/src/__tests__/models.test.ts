@@ -227,7 +227,7 @@ describe('@vibeshield/database models (schema-level tests)', () => {
       expect(findSpy).toHaveBeenCalledWith(
         { _id: orgId },
         { $inc: { membershipVersion: 1 } },
-        { new: true, session: mockSession }
+        { returnDocument: 'after', session: mockSession }
       );
 
       const missing = await acquireOrganizationMutationLock(orgId, mockSession);

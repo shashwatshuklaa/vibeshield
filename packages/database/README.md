@@ -148,8 +148,8 @@ await disconnectDatabase();
 
 ## Known Limitations
 
-- Schema-level unit tests verify Mongoose schema definitions, validators, normalizers, serialization transforms, and index metadata in memory without a running MongoDB server.
-- Actual unique index creation (`E11000` duplicate key enforcement), multi-document transactions, and query plan execution require a live MongoDB replica set instance.
+- `pnpm --filter @vibeshield/database test` runs schema-level and mocked connection unit tests in memory without a running MongoDB server.
+- Real MongoDB transaction behavior (rollback, standalone failure without fallback, WiredTiger write conflicts, and `E11000` unique index enforcement) is verified separately via `pnpm run test:integration` using [transaction.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/packages/database/src/__tests__/transaction.integration.test.ts) and [organizations.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/organizations.integration.test.ts) against ephemeral replica-set and standalone MongoDB containers.
 - `ProjectModel` currently omits repository integration fields (`repositoryUrl`, `defaultBranch`) intentionally; future repository integration tasks will extend `ProjectSchema` without breaking existing tenant isolation.
 
 ## Running Tests & Checks
@@ -158,4 +158,6 @@ await disconnectDatabase();
 pnpm --filter @vibeshield/database test
 pnpm --filter @vibeshield/database typecheck
 pnpm --filter @vibeshield/database build
+# From repository root (requires Docker or MONGODB_INTEGRATION_URI + MONGODB_STANDALONE_URI):
+pnpm run test:integration
 ```
