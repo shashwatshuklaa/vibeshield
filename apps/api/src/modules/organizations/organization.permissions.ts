@@ -15,6 +15,11 @@ export const OrganizationPermission = {
   MEMBER_UPDATE: 'MEMBER_UPDATE',
   MEMBER_REMOVE: 'MEMBER_REMOVE',
   OWNERSHIP_TRANSFER: 'OWNERSHIP_TRANSFER',
+  PROJECT_READ: 'PROJECT_READ',
+  PROJECT_CREATE: 'PROJECT_CREATE',
+  PROJECT_UPDATE: 'PROJECT_UPDATE',
+  PROJECT_ARCHIVE: 'PROJECT_ARCHIVE',
+  PROJECT_RESTORE: 'PROJECT_RESTORE',
 } as const;
 
 export type OrganizationPermissionType =
@@ -57,6 +62,30 @@ export const ORGANIZATION_PERMISSION_MATRIX: Readonly<
   ]),
   [OrganizationPermission.OWNERSHIP_TRANSFER]: new Set<OrganizationRole>([
     OrganizationRoleValue.OWNER,
+  ]),
+  [OrganizationPermission.PROJECT_READ]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+    OrganizationRoleValue.MEMBER,
+    OrganizationRoleValue.VIEWER,
+  ]),
+  [OrganizationPermission.PROJECT_CREATE]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+    OrganizationRoleValue.MEMBER,
+  ]),
+  [OrganizationPermission.PROJECT_UPDATE]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+    OrganizationRoleValue.MEMBER,
+  ]),
+  [OrganizationPermission.PROJECT_ARCHIVE]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+  ]),
+  [OrganizationPermission.PROJECT_RESTORE]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
   ]),
 });
 

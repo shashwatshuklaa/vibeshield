@@ -7,12 +7,15 @@ import {
 import type { AuthService } from '../auth/auth.service.js';
 import { createAuthService } from '../auth/auth.service.js';
 import type { AuthRuntimeConfig } from '../auth/auth.types.js';
+import { createProjectRouter } from '../projects/project.routes.js';
+import type { ProjectService } from '../projects/project.service.js';
 import { createOrganizationController } from './organization.controller.js';
 import { OrganizationPermission } from './organization.permissions.js';
 import { createOrganizationService, type OrganizationService } from './organization.service.js';
 
 export interface OrganizationRouterDependencies {
   organizationService?: OrganizationService;
+  projectService?: ProjectService;
   authService?: Pick<AuthService, 'authenticateAccessToken'>;
   authConfig?: AuthRuntimeConfig;
 }
@@ -85,6 +88,14 @@ export function createOrganizationRouter(
     requireOrgMembership,
     requireOrganizationPermission(OrganizationPermission.OWNERSHIP_TRANSFER),
     controller.transferOwnership
+  );
+
+  router.use(
+    '/:organizationId/projects',
+    createProjectRouter({
+      projectService: dependencies.projectService,
+      requireOrgMembership,
+    })
   );
 
   return router;

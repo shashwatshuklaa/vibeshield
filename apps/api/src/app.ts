@@ -5,6 +5,7 @@ import type { AuthRouterDependencies } from './modules/auth/auth.routes.js';
 import type { AuthRuntimeConfig } from './modules/auth/auth.types.js';
 import type { HealthDependencies } from './modules/health/health.controller.js';
 import type { OrganizationRouterDependencies } from './modules/organizations/organization.routes.js';
+import type { ProjectService } from './modules/projects/project.service.js';
 import { createApiRouter } from './routes/index.js';
 import { notFoundHandler } from './middlewares/not-found.js';
 import { errorHandler } from './middlewares/error-handler.js';
@@ -16,6 +17,7 @@ export interface CreateAppOptions {
   auth?: AuthRouterDependencies;
   authConfig?: AuthRuntimeConfig;
   organizations?: OrganizationRouterDependencies;
+  projectService?: ProjectService;
 }
 
 /**
@@ -30,6 +32,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
     auth,
     authConfig,
     organizations,
+    projectService,
   } = options;
   const app = express();
 
@@ -52,14 +55,18 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   // 4. API v1 routes
   const resolvedAuthDeps = auth ?? (authConfig ? { config: authConfig } : undefined);
-  const resolvedOrgDeps: OrganizationRouterDependencies | undefined =
-    organizations ??
-    (resolvedAuthDeps
+  const resolvedOrgDeps: OrganizationRouterDependencies | undefined = organizations
+    ? {
+        ...organizations,
+        ...(projectService && !organizations.projectService ? { projectService } : {}),
+      }
+    : resolvedAuthDeps || projectService
       ? {
-          authService: resolvedAuthDeps.authService,
-          authConfig: resolvedAuthDeps.config,
+          authService: resolvedAuthDeps?.authService,
+          authConfig: resolvedAuthDeps?.config,
+          projectService,
         }
-      : undefined);
+      : undefined;
 
   app.use(
     apiPrefix,
