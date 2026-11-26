@@ -89,14 +89,23 @@ describe('@vibeshield/database models (schema-level tests)', () => {
       expect(user.status).toBe(UserStatusValue.ACTIVE);
     });
 
-    it('requires email, displayName, and passwordHash', async () => {
+    it('requires email, displayName, and passwordHash (including explicit undefined)', async () => {
       const user = new UserModel({});
       const error = await getValidationError(user);
 
       expect(error).toBeDefined();
-      expect(error?.errors.email).toBeDefined();
-      expect(error?.errors.displayName).toBeDefined();
-      expect(error?.errors.passwordHash).toBeDefined();
+      expect(error?.errors.email?.kind).toBe('required');
+      expect(error?.errors.displayName?.kind).toBe('required');
+      expect(error?.errors.passwordHash?.kind).toBe('required');
+
+      const explicitUndefinedUser = new UserModel({
+        email: undefined,
+        displayName: 'User',
+        passwordHash: 'hash',
+      });
+      const undefinedError = await getValidationError(explicitUndefinedUser);
+      expect(undefinedError?.errors.email?.name).toBe('ValidatorError');
+      expect(undefinedError?.errors.email?.kind).toBe('required');
     });
 
     it('validates email format and status enum', async () => {
@@ -122,7 +131,7 @@ describe('@vibeshield/database models (schema-level tests)', () => {
       }
     });
 
-    it('excludes passwordHash from default selection and JSON/object serialization', () => {
+    it('excludes passwordHash from default selection and JSON/object serialization even when loaded', () => {
       const passwordHashPath = userSchema.path('passwordHash');
       expect(passwordHashPath.options.select).toBe(false);
 
@@ -131,6 +140,9 @@ describe('@vibeshield/database models (schema-level tests)', () => {
         displayName: 'Sec User',
         passwordHash: '$argon2id$very_sensitive_hash_value',
       });
+
+      // Verify passwordHash is present in memory (as when explicitly selected via +passwordHash)
+      expect(user.passwordHash).toBe('$argon2id$very_sensitive_hash_value');
 
       const jsonObj = user.toJSON() as unknown as Record<string, unknown>;
       const plainObj = user.toObject() as unknown as Record<string, unknown>;
@@ -142,6 +154,30 @@ describe('@vibeshield/database models (schema-level tests)', () => {
       expect(plainObj.__v).toBeUndefined();
       expect(serialized).not.toContain('very_sensitive_hash_value');
       expect(serialized).not.toContain('passwordHash');
+    });
+
+    it('normalizes email in Mongoose update payloads', () => {
+      const directUpdateQuery = UserModel.findOneAndUpdate(
+        {},
+        { email: '  Updated.User@Example.COM  ' }
+      ) as unknown as {
+        _castUpdate: (update: Record<string, unknown>) => Record<string, unknown>;
+        getUpdate: () => Record<string, unknown>;
+      };
+      const setUpdateQuery = UserModel.updateOne(
+        {},
+        { $set: { email: '  Second.User@Example.COM  ' } }
+      ) as unknown as {
+        _castUpdate: (update: Record<string, unknown>) => Record<string, unknown>;
+        getUpdate: () => Record<string, unknown>;
+      };
+
+      expect(directUpdateQuery._castUpdate(directUpdateQuery.getUpdate())).toEqual({
+        $set: { email: 'updated.user@example.com' },
+      });
+      expect(setUpdateQuery._castUpdate(setUpdateQuery.getUpdate())).toEqual({
+        $set: { email: 'second.user@example.com' },
+      });
     });
 
     it('defines unique email index and status index', () => {
@@ -173,12 +209,21 @@ describe('@vibeshield/database models (schema-level tests)', () => {
       expect(org.createdBy.equals(creatorId)).toBe(true);
     });
 
-    it('requires name, slug, and createdBy and rejects malformed slugs', async () => {
+    it('requires name, slug, and createdBy (including explicit undefined) and rejects malformed slugs', async () => {
       const missing = new OrganizationModel({});
       const missingErr = await getValidationError(missing);
-      expect(missingErr?.errors.name).toBeDefined();
-      expect(missingErr?.errors.slug).toBeDefined();
-      expect(missingErr?.errors.createdBy).toBeDefined();
+      expect(missingErr?.errors.name?.kind).toBe('required');
+      expect(missingErr?.errors.slug?.kind).toBe('required');
+      expect(missingErr?.errors.createdBy?.kind).toBe('required');
+
+      const undefinedSlug = new OrganizationModel({
+        name: 'Valid Org',
+        slug: undefined,
+        createdBy: new Types.ObjectId(),
+      });
+      const undefinedSlugErr = await getValidationError(undefinedSlug);
+      expect(undefinedSlugErr?.errors.slug?.name).toBe('ValidatorError');
+      expect(undefinedSlugErr?.errors.slug?.kind).toBe('required');
 
       for (const badSlug of ['a', '-leading', 'trailing-', 'double--hyphen', 'has space', 'a_b']) {
         const badOrg = new OrganizationModel({
@@ -188,6 +233,20 @@ describe('@vibeshield/database models (schema-level tests)', () => {
         });
         expect((await getValidationError(badOrg))?.errors.slug).toBeDefined();
       }
+    });
+
+    it('normalizes organization slug in Mongoose update payloads', () => {
+      const query = OrganizationModel.findOneAndUpdate(
+        {},
+        { $set: { slug: '  New-Org-Slug  ' } }
+      ) as unknown as {
+        _castUpdate: (update: Record<string, unknown>) => Record<string, unknown>;
+        getUpdate: () => Record<string, unknown>;
+      };
+
+      expect(query._castUpdate(query.getUpdate())).toEqual({
+        $set: { slug: 'new-org-slug' },
+      });
     });
 
     it('defines ObjectId ref to User and unique slug index', () => {
@@ -299,14 +358,38 @@ describe('@vibeshield/database models (schema-level tests)', () => {
       expect(project.createdBy.equals(creatorId)).toBe(true);
     });
 
-    it('requires organizationId, name, slug, and createdBy', async () => {
+    it('requires organizationId, name, slug, and createdBy (including explicit undefined)', async () => {
       const project = new ProjectModel({});
       const error = await getValidationError(project);
 
-      expect(error?.errors.organizationId).toBeDefined();
-      expect(error?.errors.name).toBeDefined();
-      expect(error?.errors.slug).toBeDefined();
-      expect(error?.errors.createdBy).toBeDefined();
+      expect(error?.errors.organizationId?.kind).toBe('required');
+      expect(error?.errors.name?.kind).toBe('required');
+      expect(error?.errors.slug?.kind).toBe('required');
+      expect(error?.errors.createdBy?.kind).toBe('required');
+
+      const undefinedSlug = new ProjectModel({
+        organizationId: new Types.ObjectId(),
+        name: 'Valid Project',
+        slug: undefined,
+        createdBy: new Types.ObjectId(),
+      });
+      const undefinedSlugErr = await getValidationError(undefinedSlug);
+      expect(undefinedSlugErr?.errors.slug?.name).toBe('ValidatorError');
+      expect(undefinedSlugErr?.errors.slug?.kind).toBe('required');
+    });
+
+    it('normalizes project slug in Mongoose update payloads', () => {
+      const query = ProjectModel.updateOne(
+        {},
+        { $set: { slug: '  Updated-Project-Slug  ' } }
+      ) as unknown as {
+        _castUpdate: (update: Record<string, unknown>) => Record<string, unknown>;
+        getUpdate: () => Record<string, unknown>;
+      };
+
+      expect(query._castUpdate(query.getUpdate())).toEqual({
+        $set: { slug: 'updated-project-slug' },
+      });
     });
 
     it('rejects malformed project slugs', async () => {

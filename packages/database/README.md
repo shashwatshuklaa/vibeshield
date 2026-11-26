@@ -99,8 +99,10 @@ erDiagram
 ## Multi-Tenancy & Service-Layer Guidance
 
 - **Tenant isolation**: Every `Project` strictly requires `organizationId`. API services must always scope project queries and mutations by `organizationId` after verifying an `ACTIVE` `OrganizationMembership` for the authenticated `userId`.
+- **Creator membership boundary**: Storing `organizationId` and `createdBy` on `Project` does **not** prove at the schema level that the creator belongs to that organization. Service-layer handlers must verify active `OrganizationMembership` in `organizationId` before creating or modifying a project.
 - **Multi-org users**: Membership lives in `OrganizationMembershipModel` rather than embedding org lists on `User` or member arrays on `Organization`, allowing users to hold distinct roles across any number of organizations.
-- **Ownership consistency**: `Organization.createdBy` records immutable creation provenance, while active ownership and role permissions come from `OrganizationMembershipModel`. Future service operations creating an organization should create the `Organization` and initial `OWNER` `OrganizationMembership` inside a MongoDB transaction, and prevent demoting or deleting the last `ACTIVE` `OWNER` of an organization.
+- **Ownership consistency**: `Organization.createdBy` is creator provenance, not a substitute for an active `OWNER` membership. Future service operations must create the `Organization` and its initial `OWNER` `OrganizationMembership` together (preferably inside a MongoDB transaction) and prevent removing or demoting the last `ACTIVE` `OWNER` of an organization.
+- **Update & `.lean()` precautions**: Mongoose runs schema setters (`normalizeEmail`, `normalizeSlug`, `trim`, `lowercase`) during standard update casting, but update queries (`updateOne`, `findOneAndUpdate`, `updateMany`) do **not** run schema validators by default unless `{ runValidators: true }` is passed. Likewise, `.lean()` queries bypass Mongoose `toJSON`/`toObject` transforms—never serialize `.lean()` documents that explicitly selected `+passwordHash`.
 - **No model recompilation errors**: Models are registered via `getOrCreateModel()` to safely handle repeated imports or watch-mode reloads.
 
 ## Usage
