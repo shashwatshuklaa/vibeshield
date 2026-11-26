@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 import { ZodError } from 'zod';
-import { AuthError } from '../modules/auth/auth.types.js';
+import { HttpError } from '../utils/http-error.js';
 
 export interface ApiErrorResponse {
   error: {
@@ -21,7 +21,7 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
-  if (err instanceof AuthError) {
+  if (err instanceof HttpError) {
     const body: ApiErrorResponse = {
       error: {
         code: err.code,

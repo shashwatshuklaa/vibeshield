@@ -1,4 +1,4 @@
-import type { ConnectOptions } from 'mongoose';
+import type { ClientSession, ConnectOptions } from 'mongoose';
 
 /**
  * Normalized MongoDB connection states exposed by @vibeshield/database.
@@ -59,7 +59,20 @@ export interface MongooseConnectionLike {
 export interface MongooseClientLike {
   connect: (uri: string, options?: ConnectOptions) => Promise<unknown>;
   disconnect: () => Promise<void>;
+  startSession?: () => Promise<ClientSession>;
   connection: MongooseConnectionLike;
+}
+
+/**
+ * Minimal session-capable client interface for running MongoDB transactions.
+ */
+export interface TransactionSessionLike {
+  withTransaction: <T = unknown>(fn: () => Promise<T>) => Promise<T>;
+  endSession: () => Promise<void>;
+}
+
+export interface TransactionClientLike {
+  startSession: () => Promise<TransactionSessionLike>;
 }
 
 /**

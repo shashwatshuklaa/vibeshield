@@ -2,10 +2,15 @@ import { Router } from 'express';
 import { createAuthRouter, type AuthRouterDependencies } from '../modules/auth/auth.routes.js';
 import type { HealthDependencies } from '../modules/health/health.controller.js';
 import { createHealthRouter } from '../modules/health/health.routes.js';
+import {
+  createOrganizationRouter,
+  type OrganizationRouterDependencies,
+} from '../modules/organizations/organization.routes.js';
 
 export interface ApiRouterDependencies {
   health?: HealthDependencies;
   auth?: AuthRouterDependencies;
+  organizations?: OrganizationRouterDependencies;
 }
 
 /**
@@ -17,6 +22,7 @@ export function createApiRouter(dependencies: ApiRouterDependencies = {}): Route
   // Mount module routes
   router.use(createHealthRouter(dependencies.health));
   router.use('/auth', createAuthRouter(dependencies.auth));
+  router.use('/organizations', createOrganizationRouter(dependencies.organizations));
 
   return router;
 }

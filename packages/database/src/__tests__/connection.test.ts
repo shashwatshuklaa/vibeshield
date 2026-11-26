@@ -7,8 +7,10 @@ import {
   isValidMongoUri,
   mapReadyStateToConnectionState,
   redactMongoUri,
+  runInTransaction,
   type DatabaseLogger,
   type MongooseClientLike,
+  type TransactionClientLike,
 } from '../index.js';
 
 interface MockConnection extends Record<string, unknown> {
@@ -378,6 +380,47 @@ describe('@vibeshield/database', () => {
       expect(logger.warn).toHaveBeenCalledWith(
         '[database] MongoDB connection lost or disconnected.'
       );
+    });
+  });
+
+  describe('runInTransaction', () => {
+    it('executes work inside session.withTransaction and always ends the session', async () => {
+      const endSession = vi.fn(async () => undefined);
+      const withTransaction = vi.fn(async (fn: () => Promise<unknown>) => fn());
+      const mockClient: TransactionClientLike = {
+        startSession: vi.fn(async () => ({ withTransaction, endSession })),
+      };
+
+      const outcome = await runInTransaction(
+        async (session) => {
+          expect(session).toBeDefined();
+          return 'committed';
+        },
+        { client: mockClient }
+      );
+
+      expect(outcome).toBe('committed');
+      expect(withTransaction).toHaveBeenCalledTimes(1);
+      expect(endSession).toHaveBeenCalledTimes(1);
+    });
+
+    it('ends the session and propagates errors without non-transactional fallback', async () => {
+      const endSession = vi.fn(async () => undefined);
+      const withTransaction = vi.fn(async (fn: () => Promise<unknown>) => fn());
+      const mockClient: TransactionClientLike = {
+        startSession: vi.fn(async () => ({ withTransaction, endSession })),
+      };
+
+      await expect(
+        runInTransaction(
+          async () => {
+            throw new Error('TransactionNumbers are only allowed on a replica set member');
+          },
+          { client: mockClient }
+        )
+      ).rejects.toThrow('TransactionNumbers are only allowed on a replica set member');
+
+      expect(endSession).toHaveBeenCalledTimes(1);
     });
   });
 });

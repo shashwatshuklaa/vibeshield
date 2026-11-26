@@ -1,4 +1,4 @@
-import mongoose, { type ConnectOptions } from 'mongoose';
+import mongoose, { type ClientSession, type ConnectOptions } from 'mongoose';
 import type {
   DatabaseConnectOptions,
   DatabaseConnectionState,
@@ -6,6 +6,8 @@ import type {
   DatabaseLogger,
   DatabaseManagerOptions,
   MongooseClientLike,
+  TransactionClientLike,
+  TransactionSessionLike,
 } from './types.js';
 
 /**
@@ -383,4 +385,26 @@ export function isDatabaseConnected(): boolean {
  */
 export function getDatabaseStatus(): DatabaseConnectionStatus {
   return databaseManager.getStatus();
+}
+
+/**
+ * Executes a multi-document database operation inside a MongoDB transaction.
+ * Requires a MongoDB replica set or sharded cluster; never falls back to non-transactional writes.
+ */
+export async function runInTransaction<T>(
+  work: (session: ClientSession) => Promise<T>,
+  options: { client?: TransactionClientLike } = {}
+): Promise<T> {
+  const client = options.client ?? (mongoose as unknown as TransactionClientLike);
+  const session: TransactionSessionLike = await client.startSession();
+
+  try {
+    let result!: T;
+    await session.withTransaction(async () => {
+      result = await work(session as unknown as ClientSession);
+    });
+    return result;
+  } finally {
+    await session.endSession();
+  }
 }

@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import type { AuthRouterDependencies } from './modules/auth/auth.routes.js';
 import type { AuthRuntimeConfig } from './modules/auth/auth.types.js';
 import type { HealthDependencies } from './modules/health/health.controller.js';
+import type { OrganizationRouterDependencies } from './modules/organizations/organization.routes.js';
 import { createApiRouter } from './routes/index.js';
 import { notFoundHandler } from './middlewares/not-found.js';
 import { errorHandler } from './middlewares/error-handler.js';
@@ -14,6 +15,7 @@ export interface CreateAppOptions {
   health?: HealthDependencies;
   auth?: AuthRouterDependencies;
   authConfig?: AuthRuntimeConfig;
+  organizations?: OrganizationRouterDependencies;
 }
 
 /**
@@ -21,7 +23,14 @@ export interface CreateAppOptions {
  * Decoupled from network port listening and database connection for fast integration testing.
  */
 export function createApp(options: CreateAppOptions = {}): Express {
-  const { apiPrefix = '/api/v1', bodyLimit = '1mb', health, auth, authConfig } = options;
+  const {
+    apiPrefix = '/api/v1',
+    bodyLimit = '1mb',
+    health,
+    auth,
+    authConfig,
+    organizations,
+  } = options;
   const app = express();
 
   // 1. Security Headers via Helmet
@@ -42,11 +51,22 @@ export function createApp(options: CreateAppOptions = {}): Express {
   });
 
   // 4. API v1 routes
+  const resolvedAuthDeps = auth ?? (authConfig ? { config: authConfig } : undefined);
+  const resolvedOrgDeps: OrganizationRouterDependencies | undefined =
+    organizations ??
+    (resolvedAuthDeps
+      ? {
+          authService: resolvedAuthDeps.authService,
+          authConfig: resolvedAuthDeps.config,
+        }
+      : undefined);
+
   app.use(
     apiPrefix,
     createApiRouter({
       health,
-      auth: auth ?? (authConfig ? { config: authConfig } : undefined),
+      auth: resolvedAuthDeps,
+      organizations: resolvedOrgDeps,
     })
   );
 

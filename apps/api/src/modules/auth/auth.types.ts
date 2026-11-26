@@ -1,5 +1,6 @@
 import type {} from 'express';
 import type { UserStatus } from '@vibeshield/database';
+import { HttpError } from '../../utils/http-error.js';
 
 export const REFRESH_TOKEN_COOKIE_NAME = 'vs_refresh_token';
 
@@ -72,17 +73,10 @@ export interface LogoutInput {
  * Operational error thrown by authentication and authorization components.
  * Guarantees safe client-facing error messages without stack or secret leakage.
  */
-export class AuthError extends Error {
-  public readonly statusCode: number;
-  public readonly code: string;
-  public readonly details?: unknown;
-
+export class AuthError extends HttpError {
   constructor(statusCode: number, code: string, message: string, details?: unknown) {
-    super(message);
+    super(statusCode, code, message, details);
     this.name = 'AuthError';
-    this.statusCode = statusCode;
-    this.code = code;
-    this.details = details;
   }
 }
 

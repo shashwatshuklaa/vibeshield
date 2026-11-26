@@ -125,6 +125,7 @@ erDiagram
 - **Multi-org users**: Membership lives in `OrganizationMembershipModel` rather than embedding org lists on `User` or member arrays on `Organization`, allowing users to hold distinct roles across any number of organizations.
 - **Ownership consistency**: `Organization.createdBy` is creator provenance, not a substitute for an active `OWNER` membership. Future service operations must create the `Organization` and its initial `OWNER` `OrganizationMembership` together (preferably inside a MongoDB transaction) and prevent removing or demoting the last `ACTIVE` `OWNER` of an organization.
 - **Update & `.lean()` precautions**: Mongoose runs schema setters (`normalizeEmail`, `normalizeSlug`, `trim`, `lowercase`) during standard update casting, but update queries (`updateOne`, `findOneAndUpdate`, `updateMany`) do **not** run schema validators by default unless `{ runValidators: true }` is passed. Likewise, `.lean()` queries bypass Mongoose `toJSON`/`toObject` transforms—never serialize `.lean()` documents that explicitly selected `+passwordHash`.
+- **Transaction support**: `runInTransaction(work)` executes multi-document operations inside `session.withTransaction()` and always closes the session. MongoDB transactions require a **replica set or sharded cluster** and never silently fall back to non-transactional writes.
 - **No model recompilation errors**: Models are registered via `getOrCreateModel()` to safely handle repeated imports or watch-mode reloads.
 
 ## Usage

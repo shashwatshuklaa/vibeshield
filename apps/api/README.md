@@ -95,3 +95,29 @@ pnpm --filter @vibeshield/api test
 - **`POST /api/v1/auth/refresh`**: Atomically rotate refresh cookie, detect reuse, and return `{ accessToken, expiresIn }`.
 - **`GET /api/v1/auth/me`**: Return the authenticated user's safe profile (requires Bearer token + active session).
 - **`POST /api/v1/auth/logout`**: Revoke the current session, clear `vs_refresh_token` cookie, and invalidate the session's access tokens.
+- **`POST /api/v1/organizations`**: Create an organization and initial `ACTIVE` `OWNER` membership inside a MongoDB transaction.
+- **`GET /api/v1/organizations`**: List organizations where the authenticated user holds an `ACTIVE` membership (with user role).
+- **`GET /api/v1/organizations/:organizationId`**: Retrieve organization details (requires `ACTIVE` membership).
+- **`PATCH /api/v1/organizations/:organizationId`**: Update organization `name`/`slug` (`OWNER` or `ADMIN`).
+- **`DELETE /api/v1/organizations/:organizationId`**: Delete an organization and its memberships transactionally (`OWNER` only; blocked if projects exist).
+- **`GET /api/v1/organizations/:organizationId/members`**: List organization members safely (`OWNER`, `ADMIN`, `MEMBER`, `VIEWER`).
+- **`POST /api/v1/organizations/:organizationId/members`**: Add an existing registered user by email (`OWNER` assigns `ADMIN`/`MEMBER`/`VIEWER`; `ADMIN` assigns `MEMBER`/`VIEWER`).
+- **`PATCH /api/v1/organizations/:organizationId/members/:membershipId`**: Update member role/status according to the permission matrix and last-`OWNER` invariant.
+- **`DELETE /api/v1/organizations/:organizationId/members/:membershipId`**: Remove a member or leave the organization (last `ACTIVE` `OWNER` protected).
+- **`POST /api/v1/organizations/:organizationId/transfer-ownership`**: Atomically transfer `OWNER` to another `ACTIVE` member inside a MongoDB transaction (`OWNER` only).
+
+## Organization & RBAC Architecture
+
+- **Centralized Permission Matrix** ([organization.permissions.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/modules/organizations/organization.permissions.ts)):
+  - Roles: `OWNER`, `ADMIN`, `MEMBER`, `VIEWER`.
+  - `OWNER`: Full organization control, `DELETE`, `ADMIN` assignment, member management, and ownership transfer.
+  - `ADMIN`: View/update organization, view members, add/manage/remove `MEMBER` and `VIEWER` roles; cannot manage `OWNER` or `ADMIN` memberships, assign `ADMIN`/`OWNER`, delete the organization, or transfer ownership.
+  - `MEMBER` & `VIEWER`: Read-only access to organization details and member lists (and self-removal/leave); future project permissions will grant `MEMBER` write participation while keeping `VIEWER` read-only.
+  - Anti-escalation rules: No user may modify their own role/status via `PATCH`, assign `OWNER` outside `/transfer-ownership`, or access another organization via ID guessing (non-members, `INVITED`, and `SUSPENDED` memberships receive `404 ORGANIZATION_NOT_FOUND`).
+- **Reusable Authorization Middleware** ([authorize-organization.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/middlewares/authorize-organization.ts)):
+  - `createRequireOrganizationMembershipMiddleware` resolves `ACTIVE` membership once per request and caches `req.organizationAuth` (avoiding duplicate DB queries).
+  - `requireOrganizationPermission` and `requireOrganizationRoles` enforce route-level authorization against the cached context.
+- **Transaction & Isolation Requirements**:
+  - `POST /organizations`, `DELETE /organizations/:id`, owner-affecting member updates/removals, and `POST /transfer-ownership` execute inside MongoDB transactions (`runInTransaction`), which require a **MongoDB replica set or sharded cluster** (never falling back to non-transactional writes).
+  - Future project, scan, finding, and repository services must always resolve `OrganizationAuthContext` first and scope every database query by `organizationId`.
+  - **Known Limitations**: Email invitation delivery and project CRUD are deferred to upcoming tasks; mocked in-memory store tests verify logic and simulated rollbacks rather than live MongoDB replica-set transactions.
