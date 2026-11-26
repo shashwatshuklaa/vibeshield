@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@vibeshield/database": "workspace:*",
     "@vibeshield/env": "workspace:*",
     "@vibeshield/types": "workspace:*",
     "express": "^5.0.0",

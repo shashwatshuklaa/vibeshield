@@ -20,10 +20,11 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
   - **`packages/types`** (`@vibeshield/types`): Shared domain contracts, enums, and entities. *(Implemented)*
   - **`packages/config`** (`@vibeshield/config`): Shared TypeScript presets (`node.json`, `react.json`). *(Implemented)*
   - **`packages/env`** (`@vibeshield/env`): Secure environment validation and schema utilities with secret redaction. *(Implemented)*
-  - Other shared packages (`database`, `queue`): *(Planned)*
+  - **`packages/database`** (`@vibeshield/database`): Reusable MongoDB connectivity and connection lifecycle management built on Mongoose. *(Implemented)*
+  - Other shared packages (`queue`): *(Planned)*
 
 > [!NOTE]
-> `@vibeshield/api`, `@vibeshield/types`, `@vibeshield/config`, and `@vibeshield/env` are active workspaces. Web UI and background workers are planned architecture components.
+> `@vibeshield/api`, `@vibeshield/types`, `@vibeshield/config`, `@vibeshield/env`, and `@vibeshield/database` are active workspaces. Web UI and background workers are planned architecture components.
 
 ## Prerequisites
 
@@ -60,5 +61,5 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
 
 ## Development Status
 
-- **Status**: Backend API foundation established (Task 1.0 completed).
-- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), secure environment configuration (`@vibeshield/env`), and core Express backend service (`@vibeshield/api`) are active. Frontend UI and background worker implementations are pending next phases.
+- **Status**: MongoDB and Mongoose integration foundation established (Task 1.1 completed).
+- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), secure environment configuration (`@vibeshield/env`), MongoDB connection lifecycle package (`@vibeshield/database`), and Express backend service (`@vibeshield/api` with `MONGODB_URI` validation and liveness/readiness probes) are active. Frontend UI and background worker implementations are pending next phases.

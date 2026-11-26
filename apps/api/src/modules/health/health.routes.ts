@@ -1,6 +1,23 @@
 import { Router } from 'express';
-import { getHealthStatus } from './health.controller.js';
+import {
+  createReadinessHandler,
+  getHealthStatus,
+  getLivenessStatus,
+  type HealthDependencies,
+} from './health.controller.js';
 
-export const healthRouter: Router = Router();
+/**
+ * Creates the health router with liveness and readiness endpoints.
+ * Supports dependency injection for testing readiness states without a live database.
+ */
+export function createHealthRouter(dependencies: HealthDependencies = {}): Router {
+  const router: Router = Router();
 
-healthRouter.get('/health', getHealthStatus);
+  router.get('/health', getHealthStatus);
+  router.get('/health/live', getLivenessStatus);
+  router.get('/health/ready', createReadinessHandler(dependencies));
+
+  return router;
+}
+
+export const healthRouter: Router = createHealthRouter();

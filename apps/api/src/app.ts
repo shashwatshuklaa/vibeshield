@@ -1,20 +1,22 @@
 import express, { type Express } from 'express';
 import helmet from 'helmet';
-import { apiRouter } from './routes/index.js';
+import type { HealthDependencies } from './modules/health/health.controller.js';
+import { createApiRouter } from './routes/index.js';
 import { notFoundHandler } from './middlewares/not-found.js';
 import { errorHandler } from './middlewares/error-handler.js';
 
 export interface CreateAppOptions {
   apiPrefix?: string;
   bodyLimit?: string;
+  health?: HealthDependencies;
 }
 
 /**
  * Creates and configures the Express application instance.
- * Decoupled from network port listening for easy, fast integration testing.
+ * Decoupled from network port listening and database connection for fast integration testing.
  */
 export function createApp(options: CreateAppOptions = {}): Express {
-  const { apiPrefix = '/api/v1', bodyLimit = '1mb' } = options;
+  const { apiPrefix = '/api/v1', bodyLimit = '1mb', health } = options;
   const app = express();
 
   // 1. Security Headers via Helmet
@@ -34,7 +36,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
   });
 
   // 4. API v1 routes
-  app.use(apiPrefix, apiRouter);
+  app.use(apiPrefix, createApiRouter({ health }));
 
   // 5. 404 Handler for unmatched routes
   app.use(notFoundHandler);

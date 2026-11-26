@@ -1,3 +1,4 @@
+import { isValidMongoUri } from '@vibeshield/database';
 import { baseEnvSchema, validateEnv, z } from '@vibeshield/env';
 
 /**
@@ -14,6 +15,14 @@ export const apiEnvSchema = baseEnvSchema.extend({
    * Base route prefix for versioned API endpoints.
    */
   API_PREFIX: z.string().default('/api/v1'),
+
+  /**
+   * MongoDB connection URI for the API service.
+   * Validated explicitly without exposing credentials in errors or logs.
+   */
+  MONGODB_URI: z.string().min(1).refine(isValidMongoUri, {
+    message: 'Must be a valid MongoDB connection URI (mongodb:// or mongodb+srv://)',
+  }),
 });
 
 export type ApiEnv = z.infer<typeof apiEnvSchema>;
