@@ -11,8 +11,14 @@ import {
   assertCanAddMemberWithRole,
   assertCanModifyMembership,
   assertCanRemoveMembership,
+  hasOrganizationPermission,
+  OrganizationPermission,
 } from './organization.permissions.js';
-import { mongooseOrganizationStore, type OrganizationStore } from './organization.store.js';
+import {
+  mongooseOrganizationStore,
+  type OrganizationStore,
+  type OrganizationTransactionContext,
+} from './organization.store.js';
 import {
   OrganizationError,
   type AddOrganizationMemberInput,
@@ -40,13 +46,14 @@ export interface OrganizationService {
   listOrganizationsForUser(userId: string): Promise<OrganizationSummary[]>;
   getOrganization(authContext: OrganizationAuthContext): OrganizationSummary;
   updateOrganization(
-    authContext: OrganizationAuthContext,
+    actorUserId: string,
+    organizationId: string,
     input: UpdateOrganizationInput
   ): Promise<OrganizationSummary>;
   deleteOrganization(actorUserId: string, organizationId: string): Promise<void>;
   listMembers(organizationId: string): Promise<OrganizationMemberView[]>;
   addMember(
-    actorRole: OrganizationRole,
+    actorUserId: string,
     organizationId: string,
     input: AddOrganizationMemberInput
   ): Promise<OrganizationMemberView>;
@@ -83,9 +90,25 @@ function toOrganizationSummary(
 }
 
 /**
+ * Acquires the per-organization transaction lock before reading or mutating
+ * organization or membership state, preventing WiredTiger snapshot-isolation write skew.
+ */
+async function requireOrganizationLock(
+  store: OrganizationStore,
+  organizationId: string,
+  tx: OrganizationTransactionContext
+): Promise<void> {
+  const locked = await store.acquireOrganizationLock(organizationId, tx);
+  if (!locked) {
+    throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+  }
+}
+
+/**
  * Creates the multi-tenant organization & RBAC service.
- * Enforces membership boundaries, permission matrix rules, and MongoDB transactions
- * for multi-document ownership invariants.
+ * Every organization-level mutation acquires a per-organization transaction lock
+ * on the parent Organization document and revalidates actor authorization inside
+ * the MongoDB transaction before checking invariants or committing writes.
  */
 export function createOrganizationService(
   dependencies: OrganizationServiceDependencies = {}
@@ -169,7 +192,8 @@ export function createOrganizationService(
     },
 
     async updateOrganization(
-      authContext: OrganizationAuthContext,
+      actorUserId: string,
+      organizationId: string,
       input: UpdateOrganizationInput
     ): Promise<OrganizationSummary> {
       const updates: { name?: string; slug?: string } = {};
@@ -181,11 +205,23 @@ export function createOrganizationService(
       }
 
       try {
-        const updated = await store.updateOrganizationById(authContext.organization.id, updates);
-        if (!updated) {
-          throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
-        }
-        return toOrganizationSummary(updated, authContext.membership.role);
+        return await store.withTransaction(async (tx) => {
+          await requireOrganizationLock(store, organizationId, tx);
+
+          const actorMembership = await store.findActiveMembership(organizationId, actorUserId, tx);
+          if (!actorMembership) {
+            throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+          }
+          if (!hasOrganizationPermission(actorMembership.role, OrganizationPermission.ORG_UPDATE)) {
+            throw new OrganizationError(403, 'FORBIDDEN', 'Insufficient organization permissions');
+          }
+
+          const updated = await store.updateOrganizationById(organizationId, updates, tx);
+          if (!updated) {
+            throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+          }
+          return toOrganizationSummary(updated, actorMembership.role);
+        });
       } catch (error) {
         if (isMongoDuplicateKeyError(error)) {
           throw new OrganizationError(
@@ -200,6 +236,8 @@ export function createOrganizationService(
 
     async deleteOrganization(actorUserId: string, organizationId: string): Promise<void> {
       await store.withTransaction(async (tx) => {
+        await requireOrganizationLock(store, organizationId, tx);
+
         const membership = await store.findActiveMembership(organizationId, actorUserId, tx);
         if (!membership) {
           throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
@@ -230,43 +268,60 @@ export function createOrganizationService(
     },
 
     async addMember(
-      actorRole: OrganizationRole,
+      actorUserId: string,
       organizationId: string,
       input: AddOrganizationMemberInput
     ): Promise<OrganizationMemberView> {
-      assertCanAddMemberWithRole(actorRole, input.role);
-
       const normalizedEmail = normalizeEmail(input.email);
-      const targetUser = await store.findUserByEmail(normalizedEmail);
-      if (!targetUser) {
-        throw new OrganizationError(404, 'USER_NOT_FOUND', 'User with this email was not found');
-      }
-
-      if (targetUser.status !== UserStatusValue.ACTIVE) {
-        throw new OrganizationError(
-          400,
-          'USER_NOT_ACTIVE',
-          'Only active user accounts can be added to an organization'
-        );
-      }
 
       try {
-        const membership = await store.createMembership({
-          userId: targetUser.id,
-          organizationId,
-          role: input.role,
-          status: MembershipStatusValue.ACTIVE,
-        });
+        return await store.withTransaction(async (tx) => {
+          await requireOrganizationLock(store, organizationId, tx);
 
-        return {
-          membershipId: membership.id,
-          userId: targetUser.id,
-          email: targetUser.email,
-          displayName: targetUser.displayName,
-          role: membership.role,
-          status: membership.status,
-          createdAt: membership.createdAt,
-        };
+          const actorMembership = await store.findActiveMembership(organizationId, actorUserId, tx);
+          if (!actorMembership) {
+            throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+          }
+
+          assertCanAddMemberWithRole(actorMembership.role, input.role);
+
+          const targetUser = await store.findUserByEmail(normalizedEmail, tx);
+          if (!targetUser) {
+            throw new OrganizationError(
+              404,
+              'USER_NOT_FOUND',
+              'User with this email was not found'
+            );
+          }
+
+          if (targetUser.status !== UserStatusValue.ACTIVE) {
+            throw new OrganizationError(
+              400,
+              'USER_NOT_ACTIVE',
+              'Only active user accounts can be added to an organization'
+            );
+          }
+
+          const membership = await store.createMembership(
+            {
+              userId: targetUser.id,
+              organizationId,
+              role: input.role,
+              status: MembershipStatusValue.ACTIVE,
+            },
+            tx
+          );
+
+          return {
+            membershipId: membership.id,
+            userId: targetUser.id,
+            email: targetUser.email,
+            displayName: targetUser.displayName,
+            role: membership.role,
+            status: membership.status,
+            createdAt: membership.createdAt,
+          };
+        });
       } catch (error) {
         if (isMongoDuplicateKeyError(error)) {
           throw new OrganizationError(
@@ -290,6 +345,8 @@ export function createOrganizationService(
       }
 
       return store.withTransaction(async (tx) => {
+        await requireOrganizationLock(store, organizationId, tx);
+
         const actorMembership = await store.findActiveMembership(organizationId, actorUserId, tx);
         if (!actorMembership) {
           throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
@@ -350,21 +407,12 @@ export function createOrganizationService(
           throw new OrganizationError(404, 'MEMBERSHIP_NOT_FOUND', 'Membership not found');
         }
 
-        const members = await store.listMembersInOrganization(organizationId);
-        const foundView = members.find((m) => m.membershipId === updated.id);
-        if (foundView) {
-          return {
-            ...foundView,
-            role: updated.role,
-            status: updated.status,
-          };
-        }
-
+        const targetUser = await store.findUserById(updated.userId, tx);
         return {
           membershipId: updated.id,
           userId: updated.userId,
-          email: '',
-          displayName: '',
+          email: targetUser?.email ?? '',
+          displayName: targetUser?.displayName ?? '',
           role: updated.role,
           status: updated.status,
           createdAt: updated.createdAt,
@@ -382,6 +430,8 @@ export function createOrganizationService(
       }
 
       await store.withTransaction(async (tx) => {
+        await requireOrganizationLock(store, organizationId, tx);
+
         const actorMembership = await store.findActiveMembership(organizationId, actorUserId, tx);
         if (!actorMembership) {
           throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
@@ -451,6 +501,8 @@ export function createOrganizationService(
       }
 
       return store.withTransaction(async (tx) => {
+        await requireOrganizationLock(store, organizationId, tx);
+
         const actorMembership = await store.findActiveMembership(organizationId, actorUserId, tx);
         if (!actorMembership) {
           throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');

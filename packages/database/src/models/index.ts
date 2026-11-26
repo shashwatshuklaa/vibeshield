@@ -11,6 +11,7 @@ export {
 export {
   organizationSchema,
   OrganizationModel,
+  acquireOrganizationMutationLock,
   type OrganizationAttributes,
   type OrganizationDocument,
 } from './organization.model.js';

@@ -1,10 +1,22 @@
-import { Schema, type HydratedDocument, type Model, type Types } from 'mongoose';
-import { getOrCreateModel, normalizeSlug, SLUG_REGEX } from '../utils/normalization.js';
+import {
+  Schema,
+  type ClientSession,
+  type HydratedDocument,
+  type Model,
+  type Types,
+} from 'mongoose';
+import {
+  getOrCreateModel,
+  isValidObjectId,
+  normalizeSlug,
+  SLUG_REGEX,
+} from '../utils/normalization.js';
 
 export interface OrganizationAttributes {
   name: string;
   slug: string;
   createdBy: Types.ObjectId;
+  membershipVersion: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -16,6 +28,7 @@ function sanitizeOrganizationSerializedOutput(
   ret: Record<string, unknown>
 ): Record<string, unknown> {
   delete ret.__v;
+  delete ret.membershipVersion;
   return ret;
 }
 
@@ -46,6 +59,12 @@ export const organizationSchema = new Schema<OrganizationAttributes>(
       ref: 'User',
       required: [true, 'Organization creator reference is required'],
     },
+    membershipVersion: {
+      type: Number,
+      required: true,
+      default: 0,
+      min: [0, 'Membership version cannot be negative'],
+    },
   },
   {
     collection: 'organizations',
@@ -64,3 +83,27 @@ organizationSchema.index({ createdBy: 1 }, { name: 'organizations_created_by_idx
 
 export const OrganizationModel: Model<OrganizationAttributes> =
   getOrCreateModel<OrganizationAttributes>('Organization', organizationSchema);
+
+/**
+ * Acquires a per-organization write lock within an active MongoDB transaction by atomically
+ * incrementing `membershipVersion` on the parent Organization document.
+ * Prevents WiredTiger snapshot-isolation write skew across disjoint membership or project documents.
+ *
+ * @returns `true` if the organization exists and the lock was acquired, `false` if not found.
+ */
+export async function acquireOrganizationMutationLock(
+  organizationId: string,
+  session: ClientSession
+): Promise<boolean> {
+  if (!isValidObjectId(organizationId)) {
+    return false;
+  }
+
+  const updated = await OrganizationModel.findOneAndUpdate(
+    { _id: organizationId },
+    { $inc: { membershipVersion: 1 } },
+    { new: true, session }
+  );
+
+  return Boolean(updated);
+}

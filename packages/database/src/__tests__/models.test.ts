@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { Error as MongooseError, Schema, Types, type Document } from 'mongoose';
+import { describe, expect, it, vi } from 'vitest';
+import { Error as MongooseError, Schema, Types, type ClientSession, type Document } from 'mongoose';
 import {
+  acquireOrganizationMutationLock,
   getDatabaseState,
   getOrCreateModel,
   isDatabaseConnected,
@@ -205,8 +206,37 @@ describe('@vibeshield/database models (schema-level tests)', () => {
       expect(await getValidationError(org)).toBeUndefined();
       expect(org.name).toBe('Acme Security');
       expect(org.slug).toBe('acme-sec-01');
+      expect(org.membershipVersion).toBe(0);
       expect(org.createdBy).toBeInstanceOf(Types.ObjectId);
       expect(org.createdBy.equals(creatorId)).toBe(true);
+      expect(
+        (org.toJSON() as unknown as Record<string, unknown>).membershipVersion
+      ).toBeUndefined();
+    });
+
+    it('acquireOrganizationMutationLock increments membershipVersion within the provided session', async () => {
+      const orgId = new Types.ObjectId().toString();
+      const mockSession = { id: 'mock-session' } as unknown as ClientSession;
+      const findSpy = vi
+        .spyOn(OrganizationModel, 'findOneAndUpdate')
+        .mockResolvedValueOnce({ _id: orgId, membershipVersion: 1 } as never)
+        .mockResolvedValueOnce(null as never);
+
+      const acquired = await acquireOrganizationMutationLock(orgId, mockSession);
+      expect(acquired).toBe(true);
+      expect(findSpy).toHaveBeenCalledWith(
+        { _id: orgId },
+        { $inc: { membershipVersion: 1 } },
+        { new: true, session: mockSession }
+      );
+
+      const missing = await acquireOrganizationMutationLock(orgId, mockSession);
+      expect(missing).toBe(false);
+
+      const invalid = await acquireOrganizationMutationLock('invalid-id', mockSession);
+      expect(invalid).toBe(false);
+
+      findSpy.mockRestore();
     });
 
     it('requires name, slug, and createdBy (including explicit undefined) and rejects malformed slugs', async () => {

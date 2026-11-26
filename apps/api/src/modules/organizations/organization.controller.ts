@@ -57,13 +57,14 @@ export function createOrganizationController(organizationService: OrganizationSe
 
     async update(req: Request, res: Response, next: NextFunction): Promise<void> {
       try {
-        if (!req.organizationAuth) {
+        if (!req.auth || !req.organizationAuth) {
           next(new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found'));
           return;
         }
         const parsed = updateOrganizationSchema.parse(req.body);
         const organization = await organizationService.updateOrganization(
-          req.organizationAuth,
+          req.auth.user.id,
+          req.organizationAuth.organization.id,
           parsed
         );
         res.status(200).json({ organization });
@@ -103,13 +104,13 @@ export function createOrganizationController(organizationService: OrganizationSe
 
     async addMember(req: Request, res: Response, next: NextFunction): Promise<void> {
       try {
-        if (!req.organizationAuth) {
+        if (!req.auth || !req.organizationAuth) {
           next(new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found'));
           return;
         }
         const parsed = addOrganizationMemberSchema.parse(req.body);
         const member = await organizationService.addMember(
-          req.organizationAuth.membership.role,
+          req.auth.user.id,
           req.organizationAuth.organization.id,
           parsed
         );

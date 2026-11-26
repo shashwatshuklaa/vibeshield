@@ -1,5 +1,6 @@
 import type { ClientSession } from 'mongoose';
 import {
+  acquireOrganizationMutationLock,
   isValidObjectId,
   MembershipStatusValue,
   OrganizationMembershipModel,
@@ -39,6 +40,10 @@ export interface StoredMembershipRecord {
 
 export interface OrganizationStore {
   withTransaction<T>(work: (tx: OrganizationTransactionContext) => Promise<T>): Promise<T>;
+  acquireOrganizationLock(
+    organizationId: string,
+    tx: OrganizationTransactionContext
+  ): Promise<boolean>;
   createOrganization(
     input: { name: string; slug: string; createdBy: string },
     tx?: OrganizationTransactionContext
@@ -107,7 +112,14 @@ export interface OrganizationStore {
     tx?: OrganizationTransactionContext
   ): Promise<number>;
   countActiveOwners(organizationId: string, tx?: OrganizationTransactionContext): Promise<number>;
-  findUserByEmail(email: string): Promise<StoredUserSummary | null>;
+  findUserByEmail(
+    email: string,
+    tx?: OrganizationTransactionContext
+  ): Promise<StoredUserSummary | null>;
+  findUserById(
+    userId: string,
+    tx?: OrganizationTransactionContext
+  ): Promise<StoredUserSummary | null>;
 }
 
 function asSession(tx?: OrganizationTransactionContext): ClientSession | undefined {
@@ -153,6 +165,14 @@ function toStoredMembership(doc: {
 export const mongooseOrganizationStore: OrganizationStore = {
   async withTransaction<T>(work: (tx: OrganizationTransactionContext) => Promise<T>): Promise<T> {
     return runInTransaction(async (session) => work(session));
+  },
+
+  async acquireOrganizationLock(organizationId, tx) {
+    const session = asSession(tx);
+    if (!session) {
+      throw new Error('Organization mutation lock requires an active MongoDB transaction session');
+    }
+    return acquireOrganizationMutationLock(organizationId, session);
   },
 
   async createOrganization(input, tx) {
@@ -430,8 +450,34 @@ export const mongooseOrganizationStore: OrganizationStore = {
     return query;
   },
 
-  async findUserByEmail(email) {
-    const doc = await UserModel.findOne({ email });
+  async findUserByEmail(email, tx) {
+    const session = asSession(tx);
+    const query = UserModel.findOne({ email });
+    if (session) {
+      query.session(session);
+    }
+    const doc = await query;
+    if (!doc) {
+      return null;
+    }
+    return {
+      id: doc._id.toString(),
+      email: doc.email,
+      displayName: doc.displayName,
+      status: doc.status,
+    };
+  },
+
+  async findUserById(userId, tx) {
+    if (!isValidObjectId(userId)) {
+      return null;
+    }
+    const session = asSession(tx);
+    const query = UserModel.findById(userId);
+    if (session) {
+      query.session(session);
+    }
+    const doc = await query;
     if (!doc) {
       return null;
     }

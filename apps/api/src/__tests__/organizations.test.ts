@@ -34,6 +34,22 @@ interface InMemorySessionRecord {
   lastUsedAt: Date | null;
 }
 
+interface SnapshotTx {
+  startSeq: number;
+  orgs: Map<string, PublicOrganization>;
+  memberships: Map<string, StoredMembershipRecord>;
+  touchedOrgIds: Set<string>;
+  touchedMembershipIds: Set<string>;
+}
+
+class WriteConflictError extends Error {
+  public readonly code = 112;
+  constructor(message = 'WriteConflict error: this operation conflicted with another operation') {
+    super(message);
+    this.name = 'WriteConflictError';
+  }
+}
+
 class InMemorySharedDatabase implements AuthStore, OrganizationStore {
   public readonly users = new Map<string, StoredUserWithPassword>();
   public readonly sessions = new Map<string, InMemorySessionRecord>();
@@ -42,7 +58,29 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
   public memberships = new Map<string, StoredMembershipRecord>();
   public orgIdsWithProjects = new Set<string>();
   public failNextMembershipCreate = false;
-  private txLock: Promise<void> = Promise.resolve();
+  public operationTrace: string[] = [];
+  public writeConflictCount = 0;
+
+  private commitSeq = 0;
+  private orgDocVersions = new Map<string, number>();
+  private membershipDocVersions = new Map<string, number>();
+  private orgLockVersions = new Map<string, number>();
+
+  /**
+   * Optional hook invoked inside `withTransaction` right after `acquireOrganizationLock`
+   * to test deterministic overlapping transaction interleavings without a global lock.
+   */
+  public onAfterLockAcquired?: (organizationId: string, tx: SnapshotTx) => Promise<void>;
+
+  private getOrgsMap(tx?: OrganizationTransactionContext): Map<string, PublicOrganization> {
+    return tx ? (tx as SnapshotTx).orgs : this.organizations;
+  }
+
+  private getMembershipsMap(
+    tx?: OrganizationTransactionContext
+  ): Map<string, StoredMembershipRecord> {
+    return tx ? (tx as SnapshotTx).memberships : this.memberships;
+  }
 
   // --- AuthStore ---
   async createUser(input: {
@@ -148,38 +186,111 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
   async revokeSessionByIdAndUserId(): Promise<void> {}
   async revokeSessionByTokenHash(): Promise<void> {}
 
-  // --- OrganizationStore ---
+  // --- OrganizationStore (Snapshot Isolation Simulator — NO global lock) ---
   async withTransaction<T>(work: (tx: OrganizationTransactionContext) => Promise<T>): Promise<T> {
-    const previous = this.txLock;
-    let release!: () => void;
-    this.txLock = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    const maxRetries = 5;
 
-    await previous;
-    const orgSnapshot = new Map([...this.organizations.entries()].map(([k, v]) => [k, { ...v }]));
-    const membershipSnapshot = new Map(
-      [...this.memberships.entries()].map(([k, v]) => [k, { ...v }])
-    );
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const startSeq = this.commitSeq;
+      const tx: SnapshotTx = {
+        startSeq,
+        orgs: new Map([...this.organizations.entries()].map(([k, v]) => [k, { ...v }])),
+        memberships: new Map([...this.memberships.entries()].map(([k, v]) => [k, { ...v }])),
+        touchedOrgIds: new Set<string>(),
+        touchedMembershipIds: new Set<string>(),
+      };
 
-    try {
-      return await work({ tx: true });
-    } catch (error) {
-      // Simulate MongoDB transaction rollback on failure
-      this.organizations = orgSnapshot;
-      this.memberships = membershipSnapshot;
-      throw error;
-    } finally {
-      release();
+      try {
+        const result = await work(tx);
+
+        // Snapshot-isolation commit validation: conflict only if a written document changed since startSeq
+        for (const orgId of tx.touchedOrgIds) {
+          if ((this.orgDocVersions.get(orgId) ?? 0) > tx.startSeq) {
+            throw new WriteConflictError(`WriteConflict on Organization ${orgId}`);
+          }
+        }
+        for (const membershipId of tx.touchedMembershipIds) {
+          if ((this.membershipDocVersions.get(membershipId) ?? 0) > tx.startSeq) {
+            throw new WriteConflictError(`WriteConflict on OrganizationMembership ${membershipId}`);
+          }
+        }
+
+        // Enforce unique constraints at commit time
+        const seenSlugs = new Set<string>();
+        for (const org of tx.orgs.values()) {
+          if (seenSlugs.has(org.slug)) {
+            const err = new Error('E11000 duplicate slug') as Error & { code: number };
+            err.code = 11000;
+            throw err;
+          }
+          seenSlugs.add(org.slug);
+        }
+        const seenMembers = new Set<string>();
+        for (const m of tx.memberships.values()) {
+          const key = `${m.organizationId}:${m.userId}`;
+          if (seenMembers.has(key)) {
+            const err = new Error('E11000 duplicate membership') as Error & { code: number };
+            err.code = 11000;
+            throw err;
+          }
+          seenMembers.add(key);
+        }
+
+        // Atomic commit
+        this.commitSeq++;
+        this.organizations = tx.orgs;
+        this.memberships = tx.memberships;
+        for (const orgId of tx.touchedOrgIds) {
+          this.orgDocVersions.set(orgId, this.commitSeq);
+        }
+        for (const membershipId of tx.touchedMembershipIds) {
+          this.membershipDocVersions.set(membershipId, this.commitSeq);
+        }
+        return result;
+      } catch (error) {
+        if (error instanceof WriteConflictError && attempt < maxRetries) {
+          this.writeConflictCount++;
+          continue;
+        }
+        throw error;
+      }
     }
+
+    throw new WriteConflictError('Exceeded bounded transaction retries');
   }
 
-  async createOrganization(input: {
-    name: string;
-    slug: string;
-    createdBy: string;
-  }): Promise<PublicOrganization> {
-    for (const org of this.organizations.values()) {
+  async acquireOrganizationLock(
+    organizationId: string,
+    tx: OrganizationTransactionContext
+  ): Promise<boolean> {
+    this.operationTrace.push(`acquireOrganizationLock:${organizationId}`);
+    const snapshotTx = tx as SnapshotTx;
+    const org = snapshotTx.orgs.get(organizationId);
+    if (!org) {
+      return false;
+    }
+
+    snapshotTx.touchedOrgIds.add(organizationId);
+    const prevVersion = this.orgLockVersions.get(organizationId) ?? 0;
+    this.orgLockVersions.set(organizationId, prevVersion + 1);
+
+    if (this.onAfterLockAcquired) {
+      await this.onAfterLockAcquired(organizationId, snapshotTx);
+    }
+
+    return true;
+  }
+
+  async createOrganization(
+    input: {
+      name: string;
+      slug: string;
+      createdBy: string;
+    },
+    tx?: OrganizationTransactionContext
+  ): Promise<PublicOrganization> {
+    const orgs = this.getOrgsMap(tx);
+    for (const org of orgs.values()) {
       if (org.slug === input.slug) {
         const err = new Error('E11000 duplicate slug') as Error & { code: number };
         err.code = 11000;
@@ -195,24 +306,33 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
       createdAt: now,
       updatedAt: now,
     };
-    this.organizations.set(org.id, org);
+    orgs.set(org.id, org);
+    if (tx) {
+      (tx as SnapshotTx).touchedOrgIds.add(org.id);
+    }
     return { ...org };
   }
 
-  async findOrganizationById(organizationId: string): Promise<PublicOrganization | null> {
-    const org = this.organizations.get(organizationId);
+  async findOrganizationById(
+    organizationId: string,
+    tx?: OrganizationTransactionContext
+  ): Promise<PublicOrganization | null> {
+    const org = this.getOrgsMap(tx).get(organizationId);
     return org ? { ...org } : null;
   }
 
   async updateOrganizationById(
     organizationId: string,
-    updates: { name?: string; slug?: string }
+    updates: { name?: string; slug?: string },
+    tx?: OrganizationTransactionContext
   ): Promise<PublicOrganization | null> {
-    const org = this.organizations.get(organizationId);
+    this.operationTrace.push(`updateOrganizationById:${organizationId}`);
+    const orgs = this.getOrgsMap(tx);
+    const org = orgs.get(organizationId);
     if (!org) return null;
 
     if (updates.slug !== undefined) {
-      for (const other of this.organizations.values()) {
+      for (const other of orgs.values()) {
         if (other.id !== organizationId && other.slug === updates.slug) {
           const err = new Error('E11000 duplicate slug') as Error & { code: number };
           err.code = 11000;
@@ -225,11 +345,21 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
       org.name = updates.name;
     }
     org.updatedAt = new Date();
+    if (tx) {
+      (tx as SnapshotTx).touchedOrgIds.add(organizationId);
+    }
     return { ...org };
   }
 
-  async deleteOrganizationById(organizationId: string): Promise<boolean> {
-    return this.organizations.delete(organizationId);
+  async deleteOrganizationById(
+    organizationId: string,
+    tx?: OrganizationTransactionContext
+  ): Promise<boolean> {
+    this.operationTrace.push(`deleteOrganizationById:${organizationId}`);
+    if (tx) {
+      (tx as SnapshotTx).touchedOrgIds.add(organizationId);
+    }
+    return this.getOrgsMap(tx).delete(organizationId);
   }
 
   async hasProjectsInOrganization(organizationId: string): Promise<boolean> {
@@ -249,18 +379,23 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
     return results;
   }
 
-  async createMembership(input: {
-    userId: string;
-    organizationId: string;
-    role: OrganizationRole;
-    status: MembershipStatus;
-  }): Promise<StoredMembershipRecord> {
+  async createMembership(
+    input: {
+      userId: string;
+      organizationId: string;
+      role: OrganizationRole;
+      status: MembershipStatus;
+    },
+    tx?: OrganizationTransactionContext
+  ): Promise<StoredMembershipRecord> {
+    this.operationTrace.push(`createMembership:${input.organizationId}`);
     if (this.failNextMembershipCreate) {
       this.failNextMembershipCreate = false;
       throw new Error('Simulated membership write failure');
     }
 
-    for (const existing of this.memberships.values()) {
+    const memberships = this.getMembershipsMap(tx);
+    for (const existing of memberships.values()) {
       if (existing.organizationId === input.organizationId && existing.userId === input.userId) {
         const err = new Error('E11000 duplicate membership') as Error & { code: number };
         err.code = 11000;
@@ -276,15 +411,22 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
       status: input.status,
       createdAt: new Date(),
     };
-    this.memberships.set(record.id, record);
+    memberships.set(record.id, record);
+    if (tx) {
+      (tx as SnapshotTx).touchedMembershipIds.add(record.id);
+    }
     return { ...record };
   }
 
   async findActiveMembership(
     organizationId: string,
-    userId: string
+    userId: string,
+    tx?: OrganizationTransactionContext
   ): Promise<AuthorizedOrganizationMembership | null> {
-    for (const membership of this.memberships.values()) {
+    if (tx) {
+      this.operationTrace.push(`findActiveMembershipInTx:${organizationId}`);
+    }
+    for (const membership of this.getMembershipsMap(tx).values()) {
       if (
         membership.organizationId === organizationId &&
         membership.userId === userId &&
@@ -304,18 +446,20 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
 
   async findMembershipByIdInOrganization(
     organizationId: string,
-    membershipId: string
+    membershipId: string,
+    tx?: OrganizationTransactionContext
   ): Promise<StoredMembershipRecord | null> {
-    const m = this.memberships.get(membershipId);
+    const m = this.getMembershipsMap(tx).get(membershipId);
     if (!m || m.organizationId !== organizationId) return null;
     return { ...m };
   }
 
   async findMembershipByOrgAndUser(
     organizationId: string,
-    userId: string
+    userId: string,
+    tx?: OrganizationTransactionContext
   ): Promise<StoredMembershipRecord | null> {
-    for (const m of this.memberships.values()) {
+    for (const m of this.getMembershipsMap(tx).values()) {
       if (m.organizationId === organizationId && m.userId === userId) {
         return { ...m };
       }
@@ -347,38 +491,59 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
   async updateMembershipByIdInOrganization(
     organizationId: string,
     membershipId: string,
-    updates: { role?: OrganizationRole; status?: MembershipStatus }
+    updates: { role?: OrganizationRole; status?: MembershipStatus },
+    tx?: OrganizationTransactionContext
   ): Promise<StoredMembershipRecord | null> {
-    const m = this.memberships.get(membershipId);
+    this.operationTrace.push(`updateMembership:${organizationId}`);
+    const memberships = this.getMembershipsMap(tx);
+    const m = memberships.get(membershipId);
     if (!m || m.organizationId !== organizationId) return null;
     if (updates.role !== undefined) m.role = updates.role;
     if (updates.status !== undefined) m.status = updates.status;
+    if (tx) {
+      (tx as SnapshotTx).touchedMembershipIds.add(membershipId);
+    }
     return { ...m };
   }
 
   async deleteMembershipByIdInOrganization(
     organizationId: string,
-    membershipId: string
+    membershipId: string,
+    tx?: OrganizationTransactionContext
   ): Promise<boolean> {
-    const m = this.memberships.get(membershipId);
+    this.operationTrace.push(`deleteMembership:${organizationId}`);
+    const memberships = this.getMembershipsMap(tx);
+    const m = memberships.get(membershipId);
     if (!m || m.organizationId !== organizationId) return false;
-    return this.memberships.delete(membershipId);
+    if (tx) {
+      (tx as SnapshotTx).touchedMembershipIds.add(membershipId);
+    }
+    return memberships.delete(membershipId);
   }
 
-  async deleteAllMembershipsInOrganization(organizationId: string): Promise<void> {
-    for (const [id, m] of this.memberships.entries()) {
+  async deleteAllMembershipsInOrganization(
+    organizationId: string,
+    tx?: OrganizationTransactionContext
+  ): Promise<void> {
+    const memberships = this.getMembershipsMap(tx);
+    for (const [id, m] of memberships.entries()) {
       if (m.organizationId === organizationId) {
-        this.memberships.delete(id);
+        memberships.delete(id);
+        if (tx) {
+          (tx as SnapshotTx).touchedMembershipIds.add(id);
+        }
       }
     }
   }
 
   async countActiveOwnersExcluding(
     organizationId: string,
-    excludedMembershipId: string
+    excludedMembershipId: string,
+    tx?: OrganizationTransactionContext
   ): Promise<number> {
+    this.operationTrace.push(`countActiveOwnersExcluding:${organizationId}`);
     let count = 0;
-    for (const m of this.memberships.values()) {
+    for (const m of this.getMembershipsMap(tx).values()) {
       if (
         m.organizationId === organizationId &&
         m.role === 'OWNER' &&
@@ -391,9 +556,13 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
     return count;
   }
 
-  async countActiveOwners(organizationId: string): Promise<number> {
+  async countActiveOwners(
+    organizationId: string,
+    tx?: OrganizationTransactionContext
+  ): Promise<number> {
+    this.operationTrace.push(`countActiveOwners:${organizationId}`);
     let count = 0;
-    for (const m of this.memberships.values()) {
+    for (const m of this.getMembershipsMap(tx).values()) {
       if (m.organizationId === organizationId && m.role === 'OWNER' && m.status === 'ACTIVE') {
         count++;
       }
@@ -413,6 +582,17 @@ class InMemorySharedDatabase implements AuthStore, OrganizationStore {
       }
     }
     return null;
+  }
+
+  async findUserById(userId: string): Promise<StoredUserSummary | null> {
+    const user = this.users.get(userId);
+    if (!user) return null;
+    return {
+      id: user.id,
+      email: user.email,
+      displayName: user.displayName,
+      status: user.status,
+    };
   }
 }
 
@@ -946,6 +1126,291 @@ describe('Organizations and Multi-Tenant RBAC', () => {
       expect(deleteRes.status).toBe(200);
       expect(db.organizations.size).toBe(0);
       expect(db.memberships.size).toBe(0);
+    });
+  });
+
+  describe('Per-Organization Transaction Lock, Write-Skew Prevention, and Revalidation', () => {
+    it('acquires the organization mutation lock BEFORE reading memberships/owners across all mutations', async () => {
+      const { app, db, registerAndLogin } = createHarness();
+      const owner = await registerAndLogin('lockorder@own.dev', 'Lock Owner');
+      const memberUser = await registerAndLogin('lockmember@own.dev', 'Lock Member');
+
+      const orgRes = await request(app)
+        .post('/api/v1/organizations')
+        .set('Authorization', `Bearer ${owner.accessToken}`)
+        .send({ name: 'Lock Order Org', slug: 'lock-order-org' });
+      const orgId = orgRes.body.organization.id as string;
+
+      // 1. updateOrganization
+      db.operationTrace = [];
+      await request(app)
+        .patch(`/api/v1/organizations/${orgId}`)
+        .set('Authorization', `Bearer ${owner.accessToken}`)
+        .send({ name: 'Updated Name' });
+      expect(db.operationTrace[0]).toBe(`acquireOrganizationLock:${orgId}`);
+      expect(db.operationTrace.indexOf(`findActiveMembershipInTx:${orgId}`)).toBeGreaterThan(0);
+
+      // 2. addMember
+      db.operationTrace = [];
+      const addRes = await request(app)
+        .post(`/api/v1/organizations/${orgId}/members`)
+        .set('Authorization', `Bearer ${owner.accessToken}`)
+        .send({ email: memberUser.user.email, role: 'MEMBER' });
+      const membershipId = addRes.body.member.membershipId as string;
+      expect(db.operationTrace[0]).toBe(`acquireOrganizationLock:${orgId}`);
+      expect(db.operationTrace.indexOf(`findActiveMembershipInTx:${orgId}`)).toBeGreaterThan(0);
+
+      // 3. updateMember
+      db.operationTrace = [];
+      await request(app)
+        .patch(`/api/v1/organizations/${orgId}/members/${membershipId}`)
+        .set('Authorization', `Bearer ${owner.accessToken}`)
+        .send({ role: 'VIEWER' });
+      expect(db.operationTrace[0]).toBe(`acquireOrganizationLock:${orgId}`);
+
+      // 4. transferOwnership
+      db.operationTrace = [];
+      await request(app)
+        .post(`/api/v1/organizations/${orgId}/transfer-ownership`)
+        .set('Authorization', `Bearer ${owner.accessToken}`)
+        .send({ targetUserId: memberUser.user.id });
+      expect(db.operationTrace[0]).toBe(`acquireOrganizationLock:${orgId}`);
+      expect(db.operationTrace.indexOf(`countActiveOwners:${orgId}`)).toBeGreaterThan(0);
+
+      // 5. removeMember (by new owner removing old owner who is now ADMIN)
+      const membersRes = await request(app)
+        .get(`/api/v1/organizations/${orgId}/members`)
+        .set('Authorization', `Bearer ${memberUser.accessToken}`);
+      const oldOwnerMembershipId = membersRes.body.members.find(
+        (m: OrganizationMemberView) => m.userId === owner.user.id
+      ).membershipId as string;
+
+      db.operationTrace = [];
+      await request(app)
+        .delete(`/api/v1/organizations/${orgId}/members/${oldOwnerMembershipId}`)
+        .set('Authorization', `Bearer ${memberUser.accessToken}`);
+      expect(db.operationTrace[0]).toBe(`acquireOrganizationLock:${orgId}`);
+
+      // 6. deleteOrganization
+      db.operationTrace = [];
+      await request(app)
+        .delete(`/api/v1/organizations/${orgId}`)
+        .set('Authorization', `Bearer ${memberUser.accessToken}`);
+      expect(db.operationTrace[0]).toBe(`acquireOrganizationLock:${orgId}`);
+    });
+
+    it('prevents two-OWNER mutual removal/demotion write skew under snapshot isolation', async () => {
+      const { db, organizationService, registerAndLogin } = createHarness();
+      const owner1 = await registerAndLogin('skew1@own.dev', 'Owner One');
+      const owner2 = await registerAndLogin('skew2@own.dev', 'Owner Two');
+
+      const org = await organizationService.createOrganization(owner1.user.id, {
+        name: 'Two Owner Org',
+        slug: 'two-owner-org',
+      });
+      const m2 = await db.createMembership({
+        userId: owner2.user.id,
+        organizationId: org.id,
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      const m1 = (await db.findMembershipByOrgAndUser(org.id, owner1.user.id))!;
+
+      // Force both transactions to start on the exact same snapshot before either commits
+      let enteredCount = 0;
+      let releaseBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+      let barrierDone = false;
+
+      db.onAfterLockAcquired = async () => {
+        if (barrierDone) return;
+        enteredCount++;
+        if (enteredCount === 2) {
+          barrierDone = true;
+          releaseBarrier();
+        } else {
+          await barrier;
+        }
+      };
+
+      const [res1, res2] = await Promise.allSettled([
+        organizationService.removeMember(owner1.user.id, org.id, m2.id),
+        organizationService.removeMember(owner2.user.id, org.id, m1.id),
+      ]);
+
+      db.onAfterLockAcquired = undefined;
+
+      const fulfilled = [res1, res2].filter((r) => r.status === 'fulfilled');
+      const rejected = [res1, res2].filter((r) => r.status === 'rejected');
+
+      // Exactly one succeeds; the second hits WriteConflict on the Organization lock,
+      // retries against the updated snapshot, sees 1 remaining OWNER, and fails safely!
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(db.writeConflictCount).toBeGreaterThanOrEqual(1);
+      expect(await db.countActiveOwners(org.id)).toBe(1);
+    });
+
+    it('prevents addMember vs deleteOrganization race from creating orphaned memberships', async () => {
+      const { db, organizationService, registerAndLogin } = createHarness();
+      const owner = await registerAndLogin('delrace-owner@own.dev', 'Owner');
+      const candidate = await registerAndLogin('delrace-cand@own.dev', 'Candidate');
+
+      const org = await organizationService.createOrganization(owner.user.id, {
+        name: 'Delete Race Org',
+        slug: 'delete-race-org',
+      });
+
+      let enteredCount = 0;
+      let releaseBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+      let barrierDone = false;
+
+      db.onAfterLockAcquired = async () => {
+        if (barrierDone) return;
+        enteredCount++;
+        if (enteredCount === 2) {
+          barrierDone = true;
+          releaseBarrier();
+        } else {
+          await barrier;
+        }
+      };
+
+      const [delRes, addRes] = await Promise.allSettled([
+        organizationService.deleteOrganization(owner.user.id, org.id),
+        organizationService.addMember(owner.user.id, org.id, {
+          email: candidate.user.email,
+          role: 'MEMBER',
+        }),
+      ]);
+
+      db.onAfterLockAcquired = undefined;
+
+      // Whichever commits second must observe the consistent state (no orphaned membership)
+      if (delRes.status === 'fulfilled') {
+        expect(db.organizations.has(org.id)).toBe(false);
+        expect(
+          [...db.memberships.values()].filter((m) => m.organizationId === org.id)
+        ).toHaveLength(0);
+      } else {
+        expect(addRes.status).toBe('fulfilled');
+      }
+    });
+
+    it('aborts mutations with 404 when the organization is missing or deleted, and rolls back addMember on failure', async () => {
+      const { db, organizationService, registerAndLogin } = createHarness();
+      const owner = await registerAndLogin('missing@own.dev', 'Owner');
+      const candidate = await registerAndLogin('missing-cand@own.dev', 'Candidate');
+
+      const org = await organizationService.createOrganization(owner.user.id, {
+        name: 'Temp Org',
+        slug: 'temp-org',
+      });
+
+      // addMember failure rolls back cleanly without partial membership
+      db.failNextMembershipCreate = true;
+      await expect(
+        organizationService.addMember(owner.user.id, org.id, {
+          email: candidate.user.email,
+          role: 'MEMBER',
+        })
+      ).rejects.toThrow('Simulated membership write failure');
+      expect(db.memberships.size).toBe(1);
+
+      // Delete org then invoke service mutations directly -> lock fails with 404
+      await organizationService.deleteOrganization(owner.user.id, org.id);
+      await expect(
+        organizationService.addMember(owner.user.id, org.id, {
+          email: candidate.user.email,
+          role: 'MEMBER',
+        })
+      ).rejects.toMatchObject({ statusCode: 404, code: 'ORGANIZATION_NOT_FOUND' });
+
+      await expect(
+        organizationService.updateOrganization(owner.user.id, org.id, { name: 'Ghost' })
+      ).rejects.toMatchObject({ statusCode: 404, code: 'ORGANIZATION_NOT_FOUND' });
+    });
+
+    it('revalidates actor ACTIVE membership and role inside the transaction rather than trusting stale middleware context', async () => {
+      const { db, organizationService, registerAndLogin } = createHarness();
+      const owner = await registerAndLogin('reval-owner@own.dev', 'Owner');
+      const admin = await registerAndLogin('reval-admin@own.dev', 'Admin');
+
+      const org = await organizationService.createOrganization(owner.user.id, {
+        name: 'Reval Org',
+        slug: 'reval-org',
+      });
+      const adminMembership = await db.createMembership({
+        userId: admin.user.id,
+        organizationId: org.id,
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      });
+
+      // Simulate admin getting demoted to VIEWER after middleware passed, right before transaction runs
+      db.memberships.get(adminMembership.id)!.role = 'VIEWER';
+
+      await expect(
+        organizationService.updateOrganization(admin.user.id, org.id, { name: 'Unauthorized' })
+      ).rejects.toMatchObject({ statusCode: 403, code: 'FORBIDDEN' });
+
+      await expect(
+        organizationService.addMember(admin.user.id, org.id, {
+          email: owner.user.email,
+          role: 'MEMBER',
+        })
+      ).rejects.toMatchObject({ statusCode: 403, code: 'FORBIDDEN' });
+    });
+
+    it('allows concurrent mutations on different organizations without global lock contention', async () => {
+      const { db, organizationService, registerAndLogin } = createHarness();
+      const ownerA = await registerAndLogin('orga@own.dev', 'Owner A');
+      const ownerB = await registerAndLogin('orgb@own.dev', 'Owner B');
+
+      const orgA = await organizationService.createOrganization(ownerA.user.id, {
+        name: 'Org A',
+        slug: 'org-a',
+      });
+      const orgB = await organizationService.createOrganization(ownerB.user.id, {
+        name: 'Org B',
+        slug: 'org-b',
+      });
+
+      let enteredCount = 0;
+      let releaseBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+      let barrierDone = false;
+
+      // Both transactions overlap simultaneously; neither blocks or conflicts with the other!
+      db.onAfterLockAcquired = async () => {
+        if (barrierDone) return;
+        enteredCount++;
+        if (enteredCount === 2) {
+          barrierDone = true;
+          releaseBarrier();
+        } else {
+          await barrier;
+        }
+      };
+
+      db.writeConflictCount = 0;
+      const [updatedA, updatedB] = await Promise.all([
+        organizationService.updateOrganization(ownerA.user.id, orgA.id, { name: 'Org A New' }),
+        organizationService.updateOrganization(ownerB.user.id, orgB.id, { name: 'Org B New' }),
+      ]);
+
+      db.onAfterLockAcquired = undefined;
+
+      expect(updatedA.name).toBe('Org A New');
+      expect(updatedB.name).toBe('Org B New');
+      expect(db.writeConflictCount).toBe(0);
     });
   });
 });
