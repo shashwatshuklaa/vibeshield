@@ -1,8 +1,26 @@
+import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { EnvValidationError } from '@vibeshield/env';
-import { getApiConfig, toAuthConfig } from '../config/env.js';
+import {
+  getApiConfig,
+  redactGitHubEnvSecrets,
+  toAuthConfig,
+  toGitHubConfig,
+} from '../config/env.js';
 
 const TEST_JWT_SECRET = 'test_jwt_access_secret_minimum_32_characters_long';
+const TEST_WEBHOOK_SECRET = 'whsec_test_webhook_secret_at_least_32_chars';
+const TEST_WEBHOOK_SECRET_PREVIOUS = 'whsec_prev_webhook_secret_at_least_32_chars';
+const TEST_CLIENT_SECRET = 'gh_client_secret_value_min_20';
+
+function generateEphemeralTestRsaPem(): string {
+  const { privateKey } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+  });
+  return privateKey;
+}
 
 describe('API Environment Configuration', () => {
   it('validates a complete API environment with mongodb:// URI and auth defaults', () => {
@@ -130,5 +148,109 @@ describe('API Environment Configuration', () => {
         CORS_ORIGIN: 'not-a-valid-origin',
       })
     ).toThrow(EnvValidationError);
+  });
+
+  it('returns null from toGitHubConfig when GitHub integration is omitted', () => {
+    const config = getApiConfig({
+      MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+      JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+    });
+
+    expect(toGitHubConfig(config)).toBeNull();
+  });
+
+  it('validates complete GitHub App configuration and normalizes escaped newlines in PEM keys', () => {
+    const testPem = generateEphemeralTestRsaPem();
+    const escapedPem = testPem.replace(/\n/g, '\\n');
+
+    const config = getApiConfig({
+      MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+      JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+      GITHUB_APP_ID: '123456',
+      GITHUB_APP_SLUG: '  VibeShield-App  ',
+      GITHUB_APP_PRIVATE_KEY: escapedPem,
+      GITHUB_CLIENT_ID: 'Iv1.testclientid12',
+      GITHUB_CLIENT_SECRET: TEST_CLIENT_SECRET,
+      GITHUB_WEBHOOK_SECRET: TEST_WEBHOOK_SECRET,
+      GITHUB_WEBHOOK_SECRET_PREVIOUS: TEST_WEBHOOK_SECRET_PREVIOUS,
+    });
+
+    const ghConfig = toGitHubConfig(config);
+    expect(ghConfig).toEqual({
+      appId: 123456,
+      appSlug: 'vibeshield-app',
+      privateKeyPem: testPem.trim(),
+      clientId: 'Iv1.testclientid12',
+      clientSecret: TEST_CLIENT_SECRET,
+      webhookSecret: TEST_WEBHOOK_SECRET,
+      previousWebhookSecret: TEST_WEBHOOK_SECRET_PREVIOUS,
+    });
+
+    const leakedText = `Failed with secret ${TEST_CLIENT_SECRET}, ${TEST_WEBHOOK_SECRET}, and ${escapedPem}`;
+    const redacted = redactGitHubEnvSecrets(leakedText, config);
+    expect(redacted).not.toContain(TEST_CLIENT_SECRET);
+    expect(redacted).not.toContain(TEST_WEBHOOK_SECRET);
+    expect(redacted).not.toContain('BEGIN PRIVATE KEY');
+  });
+
+  it('rejects partial GitHub configuration via all-or-none validation', () => {
+    let caught: unknown;
+    try {
+      getApiConfig({
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+        GITHUB_APP_ID: '123456',
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(EnvValidationError);
+    const err = caught as EnvValidationError;
+    const variables = err.issues.map((issue) => issue.variable);
+    expect(variables).toEqual([
+      'GITHUB_APP_SLUG',
+      'GITHUB_APP_PRIVATE_KEY',
+      'GITHUB_CLIENT_ID',
+      'GITHUB_CLIENT_SECRET',
+      'GITHUB_WEBHOOK_SECRET',
+    ]);
+  });
+
+  it('rejects invalid PEM keys and malformed GitHub settings without leaking secret values', () => {
+    const malformedPem =
+      '-----BEGIN PRIVATE KEY-----\nSECRET_BODY_DO_NOT_LEAK\n-----END PRIVATE KEY-----';
+    const shortWebhook = 'too_short_webhook_secret_leak';
+    const shortClientSecret = 'short_client_leak';
+
+    let caught: unknown;
+    try {
+      getApiConfig({
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+        GITHUB_APP_ID: '0',
+        GITHUB_APP_SLUG: 'Invalid Slug!',
+        GITHUB_APP_PRIVATE_KEY: malformedPem,
+        GITHUB_CLIENT_ID: 'short',
+        GITHUB_CLIENT_SECRET: shortClientSecret,
+        GITHUB_WEBHOOK_SECRET: shortWebhook,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(EnvValidationError);
+    const err = caught as EnvValidationError;
+    expect(err.issues.map((issue) => issue.variable)).toEqual([
+      'GITHUB_APP_ID',
+      'GITHUB_APP_SLUG',
+      'GITHUB_APP_PRIVATE_KEY',
+      'GITHUB_CLIENT_ID',
+      'GITHUB_CLIENT_SECRET',
+      'GITHUB_WEBHOOK_SECRET',
+    ]);
+    expect(err.message).not.toContain('SECRET_BODY_DO_NOT_LEAK');
+    expect(err.message).not.toContain(shortWebhook);
+    expect(err.message).not.toContain(shortClientSecret);
   });
 });

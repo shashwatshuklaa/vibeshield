@@ -1,6 +1,54 @@
-import { isValidMongoUri } from '@vibeshield/database';
+import { createPrivateKey } from 'node:crypto';
+import {
+  isValidMongoUri,
+  normalizeSlug,
+  redactGitHubSecrets,
+  SLUG_REGEX,
+} from '@vibeshield/database';
 import { baseEnvSchema, validateEnv, z } from '@vibeshield/env';
 import type { AuthRuntimeConfig } from '../modules/auth/auth.types.js';
+
+export interface GitHubRuntimeConfig {
+  appId: number;
+  appSlug: string;
+  privateKeyPem: string;
+  clientId: string;
+  clientSecret: string;
+  webhookSecret: string;
+  previousWebhookSecret?: string;
+}
+
+export const REQUIRED_GITHUB_ENV_KEYS = [
+  'GITHUB_APP_ID',
+  'GITHUB_APP_SLUG',
+  'GITHUB_APP_PRIVATE_KEY',
+  'GITHUB_CLIENT_ID',
+  'GITHUB_CLIENT_SECRET',
+  'GITHUB_WEBHOOK_SECRET',
+] as const;
+
+/**
+ * Normalizes escaped newline sequences (`\n` and `\r\n`) in PEM private key configuration.
+ */
+export function normalizePemPrivateKey(raw: string): string {
+  return raw.replace(/\r\n/g, '\n').replace(/\\n/g, '\n').trim();
+}
+
+/**
+ * Validates that a PEM string represents a parseable RSA private key suitable for GitHub App JWT signing.
+ */
+export function isValidGitHubAppPrivateKey(raw: string): boolean {
+  try {
+    const normalized = normalizePemPrivateKey(raw);
+    if (!normalized.includes('BEGIN') || !normalized.includes('PRIVATE KEY')) {
+      return false;
+    }
+    const key = createPrivateKey({ key: normalized, format: 'pem' });
+    return key.type === 'private' && key.asymmetricKeyType === 'rsa';
+  } catch {
+    return false;
+  }
+}
 
 const DURATION_REGEX = /^[1-9]\d*[smhd]$/;
 
@@ -64,7 +112,7 @@ export function parseDurationToSeconds(duration: string): number {
 /**
  * Extended environment schema specific to the API application.
  */
-export const apiEnvSchema = baseEnvSchema.extend({
+const baseApiEnvSchema = baseEnvSchema.extend({
   /**
    * Host address to bind the HTTP server to.
    * Defaults to '0.0.0.0' for container and network accessibility.
@@ -122,6 +170,97 @@ export const apiEnvSchema = baseEnvSchema.extend({
     .string()
     .regex(DURATION_REGEX, 'Must be a valid positive duration (e.g. 7d, 24h)')
     .default('7d'),
+
+  /**
+   * Optional GitHub App numeric identifier (required when GitHub integration is enabled).
+   */
+  GITHUB_APP_ID: z
+    .string()
+    .trim()
+    .regex(/^[1-9]\d*$/, 'Must be a positive integer')
+    .transform(Number)
+    .refine((id) => Number.isSafeInteger(id) && id >= 1, {
+      message: 'Must be a valid positive integer',
+    })
+    .optional(),
+
+  /**
+   * Optional GitHub App URL slug (required when GitHub integration is enabled).
+   */
+  GITHUB_APP_SLUG: z
+    .string()
+    .trim()
+    .min(1, 'Must not be empty')
+    .max(100, 'Cannot exceed 100 characters')
+    .transform((value) => normalizeSlug(value))
+    .refine((value) => SLUG_REGEX.test(value), {
+      message: 'Must be a valid lowercase hyphenated slug',
+    })
+    .optional(),
+
+  /**
+   * Optional GitHub App RSA private key in PEM format (supports escaped `\n` newlines).
+   */
+  GITHUB_APP_PRIVATE_KEY: z
+    .string()
+    .min(1, 'Must not be empty')
+    .transform(normalizePemPrivateKey)
+    .refine(isValidGitHubAppPrivateKey, {
+      message: 'Must be a valid RSA PEM private key',
+    })
+    .optional(),
+
+  /**
+   * Optional GitHub App OAuth Client ID (required when GitHub integration is enabled).
+   */
+  GITHUB_CLIENT_ID: z
+    .string()
+    .trim()
+    .min(8)
+    .max(128)
+    .regex(/^[^\s]+$/, 'Must not contain whitespace')
+    .optional(),
+
+  /**
+   * Optional GitHub App OAuth Client Secret (required when GitHub integration is enabled).
+   */
+  GITHUB_CLIENT_SECRET: z
+    .string()
+    .trim()
+    .min(20)
+    .max(256)
+    .regex(/^[^\s]+$/, 'Must not contain whitespace')
+    .optional(),
+
+  /**
+   * Optional primary GitHub webhook HMAC secret (required when GitHub integration is enabled).
+   */
+  GITHUB_WEBHOOK_SECRET: z.string().min(32).max(256).optional(),
+
+  /**
+   * Optional previous GitHub webhook HMAC secret for zero-downtime secret rotation.
+   */
+  GITHUB_WEBHOOK_SECRET_PREVIOUS: z.string().min(32).max(256).optional(),
+});
+
+export const apiEnvSchema = baseApiEnvSchema.superRefine((env, ctx) => {
+  const hasAnyGitHubSetting =
+    REQUIRED_GITHUB_ENV_KEYS.some((key) => env[key] !== undefined) ||
+    env.GITHUB_WEBHOOK_SECRET_PREVIOUS !== undefined;
+
+  if (!hasAnyGitHubSetting) {
+    return;
+  }
+
+  for (const key of REQUIRED_GITHUB_ENV_KEYS) {
+    if (env[key] === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [key],
+        message: 'Missing required GitHub integration environment variable',
+      });
+    }
+  }
 });
 
 export type ApiEnv = z.infer<typeof apiEnvSchema>;
@@ -149,4 +288,62 @@ export function toAuthConfig(env: ApiEnv): AuthRuntimeConfig {
     cookiePath: `${env.API_PREFIX}/auth`,
     allowedOrigins: parseCorsOrigins(env.CORS_ORIGIN),
   };
+}
+
+/**
+ * Extracts validated GitHub App runtime configuration, or returns `null` when
+ * GitHub integration is intentionally left unconfigured.
+ */
+export function toGitHubConfig(env: ApiEnv): GitHubRuntimeConfig | null {
+  if (
+    env.GITHUB_APP_ID === undefined ||
+    env.GITHUB_APP_SLUG === undefined ||
+    env.GITHUB_APP_PRIVATE_KEY === undefined ||
+    env.GITHUB_CLIENT_ID === undefined ||
+    env.GITHUB_CLIENT_SECRET === undefined ||
+    env.GITHUB_WEBHOOK_SECRET === undefined
+  ) {
+    return null;
+  }
+
+  return {
+    appId: env.GITHUB_APP_ID,
+    appSlug: env.GITHUB_APP_SLUG,
+    privateKeyPem: env.GITHUB_APP_PRIVATE_KEY,
+    clientId: env.GITHUB_CLIENT_ID,
+    clientSecret: env.GITHUB_CLIENT_SECRET,
+    webhookSecret: env.GITHUB_WEBHOOK_SECRET,
+    ...(env.GITHUB_WEBHOOK_SECRET_PREVIOUS !== undefined
+      ? { previousWebhookSecret: env.GITHUB_WEBHOOK_SECRET_PREVIOUS }
+      : {}),
+  };
+}
+
+/**
+ * Redacts GitHub tokens, PEM private keys, Authorization credentials, and configured
+ * GitHub API secret values from arbitrary strings.
+ */
+export function redactGitHubEnvSecrets(
+  input: string,
+  env?: Partial<
+    Pick<
+      ApiEnv,
+      | 'GITHUB_APP_PRIVATE_KEY'
+      | 'GITHUB_CLIENT_SECRET'
+      | 'GITHUB_WEBHOOK_SECRET'
+      | 'GITHUB_WEBHOOK_SECRET_PREVIOUS'
+    >
+  >
+): string {
+  return redactGitHubSecrets(
+    input,
+    env
+      ? [
+          env.GITHUB_APP_PRIVATE_KEY,
+          env.GITHUB_CLIENT_SECRET,
+          env.GITHUB_WEBHOOK_SECRET,
+          env.GITHUB_WEBHOOK_SECRET_PREVIOUS,
+        ]
+      : []
+  );
 }

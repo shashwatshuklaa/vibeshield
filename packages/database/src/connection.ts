@@ -9,6 +9,7 @@ import type {
   TransactionClientLike,
   TransactionSessionLike,
 } from './types.js';
+import { redactGitHubSecrets } from './utils/redaction.js';
 
 /**
  * Sensible default connection timeouts and pooling limits for VibeShield services.
@@ -49,10 +50,10 @@ export function redactMongoUri(input: string): string {
  */
 export function formatSafeError(error: unknown): string {
   if (error instanceof Error) {
-    return redactMongoUri(error.message || error.name);
+    return redactGitHubSecrets(redactMongoUri(error.message || error.name));
   }
   if (typeof error === 'string') {
-    return redactMongoUri(error);
+    return redactGitHubSecrets(redactMongoUri(error));
   }
   return 'Unknown database error';
 }

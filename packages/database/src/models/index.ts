@@ -49,3 +49,67 @@ export {
   type RotatedRefreshTokenAttributes,
   type RotatedRefreshTokenDocument,
 } from './rotated-refresh-token.model.js';
+
+export {
+  GITHUB_ACCOUNT_TYPES,
+  GitHubAccountTypeValue,
+  GITHUB_REPOSITORY_SELECTIONS,
+  GitHubRepositorySelectionValue,
+  GITHUB_INSTALLATION_STATUSES,
+  GitHubInstallationStatusValue,
+  isInstallationActiveStatus,
+  githubInstallationSchema,
+  GitHubInstallationModel,
+  type GitHubAccountType,
+  type GitHubRepositorySelection,
+  type GitHubInstallationStatus,
+  type GitHubInstallationAttributes,
+  type GitHubInstallationDocument,
+} from './github-installation.model.js';
+
+export {
+  githubOAuthStateSchema,
+  GitHubOAuthStateModel,
+  type GitHubOAuthStateAttributes,
+  type GitHubOAuthStateDocument,
+} from './github-oauth-state.model.js';
+
+export {
+  REPOSITORY_ACCESS_STATES,
+  RepositoryAccessStateValue,
+  INSTALLATION_AVAILABILITIES,
+  InstallationAvailabilityValue,
+  EFFECTIVE_CONNECTION_STATUSES,
+  computeConnectionIsActive,
+  getEffectiveConnectionStatus,
+  projectRepositoryConnectionSchema,
+  ProjectRepositoryConnectionModel,
+  type RepositoryAccessState,
+  type InstallationAvailability,
+  type EffectiveConnectionStatus,
+  type ProjectRepositoryConnectionAttributes,
+  type ProjectRepositoryConnectionDocument,
+} from './project-repository-connection.model.js';
+
+export {
+  WEBHOOK_DELIVERY_OUTCOMES,
+  WebhookDeliveryOutcomeValue,
+  webhookDeliverySchema,
+  WebhookDeliveryModel,
+  type WebhookDeliveryOutcome,
+  type WebhookDeliveryAttributes,
+  type WebhookDeliveryDocument,
+} from './webhook-delivery.model.js';
+
+export {
+  INTEGRATION_AUDIT_ACTOR_TYPES,
+  IntegrationAuditActorTypeValue,
+  INTEGRATION_AUDIT_ACTIONS,
+  IntegrationAuditActionValue,
+  integrationAuditLogSchema,
+  IntegrationAuditLogModel,
+  type IntegrationAuditActorType,
+  type IntegrationAuditAction,
+  type IntegrationAuditLogAttributes,
+  type IntegrationAuditLogDocument,
+} from './integration-audit-log.model.js';

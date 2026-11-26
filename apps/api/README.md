@@ -28,6 +28,14 @@ The API extends the foundational environment schema from `@vibeshield/env`. Copy
 - `NODE_ENV`: Execution environment (`development`, `production`, `test`)
 - `LOG_LEVEL`: Logging verbosity level (default: `info`)
 - `API_PREFIX`: Route namespace prefix (default: `/api/v1`)
+- **GitHub App Integration (Optional; all-or-none when enabled; routes/webhooks deferred to upcoming tasks)**:
+  - `GITHUB_APP_ID`: Numeric GitHub App identifier.
+  - `GITHUB_APP_SLUG`: Hyphenated lowercase GitHub App URL slug.
+  - `GITHUB_APP_PRIVATE_KEY`: Valid RSA PEM private key (supports escaped `\n` newlines).
+  - `GITHUB_CLIENT_ID`: GitHub App OAuth Client ID.
+  - `GITHUB_CLIENT_SECRET`: GitHub App OAuth Client Secret (min 20 characters).
+  - `GITHUB_WEBHOOK_SECRET`: Primary GitHub webhook HMAC secret (min 32 characters).
+  - `GITHUB_WEBHOOK_SECRET_PREVIOUS`: Optional previous webhook secret for zero-downtime secret rotation (requires core GitHub settings when set).
 
 #### Local MongoDB Example
 ```env
@@ -146,4 +154,4 @@ pnpm run test:integration
   - **Project Creation vs. Organization Deletion Serialization**: `createProject` acquires `acquireOrganizationMutationLock(organizationId, session)` inside its MongoDB transaction before inserting the `Project` document, preventing concurrent `createProject` and `deleteOrganization` calls from committing disjoint writes and leaving orphaned projects.
   - **Replica-Set Requirement**: `runInTransaction` relies on MongoDB multi-document transactions, which require a **MongoDB replica set or sharded cluster** (no fallback to non-transactional writes; transient `WriteConflict` retries are handled by MongoDB's bounded `session.withTransaction`).
   - Future scan, finding, and repository services must always resolve `OrganizationAuthContext` first and scope every database query by `organizationId`.
-  - **Known Limitations**: Email invitation delivery and repository integration fields (`repositoryUrl`, `defaultBranch`, scan triggers) are deferred to upcoming tasks. Single-node replica-set integration tests ([organizations.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/organizations.integration.test.ts) and [projects.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/projects.integration.test.ts)) verify real MongoDB transactions, rollbacks, `WriteConflict` locking, and unique indexes, while multi-node replica-set failover and network-partition behavior are outside single-node integration scope.
+  - **Known Limitations**: Email invitation delivery, GitHub App OAuth/installation/repository endpoints, GitHub webhook processing, and repository scanning are **not implemented yet** (Task 1.6.1 introduces only the underlying database models, secret-redaction helpers, and optional environment configuration validation). Single-node replica-set integration tests ([organizations.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/organizations.integration.test.ts), [projects.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/projects.integration.test.ts), and [github-models.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/packages/database/src/__tests__/github-models.integration.test.ts)) verify real MongoDB transactions, rollbacks, `WriteConflict` locking, TTL indexes, and partial unique indexes, while multi-node replica-set failover and network-partition behavior are outside single-node integration scope.

@@ -10,15 +10,22 @@ Shared MongoDB connectivity, connection lifecycle management, and core Mongoose 
 - Deduplicate concurrent or repeated connection and disconnection calls.
 - Support graceful shutdown without hanging processes.
 - Validate MongoDB connection URI syntax (`isValidMongoUri`).
-- Redact MongoDB URIs and credentials from logs and error messages (`redactMongoUri`, `formatSafeError`).
+- Redact MongoDB URIs and GitHub credentials (`ghp_`/`ghs_`/etc., Bearer headers, PEM private keys, configured secret strings) from logs and error messages (`redactMongoUri`, `redactGitHubSecrets`, `formatSafeError`, `sanitizeAuditMetadata`).
 
 ### 2. Core Multi-Tenant Domain Models
 - **`UserModel`** (`users` collection): Platform user identity, normalized email, credential hash storage (`select: false` + serialization redaction), and account status (`ACTIVE`, `INACTIVE`, `SUSPENDED`).
 - **`OrganizationModel`** (`organizations` collection): Top-level tenant boundary with globally unique normalized slug and creator reference.
 - **`OrganizationMembershipModel`** (`organization_memberships` collection): Explicit many-to-many join model linking users to organizations with controlled roles (`OWNER`, `ADMIN`, `MEMBER`, `VIEWER`) and membership status (`ACTIVE`, `INVITED`, `SUSPENDED`).
-- **`ProjectModel`** (`projects` collection): Tenant-owned project record scoped to an `Organization`, with organization-scoped unique slug, creator reference, and non-destructive `archivedAt` timestamp.
+- **`ProjectModel`** (`projects` collection): Tenant-owned project record scoped to an `Organization`, with organization-scoped unique slug, creator reference, and non-destructive `archivedAt` timestamp. Repository integration metadata lives separately in `ProjectRepositoryConnectionModel`.
 - **`SessionModel`** (`sessions` collection): Refresh-token session store tracking `userId`, SHA-256 `refreshTokenHash` (`select: false`), `previousRefreshTokenHash` (`select: false`) for atomic `N-1` rotation reuse detection, `expiresAt` (with TTL index), `revokedAt`, and `lastUsedAt`.
 - **`RotatedRefreshTokenModel`** (`rotated_refresh_tokens` collection): Bounded TTL-indexed token-family store recording older rotated `tokenHash` values per `sessionId` so replays from `N-2` or earlier revoke the session without unbounded growth on `Session` documents.
+
+### 3. GitHub Integration Foundation Models (Schemas Ready; Routes Deferred)
+- **`GitHubInstallationModel`** (`github_installations` collection): Links a GitHub App installation (`githubInstallationId`) to a single VibeShield `Organization` while active (`isActive: true` for `ACTIVE` or `SUSPENDED`; `false` for `REVOKED` or `DISCONNECTED`). Never persists access tokens or private keys.
+- **`GitHubOAuthStateModel`** (`github_oauth_states` collection): Single-use authorization `stateHash` (SHA-256 hex, `select: false`, stripped on serialization) bound to `(userId, organizationId)` with a MongoDB TTL index on `expiresAt`.
+- **`ProjectRepositoryConnectionModel`** (`project_repository_connections` collection): Links a `Project` to a GitHub repository under an organization's `GitHubInstallation`. Separates `repositoryAccessState` (`CONNECTED | ACCESS_REVOKED | REPO_DELETED | DISCONNECTED`) from `installationAvailability` (`ACTIVE | SUSPENDED | REVOKED | DISCONNECTED`) so installation suspend/unsuspend cycles cannot restore independently revoked or deleted repositories. Uses explicit `isActive` boolean (`partialFilterExpression: { isActive: true }`) so disconnected historical records never block future reconnection.
+- **`WebhookDeliveryModel`** (`webhook_deliveries` collection): Tracks processed GitHub `deliveryId` and `payloadSha256` with unique + TTL indexes for future atomic webhook idempotency and replay protection.
+- **`IntegrationAuditLogModel`** (`integration_audit_logs` collection): Append-only audit log for installation and repository lifecycle actions, enforcing bounded sanitized `metadata` (stripping tokens, secrets, authorization headers, and PEM blocks) and blocking query-level updates.
 
 > [!NOTE]
 > Importing `@vibeshield/database` or its models never automatically initiates a database connection. Connections are established only when the host application explicitly invokes `connectDatabase()` or `manager.connect()`.
@@ -29,7 +36,7 @@ This package deliberately excludes:
 - Authentication, password hashing, or JWT issuance logic.
 - Express or HTTP framework dependencies and authorization middleware.
 - Application environment loading (callers pass the connection URI explicitly).
-- Premature repository, scan execution, or vulnerability finding models.
+- GitHub HTTP clients, OAuth callback handlers, webhook endpoints, scanning workers, or vulnerability finding models (deferred to upcoming tasks).
 
 ## Data Model Relationships
 
@@ -117,6 +124,18 @@ erDiagram
 | `RotatedRefreshToken` | `{ tokenHash: 1 }` | Yes | `rotated_tokens_hash_unique` | Unique lookup of previously rotated refresh token hashes |
 | `RotatedRefreshToken` | `{ sessionId: 1 }` | No | `rotated_tokens_session_idx` | Link rotated token hashes back to parent session |
 | `RotatedRefreshToken` | `{ expiresAt: 1 }` | No (TTL `0s`) | `rotated_tokens_expires_at_ttl_idx` | Automatic TTL cleanup bounding token-family storage |
+| `GitHubInstallation` | `{ githubInstallationId: 1 }` | Yes (Partial `{ isActive: true }`) | `github_installations_active_id_unique` | Prevent an active installation ID from linking to multiple VibeShield orgs |
+| `GitHubInstallation` | `{ organizationId: 1, isActive: 1, status: 1 }` | No | `github_installations_org_active_status_idx` | Org-scoped installation queries |
+| `GitHubOAuthState` | `{ stateHash: 1 }` | Yes | `github_oauth_states_hash_unique` | Single-use OAuth state lookup |
+| `GitHubOAuthState` | `{ expiresAt: 1 }` | No (TTL `0s`) | `github_oauth_states_expires_at_ttl_idx` | Automatic cleanup of expired OAuth states |
+| `ProjectRepositoryConnection` | `{ projectId: 1 }` | Yes (Partial `{ isActive: true }`) | `proj_repo_conn_active_project_unique` | Enforce at most one active repository per project |
+| `ProjectRepositoryConnection` | `{ organizationId: 1, githubRepositoryId: 1 }` | Yes (Partial `{ isActive: true }`) | `proj_repo_conn_active_org_repo_unique` | Prevent duplicate active connections for one repo in the same org |
+| `ProjectRepositoryConnection` | `{ githubInstallationId: 1, githubRepositoryId: 1, isActive: 1 }` | No | `proj_repo_conn_webhook_lookup_idx` | Efficient webhook routing by installation & repo ID |
+| `ProjectRepositoryConnection` | `{ organizationId: 1, projectId: 1, isActive: 1 }` | No | `proj_repo_conn_org_project_active_idx` | Efficient tenant-scoped project repository queries |
+| `WebhookDelivery` | `{ deliveryId: 1 }` | Yes | `webhook_deliveries_delivery_id_unique` | Atomic webhook replay protection & idempotency |
+| `WebhookDelivery` | `{ expiresAt: 1 }` | No (TTL `0s`) | `webhook_deliveries_expires_at_ttl_idx` | Bounded retention of delivery IDs |
+| `IntegrationAuditLog` | `{ organizationId: 1, createdAt: -1 }` | No | `integration_audit_logs_org_created_idx` | Organization audit log timeline queries |
+| `IntegrationAuditLog` | `{ organizationId: 1, projectId: 1, createdAt: -1 }` | No | `integration_audit_logs_org_project_created_idx` | Project-filtered audit log timeline queries |
 
 ## Multi-Tenancy & Service-Layer Guidance
 
@@ -148,9 +167,9 @@ await disconnectDatabase();
 
 ## Known Limitations
 
-- `pnpm --filter @vibeshield/database test` runs schema-level and mocked connection unit tests in memory without a running MongoDB server.
-- Real MongoDB transaction behavior (rollback, standalone failure without fallback, WiredTiger write conflicts, and `E11000` unique index enforcement) is verified separately via `pnpm run test:integration` using [transaction.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/packages/database/src/__tests__/transaction.integration.test.ts), [organizations.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/organizations.integration.test.ts), and [projects.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/projects.integration.test.ts) against ephemeral replica-set and standalone MongoDB containers.
-- `ProjectModel` currently omits repository integration fields (`repositoryUrl`, `defaultBranch`) intentionally; future repository integration tasks will extend `ProjectSchema` without breaking existing tenant isolation.
+- `pnpm --filter @vibeshield/database test` runs schema-level, redaction, and mocked connection unit tests in memory (`models.test.ts`, `github-models.test.ts`, `session.test.ts`, `connection.test.ts`) without a running MongoDB server.
+- Real MongoDB transaction behavior (rollback, standalone failure without fallback, WiredTiger write conflicts, `E11000` unique/partial index enforcement, and TTL expiration) is verified separately via `pnpm run test:integration` using [transaction.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/packages/database/src/__tests__/transaction.integration.test.ts), [github-models.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/packages/database/src/__tests__/github-models.integration.test.ts), [organizations.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/organizations.integration.test.ts), and [projects.integration.test.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/__tests__/projects.integration.test.ts) against ephemeral replica-set and standalone MongoDB containers.
+- Repository connection metadata lives separately in `ProjectRepositoryConnectionModel` (`ProjectModel` intentionally remains focused on core project metadata), and GitHub API client/routes/webhooks are not implemented yet.
 
 ## Running Tests & Checks
 
