@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { EnvValidationError } from '@vibeshield/env';
-import { getApiConfig } from '../config/env.js';
+import { getApiConfig, toAuthConfig } from '../config/env.js';
+
+const TEST_JWT_SECRET = 'test_jwt_access_secret_minimum_32_characters_long';
 
 describe('API Environment Configuration', () => {
-  it('validates a complete API environment with mongodb:// URI', () => {
+  it('validates a complete API environment with mongodb:// URI and auth defaults', () => {
     const config = getApiConfig({
       NODE_ENV: 'development',
       PORT: '4000',
       HOST: '127.0.0.1',
       API_PREFIX: '/api/v1',
       MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+      JWT_ACCESS_SECRET: TEST_JWT_SECRET,
     });
 
     expect(config).toEqual({
@@ -19,12 +22,29 @@ describe('API Environment Configuration', () => {
       HOST: '127.0.0.1',
       API_PREFIX: '/api/v1',
       MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+      JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+      JWT_ACCESS_TTL: '15m',
+      JWT_ISSUER: 'vibeshield-api',
+      JWT_AUDIENCE: 'vibeshield-clients',
+      AUTH_REFRESH_TOKEN_TTL: '7d',
+    });
+
+    expect(toAuthConfig(config)).toEqual({
+      jwtAccessSecret: TEST_JWT_SECRET,
+      jwtAccessTtl: '15m',
+      jwtAccessTtlSeconds: 900,
+      jwtIssuer: 'vibeshield-api',
+      jwtAudience: 'vibeshield-clients',
+      refreshTokenTtlSeconds: 604800,
+      isProduction: false,
+      cookiePath: '/api/v1/auth',
     });
   });
 
   it('validates mongodb+srv:// Atlas URIs', () => {
     const config = getApiConfig({
       MONGODB_URI: 'mongodb+srv://appuser:apppass@cluster0.example.mongodb.net/vibeshield',
+      JWT_ACCESS_SECRET: TEST_JWT_SECRET,
     });
 
     expect(config.MONGODB_URI).toBe(
@@ -32,7 +52,7 @@ describe('API Environment Configuration', () => {
     );
   });
 
-  it('throws EnvValidationError when MONGODB_URI is missing', () => {
+  it('throws EnvValidationError when MONGODB_URI or JWT_ACCESS_SECRET is missing', () => {
     expect(() => getApiConfig({ NODE_ENV: 'test' })).toThrow(EnvValidationError);
 
     try {
@@ -44,7 +64,27 @@ describe('API Environment Configuration', () => {
           variable: 'MONGODB_URI',
           message: 'Missing required environment variable',
         },
+        {
+          variable: 'JWT_ACCESS_SECRET',
+          message: 'Missing required environment variable',
+        },
       ]);
+    }
+  });
+
+  it('rejects short JWT_ACCESS_SECRET without leaking the secret value', () => {
+    const shortSecret = 'too_short_secret_value';
+
+    try {
+      getApiConfig({
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+        JWT_ACCESS_SECRET: shortSecret,
+      });
+      expect.unreachable('Should have thrown EnvValidationError');
+    } catch (error) {
+      const err = error as EnvValidationError;
+      expect(err.issues[0]?.variable).toBe('JWT_ACCESS_SECRET');
+      expect(err.message).not.toContain(shortSecret);
     }
   });
 
@@ -55,6 +95,7 @@ describe('API Environment Configuration', () => {
     try {
       getApiConfig({
         MONGODB_URI: sensitiveInvalidUri,
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
       });
     } catch (error) {
       caught = error;

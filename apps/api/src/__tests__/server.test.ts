@@ -12,6 +12,8 @@ import {
   type ServerLogger,
 } from '../server.js';
 
+const TEST_JWT_SECRET = 'test_jwt_access_secret_minimum_32_characters_long';
+
 function createMockLogger(): Required<ServerLogger> {
   return {
     info: vi.fn(),
@@ -65,6 +67,7 @@ describe('API Server Lifecycle Integration', () => {
         PORT: String(port),
         HOST: '127.0.0.1',
         MONGODB_URI: 'mongodb://localhost:27017/vibeshield_test',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
       },
       connectDb,
       disconnectDb,
@@ -109,6 +112,7 @@ describe('API Server Lifecycle Integration', () => {
         PORT: String(port),
         HOST: '127.0.0.1',
         MONGODB_URI: secretUri,
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
       },
       connectDb,
       disconnectDb,
@@ -138,6 +142,7 @@ describe('API Server Lifecycle Integration', () => {
       envSource: {
         NODE_ENV: 'test',
         MONGODB_URI: 'invalid-uri-with-secret-token',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
       },
       connectDb,
       disconnectDb: vi.fn(async () => undefined),
@@ -166,6 +171,7 @@ describe('API Server Lifecycle Integration', () => {
         PORT: String(port),
         HOST: '127.0.0.1',
         MONGODB_URI: 'mongodb://localhost:27017/vibeshield_test',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
       },
       connectDb: vi.fn(async () => undefined),
       disconnectDb,
@@ -198,6 +204,7 @@ describe('API Server Lifecycle Integration', () => {
         PORT: String(port),
         HOST: '127.0.0.1',
         MONGODB_URI: 'mongodb://localhost:27017/vibeshield_test',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
       },
       connectDb: vi.fn(async () => undefined),
       disconnectDb,

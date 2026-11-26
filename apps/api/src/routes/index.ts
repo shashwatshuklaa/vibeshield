@@ -1,9 +1,11 @@
 import { Router } from 'express';
+import { createAuthRouter, type AuthRouterDependencies } from '../modules/auth/auth.routes.js';
 import type { HealthDependencies } from '../modules/health/health.controller.js';
 import { createHealthRouter } from '../modules/health/health.routes.js';
 
 export interface ApiRouterDependencies {
   health?: HealthDependencies;
+  auth?: AuthRouterDependencies;
 }
 
 /**
@@ -14,6 +16,7 @@ export function createApiRouter(dependencies: ApiRouterDependencies = {}): Route
 
   // Mount module routes
   router.use(createHealthRouter(dependencies.health));
+  router.use('/auth', createAuthRouter(dependencies.auth));
 
   return router;
 }

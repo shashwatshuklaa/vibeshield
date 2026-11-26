@@ -34,3 +34,10 @@ export {
   type ProjectAttributes,
   type ProjectDocument,
 } from './project.model.js';
+
+export {
+  sessionSchema,
+  SessionModel,
+  type SessionAttributes,
+  type SessionDocument,
+} from './session.model.js';

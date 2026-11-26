@@ -3,4 +3,5 @@ packages:
   - 'workers/*'
   - 'packages/*'
 allowBuilds:
+  argon2: true
   esbuild: true

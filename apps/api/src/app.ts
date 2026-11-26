@@ -1,5 +1,8 @@
 import express, { type Express } from 'express';
+import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
+import type { AuthRouterDependencies } from './modules/auth/auth.routes.js';
+import type { AuthRuntimeConfig } from './modules/auth/auth.types.js';
 import type { HealthDependencies } from './modules/health/health.controller.js';
 import { createApiRouter } from './routes/index.js';
 import { notFoundHandler } from './middlewares/not-found.js';
@@ -9,6 +12,8 @@ export interface CreateAppOptions {
   apiPrefix?: string;
   bodyLimit?: string;
   health?: HealthDependencies;
+  auth?: AuthRouterDependencies;
+  authConfig?: AuthRuntimeConfig;
 }
 
 /**
@@ -16,14 +21,15 @@ export interface CreateAppOptions {
  * Decoupled from network port listening and database connection for fast integration testing.
  */
 export function createApp(options: CreateAppOptions = {}): Express {
-  const { apiPrefix = '/api/v1', bodyLimit = '1mb', health } = options;
+  const { apiPrefix = '/api/v1', bodyLimit = '1mb', health, auth, authConfig } = options;
   const app = express();
 
   // 1. Security Headers via Helmet
   app.use(helmet());
 
-  // 2. Request body parsing with strict payload limit
+  // 2. Request body and cookie parsing with strict payload limit
   app.use(express.json({ limit: bodyLimit }));
+  app.use(cookieParser());
 
   // 3. Root service info endpoint
   app.get('/', (_req, res) => {
@@ -36,7 +42,13 @@ export function createApp(options: CreateAppOptions = {}): Express {
   });
 
   // 4. API v1 routes
-  app.use(apiPrefix, createApiRouter({ health }));
+  app.use(
+    apiPrefix,
+    createApiRouter({
+      health,
+      auth: auth ?? (authConfig ? { config: authConfig } : undefined),
+    })
+  );
 
   // 5. 404 Handler for unmatched routes
   app.use(notFoundHandler);

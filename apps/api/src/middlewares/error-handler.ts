@@ -1,4 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
+import { ZodError } from 'zod';
+import { AuthError } from '../modules/auth/auth.types.js';
 
 export interface ApiErrorResponse {
   error: {
@@ -19,6 +21,36 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
+  if (err instanceof AuthError) {
+    const body: ApiErrorResponse = {
+      error: {
+        code: err.code,
+        message: err.message,
+      },
+    };
+    if (err.details !== undefined) {
+      body.error.details = err.details;
+    }
+    res.status(err.statusCode).json(body);
+    return;
+  }
+
+  if (err instanceof ZodError) {
+    const fieldErrors = err.issues.map((issue) => ({
+      field: issue.path.join('.') || 'body',
+      message: issue.message,
+    }));
+
+    res.status(400).json({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Request validation failed',
+        details: fieldErrors,
+      },
+    });
+    return;
+  }
+
   const isProduction = process.env.NODE_ENV === 'production';
   const statusCode = err.status || err.statusCode || 500;
   const isClientError = statusCode >= 400 && statusCode < 500;

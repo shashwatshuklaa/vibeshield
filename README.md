@@ -61,5 +61,5 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
 
 ## Development Status
 
-- **Status**: MongoDB and Mongoose integration foundation established (Task 1.1 completed).
-- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), secure environment configuration (`@vibeshield/env`), MongoDB connection lifecycle package (`@vibeshield/database`), and Express backend service (`@vibeshield/api` with `MONGODB_URI` validation and liveness/readiness probes) are active. Frontend UI and background worker implementations are pending next phases.
+- **Status**: Authentication and session management foundation established (Task 1.3 completed).
+- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), secure environment configuration (`@vibeshield/env`), MongoDB connection lifecycle and core domain models (`@vibeshield/database`: `User`, `Organization`, `OrganizationMembership`, `Project`, `Session`), and Express backend service (`@vibeshield/api` with Argon2id auth, HS256 JWT access tokens, rotating HttpOnly refresh sessions, and liveness/readiness probes) are active. Organization/project APIs, RBAC, frontend UI, and background worker implementations are pending next phases.

@@ -17,6 +17,7 @@ Shared MongoDB connectivity, connection lifecycle management, and core Mongoose 
 - **`OrganizationModel`** (`organizations` collection): Top-level tenant boundary with globally unique normalized slug and creator reference.
 - **`OrganizationMembershipModel`** (`organization_memberships` collection): Explicit many-to-many join model linking users to organizations with controlled roles (`OWNER`, `ADMIN`, `MEMBER`, `VIEWER`) and membership status (`ACTIVE`, `INVITED`, `SUSPENDED`).
 - **`ProjectModel`** (`projects` collection): Tenant-owned project record scoped to an `Organization`, with organization-scoped unique slug, creator reference, and non-destructive `archivedAt` timestamp.
+- **`SessionModel`** (`sessions` collection): Refresh-token session store tracking `userId`, SHA-256 `refreshTokenHash` (`select: false`), `previousRefreshTokenHash` (`select: false`) for rotation reuse detection, `expiresAt` (with TTL index), `revokedAt`, and `lastUsedAt`.
 
 > [!NOTE]
 > Importing `@vibeshield/database` or its models never automatically initiates a database connection. Connections are established only when the host application explicitly invokes `connectDatabase()` or `manager.connect()`.
@@ -38,6 +39,7 @@ erDiagram
   USER ||--o{ ORGANIZATION : "createdBy"
   ORGANIZATION ||--o{ PROJECT : "owns"
   USER ||--o{ PROJECT : "createdBy"
+  USER ||--o{ SESSION : "owns sessions"
 
   USER {
     ObjectId _id PK
@@ -79,6 +81,18 @@ erDiagram
     Date createdAt
     Date updatedAt
   }
+
+  SESSION {
+    ObjectId _id PK
+    ObjectId userId FK "ref: User"
+    string refreshTokenHash UK "SHA-256, select: false"
+    string previousRefreshTokenHash "SHA-256, select: false"
+    Date expiresAt "TTL index"
+    Date revokedAt "nullable revocation timestamp"
+    Date lastUsedAt "nullable"
+    Date createdAt
+    Date updatedAt
+  }
 ```
 
 ## Indexes and Uniqueness Constraints
@@ -95,6 +109,10 @@ erDiagram
 | `Project` | `{ organizationId: 1, slug: 1 }` | Yes | `projects_org_slug_unique` | Organization-scoped project slug uniqueness & lookup |
 | `Project` | `{ organizationId: 1, archivedAt: 1, createdAt: -1 }` | No | `projects_org_archived_created_idx` | Paginated listing of active/archived projects per org |
 | `Project` | `{ createdBy: 1 }` | No | `projects_created_by_idx` | Audit lookup of projects by creator |
+| `Session` | `{ refreshTokenHash: 1 }` | Yes | `sessions_refresh_token_hash_unique` | Unique hashed refresh token lookup |
+| `Session` | `{ previousRefreshTokenHash: 1 }` | No (Partial) | `sessions_prev_refresh_token_hash_idx` | Detect reuse of rotated refresh tokens |
+| `Session` | `{ userId: 1, revokedAt: 1, expiresAt: 1 }` | No | `sessions_user_active_idx` | Query active sessions for a user |
+| `Session` | `{ expiresAt: 1 }` | No (TTL `0s`) | `sessions_expires_at_ttl_idx` | Background cleanup of expired session documents |
 
 ## Multi-Tenancy & Service-Layer Guidance
 
