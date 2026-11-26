@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { createAuthenticateMiddleware } from '../../middlewares/authenticate.js';
+import { createVerifyOriginMiddleware } from '../../middlewares/verify-origin.js';
 import { createAuthController } from './auth.controller.js';
 import { createAuthService, type AuthService } from './auth.service.js';
 import type { AuthRuntimeConfig } from './auth.types.js';
@@ -18,12 +19,13 @@ export function createAuthRouter(dependencies: AuthRouterDependencies = {}): Rou
     dependencies.authService ?? createAuthService({ config: dependencies.config });
   const controller = createAuthController(authService, dependencies.config);
   const authenticate = createAuthenticateMiddleware(authService);
+  const verifyOrigin = createVerifyOriginMiddleware(dependencies.config?.allowedOrigins ?? []);
 
   router.post('/register', controller.register);
   router.post('/login', controller.login);
-  router.post('/refresh', controller.refresh);
+  router.post('/refresh', verifyOrigin, controller.refresh);
   router.get('/me', authenticate, controller.me);
-  router.post('/logout', controller.logout);
+  router.post('/logout', verifyOrigin, controller.logout);
 
   return router;
 }

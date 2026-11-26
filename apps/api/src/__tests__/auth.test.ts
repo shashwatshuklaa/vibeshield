@@ -29,6 +29,7 @@ interface InMemorySessionRecord {
 class InMemoryAuthStore implements AuthStore {
   public readonly users = new Map<string, StoredUserWithPassword>();
   public readonly sessions = new Map<string, InMemorySessionRecord>();
+  public readonly rotatedTokens = new Map<string, { sessionId: string; expiresAt: Date }>();
 
   async createUser(input: {
     email: string;
@@ -128,12 +129,38 @@ class InMemoryAuthStore implements AuthStore {
     return null;
   }
 
+  async recordRotatedToken(input: {
+    sessionId: string;
+    tokenHash: string;
+    expiresAt: Date;
+  }): Promise<void> {
+    if (!this.rotatedTokens.has(input.tokenHash)) {
+      this.rotatedTokens.set(input.tokenHash, {
+        sessionId: input.sessionId,
+        expiresAt: input.expiresAt,
+      });
+    }
+  }
+
   async revokeSessionByPreviousTokenHash(previousHash: string, now: Date): Promise<boolean> {
     for (const session of this.sessions.values()) {
       if (session.previousRefreshTokenHash === previousHash && session.revokedAt === null) {
         session.revokedAt = now;
         return true;
       }
+    }
+    return false;
+  }
+
+  async revokeSessionByRotatedTokenHash(tokenHash: string, now: Date): Promise<boolean> {
+    const rotated = this.rotatedTokens.get(tokenHash);
+    if (!rotated) {
+      return false;
+    }
+    const session = this.sessions.get(rotated.sessionId);
+    if (session && session.revokedAt === null) {
+      session.revokedAt = now;
+      return true;
     }
     return false;
   }
@@ -193,6 +220,7 @@ function createAuthTestHarness(overrides: { isProduction?: boolean; now?: () => 
     refreshTokenTtlSeconds: 7 * 24 * 60 * 60,
     isProduction: overrides.isProduction ?? false,
     cookiePath: '/api/v1/auth',
+    allowedOrigins: ['http://localhost:5173', 'https://app.vibeshield.io'],
   };
 
   const authService = createAuthService({
@@ -513,6 +541,79 @@ describe('Authentication Endpoints and Session Lifecycle', () => {
 
       const statuses = [res1.status, res2.status].sort();
       expect(statuses).toEqual([200, 401]);
+
+      // Because strict replay detection revoked the session on the losing concurrent request,
+      // the winning request's newly issued tokens are also invalidated.
+      const winnerRes = res1.status === 200 ? res1 : res2;
+      const winningAccessToken = winnerRes.body.accessToken as string;
+      const winningRefreshCookie = extractCookieValue(
+        winnerRes.headers['set-cookie'] as unknown as string[],
+        REFRESH_TOKEN_COOKIE_NAME
+      );
+
+      const meWithWinnerToken = await request(app)
+        .get('/api/v1/auth/me')
+        .set('Authorization', `Bearer ${winningAccessToken}`);
+      expect(meWithWinnerToken.status).toBe(401);
+
+      const refreshWithWinnerCookie = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${winningRefreshCookie}`);
+      expect(refreshWithWinnerCookie.status).toBe(401);
+    });
+
+    it('detects reuse of an older (N-2+) rotated token and revokes the active session', async () => {
+      const { app, store } = createAuthTestHarness();
+
+      await request(app).post('/api/v1/auth/register').send({
+        email: 'deepreuse@example.com',
+        displayName: 'Deep Reuse',
+        password: 'deep-reuse-passphrase-123',
+      });
+
+      const loginRes = await request(app).post('/api/v1/auth/login').send({
+        email: 'deepreuse@example.com',
+        password: 'deep-reuse-passphrase-123',
+      });
+
+      const token1 = extractCookieValue(
+        loginRes.headers['set-cookie'] as unknown as string[],
+        REFRESH_TOKEN_COOKIE_NAME
+      );
+
+      // Rotate twice: T1 -> T2 -> T3
+      const refresh1 = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${token1}`);
+      expect(refresh1.status).toBe(200);
+      const token2 = extractCookieValue(
+        refresh1.headers['set-cookie'] as unknown as string[],
+        REFRESH_TOKEN_COOKIE_NAME
+      );
+
+      const refresh2 = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${token2}`);
+      expect(refresh2.status).toBe(200);
+      const token3 = extractCookieValue(
+        refresh2.headers['set-cookie'] as unknown as string[],
+        REFRESH_TOKEN_COOKIE_NAME
+      );
+
+      // Replaying T1 (from 2 rotations ago) must revoke the entire session
+      const replayOlder = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${token1}`);
+      expect(replayOlder.status).toBe(401);
+
+      const [session] = [...store.sessions.values()];
+      expect(session?.revokedAt).toBeInstanceOf(Date);
+
+      // Current active token3 must now be rejected
+      const refreshWithCurrent = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${token3}`);
+      expect(refreshWithCurrent.status).toBe(401);
     });
 
     it('rejects expired or revoked sessions on refresh and clears cookie', async () => {
@@ -695,6 +796,69 @@ describe('Authentication Endpoints and Session Lifecycle', () => {
         .post('/api/v1/auth/logout')
         .set('Authorization', `Bearer ${accessToken}`);
       expect(logoutRes2.status).toBe(200);
+    });
+  });
+
+  describe('Cookie CSRF and Origin Protection on /refresh and /logout', () => {
+    it('blocks cross-site, untrusted sibling-subdomain, and null origins with 403 while allowing configured origins', async () => {
+      const { app } = createAuthTestHarness();
+
+      await request(app).post('/api/v1/auth/register').send({
+        email: 'csrf@example.com',
+        displayName: 'CSRF Test',
+        password: 'csrf-strong-passphrase-123',
+      });
+
+      const loginRes = await request(app).post('/api/v1/auth/login').send({
+        email: 'csrf@example.com',
+        password: 'csrf-strong-passphrase-123',
+      });
+
+      const refreshCookie = extractCookieValue(
+        loginRes.headers['set-cookie'] as unknown as string[],
+        REFRESH_TOKEN_COOKIE_NAME
+      );
+
+      // Untrusted external origin
+      const externalRes = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Origin', 'https://evil.example.com')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${refreshCookie}`);
+      expect(externalRes.status).toBe(403);
+      expect(externalRes.body.error.code).toBe('FORBIDDEN_ORIGIN');
+
+      // Untrusted sibling subdomain (same-site for SameSite=Lax cookies, must still be blocked)
+      const siblingRefreshRes = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Origin', 'https://untrusted.vibeshield.io')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${refreshCookie}`);
+      expect(siblingRefreshRes.status).toBe(403);
+
+      const siblingLogoutRes = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Referer', 'https://untrusted.vibeshield.io/attack')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${refreshCookie}`);
+      expect(siblingLogoutRes.status).toBe(403);
+
+      // Sandboxed iframe / null origin and Sec-Fetch-Site: cross-site
+      const nullOriginRes = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Origin', 'null')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${refreshCookie}`);
+      expect(nullOriginRes.status).toBe(403);
+
+      const crossSiteHeaderRes = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Sec-Fetch-Site', 'cross-site')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${refreshCookie}`);
+      expect(crossSiteHeaderRes.status).toBe(403);
+
+      // Configured frontend origin is allowed and cookie remains valid because blocked requests did not rotate/revoke it
+      const allowedRes = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Origin', 'https://app.vibeshield.io')
+        .set('Cookie', `${REFRESH_TOKEN_COOKIE_NAME}=${refreshCookie}`);
+      expect(allowedRes.status).toBe(200);
     });
   });
 });

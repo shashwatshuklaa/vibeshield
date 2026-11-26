@@ -18,6 +18,7 @@ pnpm install
 The API extends the foundational environment schema from `@vibeshield/env`. Copy the root `.env.example` to `.env` and configure required variables:
 - `MONGODB_URI` (**required**): MongoDB connection URI (`mongodb://...` or `mongodb+srv://...`). Never commit real credentials to Git.
 - `JWT_ACCESS_SECRET` (**required**): Cryptographically random secret (minimum 32 characters) used to sign HS256 JWT access tokens. No default fallback is provided.
+- `CORS_ORIGIN`: Comma-separated allowed HTTP/HTTPS frontend origin(s) for browser Origin/Referer CSRF checks on cookie-authenticated auth routes (default: `http://localhost:5173`)
 - `JWT_ACCESS_TTL`: Access token expiration duration (default: `15m`)
 - `JWT_ISSUER`: JWT `iss` claim (default: `vibeshield-api`)
 - `JWT_AUDIENCE`: JWT `aud` claim (default: `vibeshield-clients`)
@@ -71,16 +72,17 @@ pnpm --filter @vibeshield/api test
 
 - **Password Security**: Passwords (12–128 characters, no arbitrary composition rules) are hashed with **Argon2id** (`memoryCost: 65536`, `timeCost: 3`, `parallelism: 1`). Plaintext passwords and hashes are never logged or returned in API responses.
 - **Access Tokens**: Short-lived (`15m` default) JWTs signed with explicit **HS256**, containing `sub` (user ID), `sid` (session ID), `iss`, `aud`, `iat`, and `exp`. No passwords or PII are included in claims.
-- **Refresh Tokens & Sessions**: Opaque 256-bit CSPRNG refresh tokens are hashed with **SHA-256** and persisted in `SessionModel`. Each `/auth/refresh` call atomically rotates the refresh token (`findOneAndUpdate`) and stores `previousRefreshTokenHash`. Presenting a previously rotated token triggers reuse detection and revokes the entire session.
-- **Cookie Behavior**:
+- **Refresh Tokens & Sessions**: Opaque 256-bit CSPRNG refresh tokens are hashed with **SHA-256** and persisted in `SessionModel`. Each `/auth/refresh` call atomically rotates the refresh token (`findOneAndUpdate`), stores `previousRefreshTokenHash` on the session (catching concurrent `N-1` races atomically), and records the rotated hash in `RotatedRefreshTokenModel` (bounded by a MongoDB TTL index) so replay of **any** previously rotated token (`N-1`, `N-2`, ...) revokes the entire session.
+- **Cookie & CSRF Protection**:
   - Refresh tokens are issued exclusively via an `HttpOnly`, `SameSite=Lax` cookie (`vs_refresh_token`) scoped to `${API_PREFIX}/auth`, with `Secure` enabled when `NODE_ENV=production`.
   - Refresh tokens are never returned in JSON bodies.
-  - **Client Implications**: Browser clients must send credentials (`credentials: 'include'` / `withCredentials: true`) when calling `/auth/refresh` and `/auth/logout`. Non-browser API clients must retain and replay the `vs_refresh_token` cookie jar for refresh operations, and should serialize concurrent `/auth/refresh` calls in-flight since parallel replay of a rotated token triggers strict reuse revocation.
+  - Because `SameSite=Lax` alone permits same-site `POST` requests from sibling subdomains (e.g. `other.vibeshield.io` -> `api.vibeshield.io`), `POST /auth/refresh` and `POST /auth/logout` also enforce strict `Origin` / `Referer` / `Sec-Fetch-Site` validation against `CORS_ORIGIN` and the request's own host origin.
+  - **Client Implications**: Browser clients must send credentials (`credentials: 'include'` / `withCredentials: true`) when calling `/auth/refresh` and `/auth/logout`. Frontend apps must **serialize concurrent `/auth/refresh` calls** across requests and browser tabs (e.g., via a shared in-flight promise and `navigator.locks` / `BroadcastChannel`), because strict replay detection treats simultaneous parallel refresh requests with the same token as potential replay and revokes the session. If frontend and API are deployed on separate sites (`eTLD+1`), `SameSite=None; Secure` and CORS credentials middleware will be required alongside `Origin` checks.
 - **Middleware Protection**: `authenticate` validates the `Authorization: Bearer <token>` JWT, checks that session `sid` exists and is neither revoked nor expired, and verifies that the user is `ACTIVE`.
 - **Current Limitations**:
+  - **Authentication rate limiting is not implemented yet**: `/auth/register`, `/auth/login`, and `/auth/refresh` currently lack brute-force and credential-stuffing protection. A dedicated distributed **Redis-backed** rate limiter (per-IP and per-normalized-account/email) will be added in the Redis/rate-limiting task rather than introducing a misleading single-instance in-memory limiter.
   - Email verification and password reset/recovery flows are **not** implemented yet and will be introduced in dedicated future workflows.
   - Registration does not automatically create an `Organization` or `OrganizationMembership`.
-  - Rate limiting / brute-force throttling and Redis-backed revocation caching are pending later phases.
 
 ## API Endpoints
 

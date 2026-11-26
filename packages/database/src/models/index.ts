@@ -41,3 +41,10 @@ export {
   type SessionAttributes,
   type SessionDocument,
 } from './session.model.js';
+
+export {
+  rotatedRefreshTokenSchema,
+  RotatedRefreshTokenModel,
+  type RotatedRefreshTokenAttributes,
+  type RotatedRefreshTokenDocument,
+} from './rotated-refresh-token.model.js';

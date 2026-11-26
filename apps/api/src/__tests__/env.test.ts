@@ -21,6 +21,7 @@ describe('API Environment Configuration', () => {
       LOG_LEVEL: 'info',
       HOST: '127.0.0.1',
       API_PREFIX: '/api/v1',
+      CORS_ORIGIN: 'http://localhost:5173',
       MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
       JWT_ACCESS_SECRET: TEST_JWT_SECRET,
       JWT_ACCESS_TTL: '15m',
@@ -38,6 +39,7 @@ describe('API Environment Configuration', () => {
       refreshTokenTtlSeconds: 604800,
       isProduction: false,
       cookiePath: '/api/v1/auth',
+      allowedOrigins: ['http://localhost:5173'],
     });
   });
 
@@ -107,5 +109,26 @@ describe('API Environment Configuration', () => {
     expect(err.message).not.toContain('superSecretPassword');
     expect(err.message).not.toContain('prod-db.internal');
     expect(err.message).not.toContain(sensitiveInvalidUri);
+  });
+
+  it('parses comma-separated CORS_ORIGIN values and rejects invalid origins', () => {
+    const config = getApiConfig({
+      MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+      JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+      CORS_ORIGIN: 'https://app.vibeshield.io/, http://localhost:5173',
+    });
+
+    expect(toAuthConfig(config).allowedOrigins).toEqual([
+      'https://app.vibeshield.io',
+      'http://localhost:5173',
+    ]);
+
+    expect(() =>
+      getApiConfig({
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+        CORS_ORIGIN: 'not-a-valid-origin',
+      })
+    ).toThrow(EnvValidationError);
   });
 });

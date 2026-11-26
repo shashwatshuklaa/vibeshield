@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { Error as MongooseError, Schema, Types, type Document } from 'mongoose';
-import { getOrCreateModel, SessionModel, sessionSchema } from '../index.js';
+import {
+  getOrCreateModel,
+  RotatedRefreshTokenModel,
+  rotatedRefreshTokenSchema,
+  SessionModel,
+  sessionSchema,
+} from '../index.js';
 
 async function getValidationError(
   doc: Document
@@ -95,5 +101,53 @@ describe('SessionModel (schema-level tests)', () => {
       { expiresAt: 1 },
       expect.objectContaining({ expireAfterSeconds: 0, name: 'sessions_expires_at_ttl_idx' }),
     ]);
+  });
+
+  describe('RotatedRefreshTokenModel (bounded token-family store)', () => {
+    it('exports RotatedRefreshTokenModel with expected collection and idempotent registration', () => {
+      expect(RotatedRefreshTokenModel.modelName).toBe('RotatedRefreshToken');
+      expect(RotatedRefreshTokenModel.collection.name).toBe('rotated_refresh_tokens');
+      expect(getOrCreateModel('RotatedRefreshToken', rotatedRefreshTokenSchema)).toBe(
+        RotatedRefreshTokenModel
+      );
+    });
+
+    it('validates required fields, excludes tokenHash from selection/serialization, and defines TTL index', async () => {
+      const missing = new RotatedRefreshTokenModel({});
+      const missingError = await getValidationError(missing);
+      expect(missingError?.errors.sessionId?.kind).toBe('required');
+      expect(missingError?.errors.tokenHash?.kind).toBe('required');
+      expect(missingError?.errors.expiresAt?.kind).toBe('required');
+
+      expect(rotatedRefreshTokenSchema.path('tokenHash').options.select).toBe(false);
+      const sessionPath = rotatedRefreshTokenSchema.path('sessionId');
+      expect(sessionPath).toBeInstanceOf(Schema.Types.ObjectId);
+      expect(sessionPath.options.ref).toBe('Session');
+
+      const record = new RotatedRefreshTokenModel({
+        sessionId: new Types.ObjectId(),
+        tokenHash: 'rotated_hash_secret_789',
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      expect(await getValidationError(record)).toBeUndefined();
+      expect(JSON.stringify(record)).not.toContain('rotated_hash_secret_789');
+
+      const indexes = rotatedRefreshTokenSchema.indexes();
+      expect(indexes).toContainEqual([
+        { tokenHash: 1 },
+        expect.objectContaining({ unique: true, name: 'rotated_tokens_hash_unique' }),
+      ]);
+      expect(indexes).toContainEqual([
+        { sessionId: 1 },
+        expect.objectContaining({ name: 'rotated_tokens_session_idx' }),
+      ]);
+      expect(indexes).toContainEqual([
+        { expiresAt: 1 },
+        expect.objectContaining({
+          expireAfterSeconds: 0,
+          name: 'rotated_tokens_expires_at_ttl_idx',
+        }),
+      ]);
+    });
   });
 });

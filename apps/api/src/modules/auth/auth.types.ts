@@ -34,6 +34,7 @@ export interface AuthRuntimeConfig {
   refreshTokenTtlSeconds: number;
   isProduction: boolean;
   cookiePath: string;
+  allowedOrigins?: string[];
 }
 
 export interface RegisterInput {

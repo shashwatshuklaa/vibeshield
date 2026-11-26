@@ -12,6 +12,37 @@ const DURATION_MULTIPLIERS_SECONDS: Record<string, number> = {
 };
 
 /**
+ * Parses a comma-separated list of HTTP(S) origins into normalized origin strings.
+ */
+export function parseCorsOrigins(raw: string): string[] {
+  const parts = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  if (parts.length === 0) {
+    throw new Error('At least one valid origin is required');
+  }
+
+  return parts.map((entry) => {
+    const parsed = new URL(entry);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('Origin must use http or https protocol');
+    }
+    return parsed.origin;
+  });
+}
+
+function isValidCorsOriginList(raw: string): boolean {
+  try {
+    parseCorsOrigins(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Parses a positive duration string (e.g., '15m', '7d') into seconds.
  */
 export function parseDurationToSeconds(duration: string): number {
@@ -44,6 +75,13 @@ export const apiEnvSchema = baseEnvSchema.extend({
    * Base route prefix for versioned API endpoints.
    */
   API_PREFIX: z.string().default('/api/v1'),
+
+  /**
+   * Allowed frontend origin(s) (comma-separated HTTP/HTTPS URLs) for browser CSRF/Origin checks.
+   */
+  CORS_ORIGIN: z.string().min(1).default('http://localhost:5173').refine(isValidCorsOriginList, {
+    message: 'Must be one or more valid HTTP/HTTPS origins (comma-separated)',
+  }),
 
   /**
    * MongoDB connection URI for the API service.
@@ -109,5 +147,6 @@ export function toAuthConfig(env: ApiEnv): AuthRuntimeConfig {
     refreshTokenTtlSeconds: parseDurationToSeconds(env.AUTH_REFRESH_TOKEN_TTL),
     isProduction: env.NODE_ENV === 'production',
     cookiePath: `${env.API_PREFIX}/auth`,
+    allowedOrigins: parseCorsOrigins(env.CORS_ORIGIN),
   };
 }

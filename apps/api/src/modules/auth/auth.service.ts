@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   isValidObjectId,
   normalizeEmail,
+  RotatedRefreshTokenModel,
   SessionModel,
   UserModel,
   UserStatusValue,
@@ -58,7 +59,13 @@ export interface AuthStore {
     now: Date;
     nextExpiresAt: Date;
   }): Promise<StoredSessionRef | null>;
+  recordRotatedToken(input: {
+    sessionId: string;
+    tokenHash: string;
+    expiresAt: Date;
+  }): Promise<void>;
   revokeSessionByPreviousTokenHash(previousHash: string, now: Date): Promise<boolean>;
+  revokeSessionByRotatedTokenHash(tokenHash: string, now: Date): Promise<boolean>;
   findActiveSessionByIdAndUserId(
     sessionId: string,
     userId: string,
@@ -193,6 +200,20 @@ export const mongooseAuthStore: AuthStore = {
       : null;
   },
 
+  async recordRotatedToken(input) {
+    try {
+      await RotatedRefreshTokenModel.create({
+        sessionId: input.sessionId,
+        tokenHash: input.tokenHash,
+        expiresAt: input.expiresAt,
+      });
+    } catch (error) {
+      if (!isMongoDuplicateKeyError(error)) {
+        throw error;
+      }
+    }
+  },
+
   async revokeSessionByPreviousTokenHash(previousHash, now) {
     const doc = await SessionModel.findOneAndUpdate(
       {
@@ -205,6 +226,18 @@ export const mongooseAuthStore: AuthStore = {
       { new: true }
     );
     return Boolean(doc);
+  },
+
+  async revokeSessionByRotatedTokenHash(tokenHash, now) {
+    const rotated = await RotatedRefreshTokenModel.findOne({ tokenHash });
+    if (!rotated) {
+      return false;
+    }
+    const result = await SessionModel.updateOne(
+      { _id: rotated.sessionId, revokedAt: null },
+      { $set: { revokedAt: now } }
+    );
+    return result.modifiedCount > 0;
   },
 
   async findActiveSessionByIdAndUserId(sessionId, userId, now) {
@@ -243,13 +276,22 @@ export const mongooseAuthStore: AuthStore = {
   },
 
   async revokeSessionByTokenHash(tokenHash, now) {
-    await SessionModel.updateOne(
+    const res = await SessionModel.updateOne(
       {
         $or: [{ refreshTokenHash: tokenHash }, { previousRefreshTokenHash: tokenHash }],
         revokedAt: null,
       },
       { $set: { revokedAt: now } }
     );
+    if (res.matchedCount === 0) {
+      const rotated = await RotatedRefreshTokenModel.findOne({ tokenHash });
+      if (rotated) {
+        await SessionModel.updateOne(
+          { _id: rotated.sessionId, revokedAt: null },
+          { $set: { revokedAt: now } }
+        );
+      }
+    }
   },
 };
 
@@ -385,9 +427,21 @@ export function createAuthService(dependencies: AuthServiceDependencies = {}): A
       });
 
       if (!rotatedSession) {
-        await store.revokeSessionByPreviousTokenHash(presentedHash, currentTime);
+        const revokedDirect = await store.revokeSessionByPreviousTokenHash(
+          presentedHash,
+          currentTime
+        );
+        if (!revokedDirect) {
+          await store.revokeSessionByRotatedTokenHash(presentedHash, currentTime);
+        }
         throw new AuthError(401, 'INVALID_REFRESH_TOKEN', 'Invalid or expired session');
       }
+
+      await store.recordRotatedToken({
+        sessionId: rotatedSession.id,
+        tokenHash: presentedHash,
+        expiresAt: nextExpiresAt,
+      });
 
       const user = await store.findActiveUserById(rotatedSession.userId);
       if (!user) {
