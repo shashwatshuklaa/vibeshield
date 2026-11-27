@@ -1,8 +1,10 @@
 import express, { type Express } from 'express';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
+import type { GitHubRuntimeConfig } from './config/env.js';
 import type { AuthRouterDependencies } from './modules/auth/auth.routes.js';
 import type { AuthRuntimeConfig } from './modules/auth/auth.types.js';
+import type { GitHubService } from './modules/github/github.service.js';
 import type { HealthDependencies } from './modules/health/health.controller.js';
 import type { OrganizationRouterDependencies } from './modules/organizations/organization.routes.js';
 import type { ProjectService } from './modules/projects/project.service.js';
@@ -18,6 +20,8 @@ export interface CreateAppOptions {
   authConfig?: AuthRuntimeConfig;
   organizations?: OrganizationRouterDependencies;
   projectService?: ProjectService;
+  githubService?: GitHubService;
+  githubConfig?: GitHubRuntimeConfig | null;
 }
 
 /**
@@ -33,6 +37,8 @@ export function createApp(options: CreateAppOptions = {}): Express {
     authConfig,
     organizations,
     projectService,
+    githubService,
+    githubConfig,
   } = options;
   const app = express();
 
@@ -59,12 +65,18 @@ export function createApp(options: CreateAppOptions = {}): Express {
     ? {
         ...organizations,
         ...(projectService && !organizations.projectService ? { projectService } : {}),
+        ...(githubService && !organizations.githubService ? { githubService } : {}),
+        ...(githubConfig !== undefined && organizations.githubConfig === undefined
+          ? { githubConfig }
+          : {}),
       }
-    : resolvedAuthDeps || projectService
+    : resolvedAuthDeps || projectService || githubService || githubConfig !== undefined
       ? {
           authService: resolvedAuthDeps?.authService,
           authConfig: resolvedAuthDeps?.config,
           projectService,
+          githubService,
+          githubConfig,
         }
       : undefined;
 

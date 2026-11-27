@@ -1,0 +1,112 @@
+import type {
+  GitHubAccountType,
+  GitHubInstallationStatus,
+  GitHubRepositorySelection,
+} from '@vibeshield/database';
+import { HttpError } from '../../utils/http-error.js';
+
+export type GitHubInstallationFlowMode = 'install' | 'authorize';
+export type GitHubSetupAction = 'install' | 'update' | 'request';
+
+/**
+ * Safe public representation of a GitHub App installation linked to an organization.
+ */
+export interface PublicGitHubInstallation {
+  id: string;
+  organizationId: string;
+  githubInstallationId: number;
+  githubAppId: number;
+  accountId: number;
+  accountLogin: string;
+  accountType: GitHubAccountType;
+  repositorySelection: GitHubRepositorySelection;
+  grantedPermissions: Record<string, string>;
+  status: GitHubInstallationStatus;
+  suspendedAt: Date | null;
+  revokedAt: Date | null;
+  lastSyncedAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Safe GitHub installation summary discovered via user OAuth prior to linking.
+ */
+export interface DiscoveredUserGitHubInstallation {
+  githubInstallationId: number;
+  accountLogin: string;
+  accountType: GitHubAccountType;
+  repositorySelection: GitHubRepositorySelection;
+  suspendedAt: string | null;
+}
+
+/**
+ * Safe repository metadata returned by installation repository discovery.
+ */
+export interface PublicGitHubRepository {
+  githubRepositoryId: number;
+  name: string;
+  fullName: string;
+  ownerLogin: string;
+  defaultBranch: string;
+  isPrivate: boolean;
+  isArchived: boolean;
+  htmlUrl: string;
+}
+
+export interface StartGitHubInstallationInput {
+  mode: GitHubInstallationFlowMode;
+}
+
+export interface StartGitHubInstallationResult {
+  mode: GitHubInstallationFlowMode;
+  authorizeUrl: string;
+  expiresAt: Date;
+}
+
+export interface DiscoverUserInstallationsInput {
+  state: string;
+  code: string;
+}
+
+export interface CompleteGitHubInstallationInput {
+  state: string;
+  code?: string;
+  installationId?: number;
+  setupAction?: GitHubSetupAction;
+}
+
+export interface CompleteGitHubInstallationResult {
+  status: 'CONNECTED' | 'APPROVAL_REQUESTED';
+  installation: PublicGitHubInstallation | null;
+  message?: string;
+}
+
+export interface ListGitHubRepositoriesQuery {
+  installationRecordId?: string;
+  page: number;
+  perPage: number;
+}
+
+export interface PaginatedGitHubRepositoriesResult {
+  installationId: string;
+  githubInstallationId: number;
+  repositories: PublicGitHubRepository[];
+  pagination: {
+    page: number;
+    perPage: number;
+    total: number;
+    totalPages: number;
+    hasNextPage: boolean;
+  };
+}
+
+/**
+ * Operational error thrown by GitHub integration operations.
+ */
+export class GitHubError extends HttpError {
+  constructor(statusCode: number, code: string, message: string, details?: unknown) {
+    super(statusCode, code, message, details);
+    this.name = 'GitHubError';
+  }
+}

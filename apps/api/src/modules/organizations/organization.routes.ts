@@ -7,8 +7,11 @@ import {
 import type { AuthService } from '../auth/auth.service.js';
 import { createAuthService } from '../auth/auth.service.js';
 import type { AuthRuntimeConfig } from '../auth/auth.types.js';
+import { createGitHubRouter } from '../github/github.routes.js';
+import type { GitHubService } from '../github/github.service.js';
 import { createProjectRouter } from '../projects/project.routes.js';
 import type { ProjectService } from '../projects/project.service.js';
+import type { GitHubRuntimeConfig } from '../../config/env.js';
 import { createOrganizationController } from './organization.controller.js';
 import { OrganizationPermission } from './organization.permissions.js';
 import { createOrganizationService, type OrganizationService } from './organization.service.js';
@@ -16,6 +19,8 @@ import { createOrganizationService, type OrganizationService } from './organizat
 export interface OrganizationRouterDependencies {
   organizationService?: OrganizationService;
   projectService?: ProjectService;
+  githubService?: GitHubService;
+  githubConfig?: GitHubRuntimeConfig | null;
   authService?: Pick<AuthService, 'authenticateAccessToken'>;
   authConfig?: AuthRuntimeConfig;
 }
@@ -94,6 +99,15 @@ export function createOrganizationRouter(
     '/:organizationId/projects',
     createProjectRouter({
       projectService: dependencies.projectService,
+      requireOrgMembership,
+    })
+  );
+
+  router.use(
+    '/:organizationId/github',
+    createGitHubRouter({
+      githubService: dependencies.githubService,
+      githubConfig: dependencies.githubConfig,
       requireOrgMembership,
     })
   );

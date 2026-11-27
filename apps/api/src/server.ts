@@ -2,7 +2,7 @@ import type { Server } from 'node:http';
 import type { Express } from 'express';
 import { connectDatabase, disconnectDatabase, formatSafeError } from '@vibeshield/database';
 import { createApp, type CreateAppOptions } from './app.js';
-import { getApiConfig, toAuthConfig } from './config/env.js';
+import { getApiConfig, toAuthConfig, toGitHubConfig } from './config/env.js';
 
 export interface ServerLogger {
   info?: (message: string) => void;
@@ -60,7 +60,8 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
 
   // 3. Instantiate Express application
   const authConfig = toAuthConfig(config);
-  const app = createAppFn({ apiPrefix: config.API_PREFIX, authConfig });
+  const githubConfig = toGitHubConfig(config);
+  const app = createAppFn({ apiPrefix: config.API_PREFIX, authConfig, githubConfig });
 
   // 4. Bind and listen on configured host and port
   const port = config.PORT ?? 4000;

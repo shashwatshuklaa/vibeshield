@@ -20,6 +20,8 @@ export const OrganizationPermission = {
   PROJECT_UPDATE: 'PROJECT_UPDATE',
   PROJECT_ARCHIVE: 'PROJECT_ARCHIVE',
   PROJECT_RESTORE: 'PROJECT_RESTORE',
+  GITHUB_INTEGRATION_READ: 'GITHUB_INTEGRATION_READ',
+  GITHUB_INTEGRATION_MANAGE: 'GITHUB_INTEGRATION_MANAGE',
 } as const;
 
 export type OrganizationPermissionType =
@@ -84,6 +86,14 @@ export const ORGANIZATION_PERMISSION_MATRIX: Readonly<
     OrganizationRoleValue.ADMIN,
   ]),
   [OrganizationPermission.PROJECT_RESTORE]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+  ]),
+  [OrganizationPermission.GITHUB_INTEGRATION_READ]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+  ]),
+  [OrganizationPermission.GITHUB_INTEGRATION_MANAGE]: new Set<OrganizationRole>([
     OrganizationRoleValue.OWNER,
     OrganizationRoleValue.ADMIN,
   ]),
