@@ -99,7 +99,16 @@ function createInMemoryWebhookHarness(
       const connSnapshot = new Map(
         Array.from(connections.entries()).map(([k, v]) => [k, { ...v }])
       );
-      const delSnapshot = new Map(Array.from(deliveries.entries()).map(([k, v]) => [k, { ...v }]));
+      const delSnapshot = new Map(
+        Array.from(deliveries.entries()).map(([k, v]) => [
+          k,
+          {
+            ...v,
+            targetOrganizationIds: [...v.targetOrganizationIds],
+            completedOrganizationIds: [...v.completedOrganizationIds],
+          },
+        ])
+      );
       const auditLen = auditLogs.length;
 
       try {
@@ -133,6 +142,9 @@ function createInMemoryWebhookHarness(
           errorCode: null,
           errorMessage: null,
           attemptCount: 1,
+          targetOrganizationIds: [],
+          completedOrganizationIds: [],
+          processedConnectionCount: 0,
           processingStartedAt: input.now,
           processedAt: null,
           failedAt: null,
@@ -167,22 +179,73 @@ function createInMemoryWebhookHarness(
       if (canRetry) {
         existing.outcome = WebhookDeliveryOutcomeValue.PROCESSING;
         existing.processingStartedAt = input.now;
-        existing.failedAt = null;
-        existing.errorCode = null;
-        existing.errorMessage = null;
+        existing.outcomeReason = null;
         existing.attemptCount += 1;
-        return { state: 'CLAIMED', delivery: { ...existing } };
+        return {
+          state: 'CLAIMED',
+          delivery: {
+            ...existing,
+            targetOrganizationIds: [...existing.targetOrganizationIds],
+            completedOrganizationIds: [...existing.completedOrganizationIds],
+          },
+        };
       }
 
       return { state: 'IN_FLIGHT', delivery: { ...existing } };
     },
     async getDeliveryByDeliveryId(deliveryId) {
       const d = deliveries.get(deliveryId);
-      return d ? { ...d } : null;
+      return d
+        ? {
+            ...d,
+            targetOrganizationIds: [...d.targetOrganizationIds],
+            completedOrganizationIds: [...d.completedOrganizationIds],
+          }
+        : null;
+    },
+    async setDeliveryTargetOrganizations(input) {
+      const d = deliveries.get(input.deliveryId);
+      if (
+        !d ||
+        d.outcome !== WebhookDeliveryOutcomeValue.PROCESSING ||
+        d.attemptCount !== input.attemptCount
+      ) {
+        return null;
+      }
+      if (d.targetOrganizationIds.length === 0) {
+        d.targetOrganizationIds = Array.from(new Set(input.targetOrganizationIds));
+      }
+      return {
+        ...d,
+        targetOrganizationIds: [...d.targetOrganizationIds],
+        completedOrganizationIds: [...d.completedOrganizationIds],
+      };
+    },
+    async recordOrganizationProgress(input) {
+      const d = deliveries.get(input.deliveryId);
+      if (
+        !d ||
+        d.outcome !== WebhookDeliveryOutcomeValue.PROCESSING ||
+        d.attemptCount !== input.attemptCount ||
+        d.completedOrganizationIds.includes(input.organizationId)
+      ) {
+        return null;
+      }
+      d.completedOrganizationIds.push(input.organizationId);
+      d.processedConnectionCount += Math.max(0, input.processedConnectionsDelta);
+      return {
+        ...d,
+        targetOrganizationIds: [...d.targetOrganizationIds],
+        completedOrganizationIds: [...d.completedOrganizationIds],
+      };
     },
     async completeDelivery(input) {
       const d = deliveries.get(input.deliveryId);
-      if (!d || d.outcome !== WebhookDeliveryOutcomeValue.PROCESSING) {
+      if (
+        !d ||
+        d.outcome !== WebhookDeliveryOutcomeValue.PROCESSING ||
+        d.attemptCount !== input.attemptCount
+      ) {
         return null;
       }
       d.outcome = input.outcome;
@@ -193,11 +256,12 @@ function createInMemoryWebhookHarness(
       d.processedAt = input.now;
       d.errorCode = null;
       d.errorMessage = null;
+      d.failedAt = null;
       return { ...d };
     },
     async failDelivery(input) {
       const d = deliveries.get(input.deliveryId);
-      if (!d) {
+      if (!d || d.attemptCount !== input.attemptCount) {
         return null;
       }
       d.outcome = WebhookDeliveryOutcomeValue.FAILED;
@@ -1069,6 +1133,128 @@ describe('GitHub Webhook Verification, Idempotency & Event Processing', () => {
       expect(pushRes.status).toBe(200);
       expect(pushRes.body.outcome).toBe('IGNORED');
       expect(harness.deliveries.get('deliv-unsupported-push')?.outcome).toBe('IGNORED');
+    });
+
+    it('persists per-org progress across partial multi-org failures, preserves prior failure details on retry, and never duplicates completed org audits', async () => {
+      const harness = createInMemoryWebhookHarness();
+      const orgA = makeObjectId(700);
+      const orgB = makeObjectId(701);
+      const orgC = makeObjectId(702);
+
+      const instA = harness.seedInstallation({ organizationId: orgA, githubInstallationId: 7101 });
+      const instB = harness.seedInstallation({ organizationId: orgB, githubInstallationId: 7102 });
+      const instC = harness.seedInstallation({ organizationId: orgC, githubInstallationId: 7103 });
+
+      harness.seedConnection({
+        organizationId: orgA,
+        projectId: makeObjectId(710),
+        installationRecordId: instA.id,
+        githubInstallationId: 7101,
+        githubRepositoryId: 99001,
+        fullName: 'shared-org/original-name',
+      });
+      harness.seedConnection({
+        organizationId: orgB,
+        projectId: makeObjectId(711),
+        installationRecordId: instB.id,
+        githubInstallationId: 7102,
+        githubRepositoryId: 99001,
+        fullName: 'shared-org/original-name',
+      });
+      harness.seedConnection({
+        organizationId: orgC,
+        projectId: makeObjectId(712),
+        installationRecordId: instC.id,
+        githubInstallationId: 7103,
+        githubRepositoryId: 99001,
+        fullName: 'shared-org/original-name',
+      });
+
+      let shouldFailOrgB = true;
+      const baseCreateAudit = harness.store.createAuditLog;
+      const partialFailStore: GitHubWebhookStore = {
+        ...harness.store,
+        async createAuditLog(input, tx) {
+          if (shouldFailOrgB && input.organizationId === orgB) {
+            throw new Error(`Simulated DB write error on orgB with ${CURRENT_WEBHOOK_SECRET}`);
+          }
+          return baseCreateAudit(input, tx);
+        },
+      };
+
+      const partialService = createGitHubWebhookService({
+        config: FULL_TEST_GITHUB_CONFIG,
+        store: partialFailStore,
+      });
+      const partialApp = createApp({
+        githubConfig: FULL_TEST_GITHUB_CONFIG,
+        webhookService: partialService,
+      });
+
+      const renameBody = JSON.stringify({
+        action: 'renamed',
+        repository: {
+          id: 99001,
+          name: 'renamed-repo',
+          full_name: 'shared-org/renamed-repo',
+          owner: { login: 'shared-org' },
+          private: true,
+        },
+      });
+      const sig = signPayload(renameBody, CURRENT_WEBHOOK_SECRET);
+
+      // Attempt 1: Org A commits, Org B fails & rolls back, Org C not yet run
+      const attempt1 = await request(partialApp)
+        .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('X-GitHub-Delivery', 'multi-org-retry-unit-1')
+        .set('X-GitHub-Event', 'repository')
+        .set('X-Hub-Signature-256', sig)
+        .send(renameBody);
+      expect(attempt1.status).toBe(500);
+
+      const recAfterFail = harness.deliveries.get('multi-org-retry-unit-1');
+      expect(recAfterFail?.outcome).toBe('FAILED');
+      expect(recAfterFail?.completedOrganizationIds).toEqual([orgA]);
+      expect(recAfterFail?.targetOrganizationIds).toEqual([orgA, orgB, orgC]);
+      expect(recAfterFail?.errorCode).toBe('WEBHOOK_PROCESSING_ERROR');
+      expect(recAfterFail?.errorMessage).not.toContain(CURRENT_WEBHOOK_SECRET);
+      expect(harness.auditLogs.filter((a) => a.organizationId === orgA)).toHaveLength(1);
+      expect(harness.auditLogs.filter((a) => a.organizationId === orgB)).toHaveLength(0);
+      expect(harness.auditLogs.filter((a) => a.organizationId === orgC)).toHaveLength(0);
+
+      // Attempt 2: Org B succeeds; Org A is skipped (1 audit total), Org B + C each get 1 audit
+      shouldFailOrgB = false;
+      const attempt2 = await request(partialApp)
+        .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('X-GitHub-Delivery', 'multi-org-retry-unit-1')
+        .set('X-GitHub-Event', 'repository')
+        .set('X-Hub-Signature-256', sig)
+        .send(renameBody);
+      expect(attempt2.status).toBe(200);
+      expect(attempt2.body.outcome).toBe('PROCESSED');
+      expect(attempt2.body.duplicate).toBe(false);
+
+      const recAfterSuccess = harness.deliveries.get('multi-org-retry-unit-1');
+      expect(recAfterSuccess?.outcome).toBe('PROCESSED');
+      expect(recAfterSuccess?.completedOrganizationIds).toEqual([orgA, orgB, orgC]);
+      expect(recAfterSuccess?.attemptCount).toBe(2);
+      expect(harness.auditLogs.filter((a) => a.organizationId === orgA)).toHaveLength(1);
+      expect(harness.auditLogs.filter((a) => a.organizationId === orgB)).toHaveLength(1);
+      expect(harness.auditLogs.filter((a) => a.organizationId === orgC)).toHaveLength(1);
+
+      // Attempt 3: completed duplicate returns 200 duplicate without touching any org
+      const attempt3 = await request(partialApp)
+        .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('X-GitHub-Delivery', 'multi-org-retry-unit-1')
+        .set('X-GitHub-Event', 'repository')
+        .set('X-Hub-Signature-256', sig)
+        .send(renameBody);
+      expect(attempt3.status).toBe(200);
+      expect(attempt3.body.duplicate).toBe(true);
+      expect(harness.auditLogs).toHaveLength(3);
     });
   });
 });

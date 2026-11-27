@@ -95,6 +95,7 @@ export {
 } from './project-repository-connection.model.js';
 
 export {
+  WEBHOOK_DELIVERY_MAX_ORGANIZATIONS,
   WEBHOOK_DELIVERY_OUTCOMES,
   WebhookDeliveryOutcomeValue,
   webhookDeliverySchema,

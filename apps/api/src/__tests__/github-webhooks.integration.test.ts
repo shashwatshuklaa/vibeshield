@@ -102,10 +102,15 @@ describe.skipIf(!REPLICA_URI)(
       await disconnectDatabase();
     });
 
-    function createIntegrationApp(storeOverride?: GitHubWebhookStore) {
+    function createIntegrationApp(
+      storeOverride?: GitHubWebhookStore,
+      options?: { processingLeaseMs?: number; now?: () => Date }
+    ) {
       const webhookService = createGitHubWebhookService({
         config: TEST_GITHUB_CONFIG,
         store: storeOverride ?? mongooseGitHubWebhookStore,
+        processingLeaseMs: options?.processingLeaseMs,
+        now: options?.now,
       });
 
       return createApp({
@@ -438,6 +443,266 @@ describe.skipIf(!REPLICA_URI)(
         (await ProjectRepositoryConnectionModel.findById(orgA.connectionIds[1]))
           ?.repositoryAccessState
       ).toBe(RepositoryAccessStateValue.REPO_DELETED);
+    });
+
+    it('persists per-org progress across 3-org partial failures and retries without duplicating A or leaving rolled-back orgs marked complete', async () => {
+      const bootstrapApp = createIntegrationApp();
+      const orgA = await seedOrgWithProjectAndInstallation(
+        bootstrapApp,
+        'wh-multi-a@test.dev',
+        'wh-multi-a',
+        8401,
+        [77001]
+      );
+      const orgB = await seedOrgWithProjectAndInstallation(
+        bootstrapApp,
+        'wh-multi-b@test.dev',
+        'wh-multi-b',
+        8402,
+        [77001]
+      );
+      const orgC = await seedOrgWithProjectAndInstallation(
+        bootstrapApp,
+        'wh-multi-c@test.dev',
+        'wh-multi-c',
+        8403,
+        [77001]
+      );
+
+      const orderedOrgIds = [orgA.organizationId, orgB.organizationId, orgC.organizationId].sort();
+      const firstOrgId = orderedOrgIds[0]!;
+      const secondOrgId = orderedOrgIds[1]!;
+      const thirdOrgId = orderedOrgIds[2]!;
+
+      let failSecondOrg = true;
+      const partialFailStore: GitHubWebhookStore = {
+        ...mongooseGitHubWebhookStore,
+        async createAuditLog(input, tx) {
+          if (failSecondOrg && input.organizationId === secondOrgId) {
+            throw new Error(`Transient org B write failure with secret ${TEST_WEBHOOK_SECRET}`);
+          }
+          return mongooseGitHubWebhookStore.createAuditLog(input, tx);
+        },
+      };
+
+      const partialApp = createIntegrationApp(partialFailStore);
+      const payload = JSON.stringify({
+        action: 'renamed',
+        repository: {
+          id: 77001,
+          name: 'repo-77001-renamed',
+          full_name: 'shared-owner/repo-77001-renamed',
+          owner: { login: 'shared-owner' },
+          private: true,
+        },
+      });
+      const sig = signWebhookBody(payload);
+
+      // 1. First delivery: firstOrg commits, secondOrg fails and rolls back, thirdOrg skipped
+      const firstRes = await request(partialApp)
+        .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('X-GitHub-Delivery', 'real-multi-org-partial-1')
+        .set('X-GitHub-Event', 'repository')
+        .set('X-Hub-Signature-256', sig)
+        .send(payload);
+      expect(firstRes.status).toBe(500);
+
+      const midDelivery = await WebhookDeliveryModel.findOne({
+        deliveryId: 'real-multi-org-partial-1',
+      });
+      expect(midDelivery?.outcome).toBe(WebhookDeliveryOutcomeValue.FAILED);
+      expect(midDelivery?.targetOrganizationIds.map((id) => id.toString())).toEqual(orderedOrgIds);
+      expect(midDelivery?.completedOrganizationIds.map((id) => id.toString())).toEqual([
+        firstOrgId,
+      ]);
+      expect(midDelivery?.processedConnectionCount).toBe(1);
+      expect(midDelivery?.errorCode).toBe('WEBHOOK_PROCESSING_ERROR');
+      expect(midDelivery?.errorMessage).not.toContain(TEST_WEBHOOK_SECRET);
+
+      // Rolled-back secondOrg and unprocessed thirdOrg are NOT marked complete and kept original names
+      expect(
+        (await ProjectRepositoryConnectionModel.findOne({ organizationId: firstOrgId }))?.fullName
+      ).toBe('shared-owner/repo-77001-renamed');
+      expect(
+        (await ProjectRepositoryConnectionModel.findOne({ organizationId: secondOrgId }))?.fullName
+      ).not.toBe('shared-owner/repo-77001-renamed');
+      expect(
+        (await ProjectRepositoryConnectionModel.findOne({ organizationId: thirdOrgId }))?.fullName
+      ).not.toBe('shared-owner/repo-77001-renamed');
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: firstOrgId })).toBe(1);
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: secondOrgId })).toBe(
+        0
+      );
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: thirdOrgId })).toBe(0);
+
+      // 2. Retry after fixing secondOrg: skips firstOrg (no duplicate audit!), completes secondOrg + thirdOrg
+      failSecondOrg = false;
+      const retryRes = await request(partialApp)
+        .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('X-GitHub-Delivery', 'real-multi-org-partial-1')
+        .set('X-GitHub-Event', 'repository')
+        .set('X-Hub-Signature-256', sig)
+        .send(payload);
+      expect(retryRes.status).toBe(200);
+      expect(retryRes.body.outcome).toBe('PROCESSED');
+      expect(retryRes.body.duplicate).toBe(false);
+
+      const finalDelivery = await WebhookDeliveryModel.findOne({
+        deliveryId: 'real-multi-org-partial-1',
+      });
+      expect(finalDelivery?.outcome).toBe(WebhookDeliveryOutcomeValue.PROCESSED);
+      expect(finalDelivery?.attemptCount).toBe(2);
+      expect(finalDelivery?.errorCode).toBeNull();
+      expect(finalDelivery?.errorMessage).toBeNull();
+      expect(finalDelivery?.completedOrganizationIds.map((id) => id.toString())).toEqual(
+        orderedOrgIds
+      );
+      expect(finalDelivery?.processedConnectionCount).toBe(3);
+
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: firstOrgId })).toBe(1);
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: secondOrgId })).toBe(
+        1
+      );
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: thirdOrgId })).toBe(1);
+
+      // 3. Subsequent duplicate retry returns 200 duplicate without repeating any org mutation
+      const dupRes = await request(partialApp)
+        .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('X-GitHub-Delivery', 'real-multi-org-partial-1')
+        .set('X-GitHub-Event', 'repository')
+        .set('X-Hub-Signature-256', sig)
+        .send(payload);
+      expect(dupRes.status).toBe(200);
+      expect(dupRes.body.duplicate).toBe(true);
+      expect(await IntegrationAuditLogModel.countDocuments({})).toBe(3);
+    });
+
+    it('recovers from process crash between org transactions without losing A progress or running concurrently', async () => {
+      const nowRef = { current: new Date('2026-11-27T18:00:00Z') };
+      const healthyApp = createIntegrationApp(mongooseGitHubWebhookStore, {
+        processingLeaseMs: 10_000,
+        now: () => nowRef.current,
+      });
+
+      const orgA = await seedOrgWithProjectAndInstallation(
+        healthyApp,
+        'wh-crash-a@test.dev',
+        'wh-crash-a',
+        8501,
+        [88001]
+      );
+      const orgB = await seedOrgWithProjectAndInstallation(
+        healthyApp,
+        'wh-crash-b@test.dev',
+        'wh-crash-b',
+        8502,
+        [88001]
+      );
+      const orgC = await seedOrgWithProjectAndInstallation(
+        healthyApp,
+        'wh-crash-c@test.dev',
+        'wh-crash-c',
+        8503,
+        [88001]
+      );
+
+      const orderedOrgIds = [orgA.organizationId, orgB.organizationId, orgC.organizationId].sort();
+      const firstOrgId = orderedOrgIds[0]!;
+      const secondOrgId = orderedOrgIds[1]!;
+      const thirdOrgId = orderedOrgIds[2]!;
+
+      // Simulate abrupt process crash right after firstOrg commits: leave delivery in PROCESSING
+      // without calling failDelivery (failDelivery is bypassed to simulate SIGKILL).
+      const crashMidLoopStore: GitHubWebhookStore = {
+        ...mongooseGitHubWebhookStore,
+        async recordOrganizationProgress(input, tx) {
+          return mongooseGitHubWebhookStore.recordOrganizationProgress(input, tx);
+        },
+        async createAuditLog(input, tx) {
+          if (input.organizationId === secondOrgId) {
+            throw new Error('SIMULATED_PROCESS_CRASH_NO_FAIL_RECORD');
+          }
+          return mongooseGitHubWebhookStore.createAuditLog(input, tx);
+        },
+        async failDelivery() {
+          // Simulate process killed before failDelivery could run
+          return null;
+        },
+      };
+
+      const crashApp = createIntegrationApp(crashMidLoopStore, {
+        processingLeaseMs: 10_000,
+        now: () => nowRef.current,
+      });
+
+      const payload = JSON.stringify({
+        action: 'privatized',
+        repository: {
+          id: 88001,
+          name: 'repo-88001',
+          full_name: 'shared/repo-88001',
+          owner: { login: 'shared' },
+          private: true,
+        },
+      });
+      const sig = signWebhookBody(payload);
+
+      const crashedAttempt = await request(crashApp)
+        .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('X-GitHub-Delivery', 'real-multi-crash-1')
+        .set('X-GitHub-Event', 'repository')
+        .set('X-Hub-Signature-256', sig)
+        .send(payload);
+      expect(crashedAttempt.status).toBe(500);
+
+      // Delivery remains stuck in PROCESSING with firstOrgId durably committed
+      const stuckDelivery = await WebhookDeliveryModel.findOne({
+        deliveryId: 'real-multi-crash-1',
+      });
+      expect(stuckDelivery?.outcome).toBe(WebhookDeliveryOutcomeValue.PROCESSING);
+      expect(stuckDelivery?.completedOrganizationIds.map((id) => id.toString())).toEqual([
+        firstOrgId,
+      ]);
+
+      // Advance clock past processingLeaseMs and send CONCURRENT retries across healthyApp
+      nowRef.current = new Date(nowRef.current.getTime() + 15_000);
+      const [concRetry1, concRetry2] = await Promise.all([
+        request(healthyApp)
+          .post('/api/v1/webhooks/github')
+          .set('Content-Type', 'application/json')
+          .set('X-GitHub-Delivery', 'real-multi-crash-1')
+          .set('X-GitHub-Event', 'repository')
+          .set('X-Hub-Signature-256', sig)
+          .send(payload),
+        request(healthyApp)
+          .post('/api/v1/webhooks/github')
+          .set('Content-Type', 'application/json')
+          .set('X-GitHub-Delivery', 'real-multi-crash-1')
+          .set('X-GitHub-Event', 'repository')
+          .set('X-Hub-Signature-256', sig)
+          .send(payload),
+      ]);
+
+      expect(concRetry1.status).toBe(200);
+      expect(concRetry2.status).toBe(200);
+      expect([concRetry1.body.duplicate, concRetry2.body.duplicate].sort()).toEqual([false, true]);
+
+      const recoveredDelivery = await WebhookDeliveryModel.findOne({
+        deliveryId: 'real-multi-crash-1',
+      });
+      expect(recoveredDelivery?.outcome).toBe(WebhookDeliveryOutcomeValue.PROCESSED);
+      expect(recoveredDelivery?.completedOrganizationIds.map((id) => id.toString())).toEqual(
+        orderedOrgIds
+      );
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: firstOrgId })).toBe(1);
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: secondOrgId })).toBe(
+        1
+      );
+      expect(await IntegrationAuditLogModel.countDocuments({ organizationId: thirdOrgId })).toBe(1);
     });
   }
 );

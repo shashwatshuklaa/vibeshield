@@ -468,7 +468,21 @@ describe('GitHub Integration Database Models and Redaction', () => {
       expect(doc.deliveryId).toBe('123e4567-e89b-12d3-a456-426614174000');
       expect(doc.payloadSha256).toBe(sha);
       expect(doc.attemptCount).toBe(1);
+      expect(doc.targetOrganizationIds).toEqual([]);
+      expect(doc.completedOrganizationIds).toEqual([]);
+      expect(doc.processedConnectionCount).toBe(0);
       expect(doc.errorMessage).toBe('Upstream error with Bearer [REDACTED]');
+
+      const oversizedProgressDoc = new WebhookDeliveryModel({
+        deliveryId: 'id-too-many-orgs',
+        event: 'repository',
+        payloadSha256: sha,
+        outcome: WebhookDeliveryOutcomeValue.PROCESSING,
+        targetOrganizationIds: Array.from({ length: 1001 }, () => new Types.ObjectId()),
+        expiresAt: new Date(Date.now() + 86_400_000),
+      });
+      const progressErr = await getValidationError(oversizedProgressDoc);
+      expect(progressErr?.errors.targetOrganizationIds).toBeDefined();
 
       const invalid = new WebhookDeliveryModel({
         deliveryId: 'id-1',

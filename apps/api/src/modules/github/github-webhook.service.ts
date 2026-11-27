@@ -5,6 +5,7 @@ import {
   InstallationAvailabilityValue,
   IntegrationAuditActionValue,
   isInstallationActiveStatus,
+  isValidObjectId,
   redactGitHubSecrets,
   RepositoryAccessStateValue,
   WebhookDeliveryOutcomeValue,
@@ -24,10 +25,15 @@ import {
   type InstallationWebhookPayload,
   type RepositoryWebhookPayload,
 } from './github-webhook.schemas.js';
-import { mongooseGitHubWebhookStore, type GitHubWebhookStore } from './github-webhook.store.js';
+import {
+  mongooseGitHubWebhookStore,
+  type GitHubWebhookStore,
+  type WebhookTransactionContext,
+} from './github-webhook.store.js';
 import type {
   GitHubWebhookProcessingResult,
   ProcessGitHubWebhookInput,
+  WebhookDeliveryRecord,
 } from './github-webhook.types.js';
 import { verifyGitHubWebhookSignature } from './github-webhook.verifier.js';
 
@@ -131,6 +137,21 @@ export function createGitHubWebhookService(
     ]).slice(0, 500);
   }
 
+  async function completeWithFencingOrAbort(
+    input: Parameters<GitHubWebhookStore['completeDelivery']>[0],
+    tx?: WebhookTransactionContext
+  ): Promise<WebhookDeliveryRecord> {
+    const updated = await store.completeDelivery(input, tx);
+    if (!updated) {
+      throw new GitHubError(
+        503,
+        'WEBHOOK_DELIVERY_LEASE_LOST',
+        'Webhook delivery lease was superseded or is no longer active; please retry'
+      );
+    }
+    return updated;
+  }
+
   async function waitForInFlightDelivery(
     deliveryId: string,
     event: string,
@@ -174,6 +195,7 @@ export function createGitHubWebhookService(
 
   async function handleInstallationEvent(
     deliveryId: string,
+    attemptCount: number,
     payload: InstallationWebhookPayload,
     eventTime: Date
   ): Promise<{
@@ -189,8 +211,9 @@ export function createGitHubWebhookService(
         action === 'created'
           ? 'Installation created event ignored because installation is not yet linked to an organization'
           : `Installation ${action} ignored because no active VibeShield installation exists`;
-      await store.completeDelivery({
+      await completeWithFencingOrAbort({
         deliveryId,
+        attemptCount,
         outcome: WebhookDeliveryOutcomeValue.IGNORED,
         outcomeReason: reason,
         githubInstallationId: installationId,
@@ -205,9 +228,10 @@ export function createGitHubWebhookService(
       const locked = await store.acquireOrganizationLock(organizationId, tx);
       if (!locked) {
         const reason = 'Target organization no longer exists';
-        await store.completeDelivery(
+        await completeWithFencingOrAbort(
           {
             deliveryId,
+            attemptCount,
             outcome: WebhookDeliveryOutcomeValue.IGNORED,
             outcomeReason: reason,
             githubInstallationId: installationId,
@@ -225,9 +249,10 @@ export function createGitHubWebhookService(
         !isInstallationActiveStatus(txInstallation.status)
       ) {
         const reason = `Installation ${action} ignored because installation is revoked or inactive`;
-        await store.completeDelivery(
+        await completeWithFencingOrAbort(
           {
             deliveryId,
+            attemptCount,
             outcome: WebhookDeliveryOutcomeValue.IGNORED,
             outcomeReason: reason,
             githubInstallationId: installationId,
@@ -469,9 +494,10 @@ export function createGitHubWebhookService(
       }
 
       const reason = `Processed installation.${action}`;
-      await store.completeDelivery(
+      await completeWithFencingOrAbort(
         {
           deliveryId,
+          attemptCount,
           outcome: WebhookDeliveryOutcomeValue.PROCESSED,
           outcomeReason: reason,
           githubInstallationId: installationId,
@@ -485,6 +511,7 @@ export function createGitHubWebhookService(
 
   async function handleInstallationRepositoriesEvent(
     deliveryId: string,
+    attemptCount: number,
     payload: InstallationRepositoriesWebhookPayload,
     eventTime: Date
   ): Promise<{ outcome: 'PROCESSED' | 'IGNORED'; reason: string }> {
@@ -494,8 +521,9 @@ export function createGitHubWebhookService(
     const existing = await store.findActiveInstallationByGitHubId(installationId);
     if (!existing) {
       const reason = `installation_repositories.${action} ignored because no active VibeShield installation exists`;
-      await store.completeDelivery({
+      await completeWithFencingOrAbort({
         deliveryId,
+        attemptCount,
         outcome: WebhookDeliveryOutcomeValue.IGNORED,
         outcomeReason: reason,
         githubInstallationId: installationId,
@@ -510,9 +538,10 @@ export function createGitHubWebhookService(
       const locked = await store.acquireOrganizationLock(organizationId, tx);
       if (!locked) {
         const reason = 'Target organization no longer exists';
-        await store.completeDelivery(
+        await completeWithFencingOrAbort(
           {
             deliveryId,
+            attemptCount,
             outcome: WebhookDeliveryOutcomeValue.IGNORED,
             outcomeReason: reason,
             githubInstallationId: installationId,
@@ -530,9 +559,10 @@ export function createGitHubWebhookService(
         !isInstallationActiveStatus(txInstallation.status)
       ) {
         const reason = `installation_repositories.${action} ignored because installation is inactive`;
-        await store.completeDelivery(
+        await completeWithFencingOrAbort(
           {
             deliveryId,
+            attemptCount,
             outcome: WebhookDeliveryOutcomeValue.IGNORED,
             outcomeReason: reason,
             githubInstallationId: installationId,
@@ -718,9 +748,10 @@ export function createGitHubWebhookService(
       }
 
       const reason = `Processed installation_repositories.${action}`;
-      await store.completeDelivery(
+      await completeWithFencingOrAbort(
         {
           deliveryId,
+          attemptCount,
           outcome: WebhookDeliveryOutcomeValue.PROCESSED,
           outcomeReason: reason,
           githubInstallationId: installationId,
@@ -737,125 +768,157 @@ export function createGitHubWebhookService(
     installationRecordId: string | null;
     payload: RepositoryWebhookPayload;
     deliveryId: string;
+    attemptCount: number;
     eventTime: Date;
     finalizeDeliveryInTx: boolean;
-  }): Promise<number> {
+  }): Promise<{
+    updatedCount: number;
+    finalOutcome?: 'PROCESSED' | 'IGNORED';
+    finalReason?: string;
+  }> {
     return store.withTransaction(async (tx) => {
       const locked = await store.acquireOrganizationLock(input.organizationId, tx);
-      if (!locked) {
-        if (input.finalizeDeliveryInTx) {
-          await store.completeDelivery(
-            {
-              deliveryId: input.deliveryId,
-              outcome: WebhookDeliveryOutcomeValue.IGNORED,
-              outcomeReason: 'Target organization no longer exists',
-              githubInstallationId: input.payload.installation?.id ?? null,
-              now: input.eventTime,
-            },
-            tx
-          );
+      let updatedCount = 0;
+
+      if (locked) {
+        const repoConnections = await store.listActiveConnectionsByOrgAndRepoId(
+          input.organizationId,
+          input.payload.repository.id,
+          tx
+        );
+        const scopedConnections = input.installationRecordId
+          ? repoConnections.filter((c) => c.installationRecordId === input.installationRecordId)
+          : repoConnections;
+
+        const repo = input.payload.repository;
+        const htmlUrl = repo.html_url ?? `https://github.com/${repo.full_name}`;
+
+        for (const conn of scopedConnections) {
+          if (input.payload.action === 'deleted') {
+            await store.updateConnectionByIdInOrganization(
+              input.organizationId,
+              conn.id,
+              {
+                repositoryAccessState: RepositoryAccessStateValue.REPO_DELETED,
+                installationAvailability: conn.installationAvailability,
+                statusReason: 'Repository was permanently deleted on GitHub',
+                lastSyncedAt: input.eventTime,
+                lastWebhookAt: input.eventTime,
+              },
+              tx
+            );
+
+            await store.createAuditLog(
+              {
+                organizationId: input.organizationId,
+                projectId: conn.projectId,
+                action: IntegrationAuditActionValue.REPOSITORY_DELETED,
+                githubInstallationId: conn.githubInstallationId,
+                githubRepositoryId: repo.id,
+                metadata: {
+                  deliveryId: input.deliveryId,
+                  event: 'repository',
+                  action: 'deleted',
+                  fullName: conn.fullName,
+                },
+              },
+              tx
+            );
+          } else {
+            // Preserve organizationId, projectId, REPO_DELETED state, and installationAvailability
+            await store.updateConnectionByIdInOrganization(
+              input.organizationId,
+              conn.id,
+              {
+                ownerLogin: repo.owner.login,
+                repoName: repo.name,
+                fullName: repo.full_name,
+                htmlUrl,
+                ...(repo.default_branch ? { defaultBranch: repo.default_branch } : {}),
+                isPrivate: input.payload.action === 'privatized' ? true : repo.private,
+                ...(repo.archived !== undefined ? { isArchivedOnGitHub: repo.archived } : {}),
+                repositoryAccessState: conn.repositoryAccessState,
+                installationAvailability: conn.installationAvailability,
+                statusReason: conn.statusReason,
+                lastSyncedAt: input.eventTime,
+                lastWebhookAt: input.eventTime,
+              },
+              tx
+            );
+
+            await store.createAuditLog(
+              {
+                organizationId: input.organizationId,
+                projectId: conn.projectId,
+                action: IntegrationAuditActionValue.REPOSITORY_SYNCED,
+                githubInstallationId: conn.githubInstallationId,
+                githubRepositoryId: repo.id,
+                metadata: {
+                  deliveryId: input.deliveryId,
+                  event: 'repository',
+                  action: input.payload.action,
+                  previousFullName: conn.fullName,
+                  fullName: repo.full_name,
+                  isPrivate: input.payload.action === 'privatized' ? true : repo.private,
+                },
+              },
+              tx
+            );
+          }
         }
-        return 0;
+
+        updatedCount = scopedConnections.length;
       }
 
-      const repoConnections = await store.listActiveConnectionsByOrgAndRepoId(
-        input.organizationId,
-        input.payload.repository.id,
+      // Atomically persist this organization's completion alongside its state & audit mutations
+      const progress = await store.recordOrganizationProgress(
+        {
+          deliveryId: input.deliveryId,
+          attemptCount: input.attemptCount,
+          organizationId: input.organizationId,
+          processedConnectionsDelta: updatedCount,
+        },
         tx
       );
-      const scopedConnections = input.installationRecordId
-        ? repoConnections.filter((c) => c.installationRecordId === input.installationRecordId)
-        : repoConnections;
-
-      const repo = input.payload.repository;
-      const htmlUrl = repo.html_url ?? `https://github.com/${repo.full_name}`;
-
-      for (const conn of scopedConnections) {
-        if (input.payload.action === 'deleted') {
-          await store.updateConnectionByIdInOrganization(
-            input.organizationId,
-            conn.id,
-            {
-              repositoryAccessState: RepositoryAccessStateValue.REPO_DELETED,
-              installationAvailability: conn.installationAvailability,
-              statusReason: 'Repository was permanently deleted on GitHub',
-              lastSyncedAt: input.eventTime,
-              lastWebhookAt: input.eventTime,
-            },
-            tx
-          );
-
-          await store.createAuditLog(
-            {
-              organizationId: input.organizationId,
-              projectId: conn.projectId,
-              action: IntegrationAuditActionValue.REPOSITORY_DELETED,
-              githubInstallationId: conn.githubInstallationId,
-              githubRepositoryId: repo.id,
-              metadata: {
-                deliveryId: input.deliveryId,
-                event: 'repository',
-                action: 'deleted',
-                fullName: conn.fullName,
-              },
-            },
-            tx
-          );
-        } else {
-          // Preserve organizationId, projectId, REPO_DELETED state, and installationAvailability
-          await store.updateConnectionByIdInOrganization(
-            input.organizationId,
-            conn.id,
-            {
-              ownerLogin: repo.owner.login,
-              repoName: repo.name,
-              fullName: repo.full_name,
-              htmlUrl,
-              ...(repo.default_branch ? { defaultBranch: repo.default_branch } : {}),
-              isPrivate: input.payload.action === 'privatized' ? true : repo.private,
-              ...(repo.archived !== undefined ? { isArchivedOnGitHub: repo.archived } : {}),
-              repositoryAccessState: conn.repositoryAccessState,
-              installationAvailability: conn.installationAvailability,
-              statusReason: conn.statusReason,
-              lastSyncedAt: input.eventTime,
-              lastWebhookAt: input.eventTime,
-            },
-            tx
-          );
-
-          await store.createAuditLog(
-            {
-              organizationId: input.organizationId,
-              projectId: conn.projectId,
-              action: IntegrationAuditActionValue.REPOSITORY_SYNCED,
-              githubInstallationId: conn.githubInstallationId,
-              githubRepositoryId: repo.id,
-              metadata: {
-                deliveryId: input.deliveryId,
-                event: 'repository',
-                action: input.payload.action,
-                previousFullName: conn.fullName,
-                fullName: repo.full_name,
-                isPrivate: input.payload.action === 'privatized' ? true : repo.private,
-              },
-            },
-            tx
-          );
-        }
+      if (!progress) {
+        throw new GitHubError(
+          503,
+          'WEBHOOK_DELIVERY_LEASE_LOST',
+          'Webhook delivery progress update failed due to lost lease or duplicate org execution'
+        );
       }
 
       if (input.finalizeDeliveryInTx) {
+        if (progress.targetOrganizationIds.length > 0) {
+          const completedSet = new Set(progress.completedOrganizationIds);
+          const allTargetsCompleted = progress.targetOrganizationIds.every((id) =>
+            completedSet.has(id)
+          );
+          if (!allTargetsCompleted) {
+            throw new GitHubError(
+              500,
+              'WEBHOOK_PROGRESS_INCOMPLETE',
+              'Cannot finalize webhook delivery before all target organizations complete'
+            );
+          }
+        }
+
+        const totalUpdated = progress.processedConnectionCount;
         const outcome =
-          scopedConnections.length > 0
+          totalUpdated > 0
             ? WebhookDeliveryOutcomeValue.PROCESSED
             : WebhookDeliveryOutcomeValue.IGNORED;
         const reason =
-          scopedConnections.length > 0
-            ? `Processed repository.${input.payload.action}`
+          totalUpdated > 0
+            ? progress.targetOrganizationIds.length > 1
+              ? `Processed repository.${input.payload.action} across ${progress.targetOrganizationIds.length} organizations`
+              : `Processed repository.${input.payload.action}`
             : `No active project connections matched repository.${input.payload.action}`;
-        await store.completeDelivery(
+
+        await completeWithFencingOrAbort(
           {
             deliveryId: input.deliveryId,
+            attemptCount: input.attemptCount,
             outcome,
             outcomeReason: reason,
             githubInstallationId: input.payload.installation?.id ?? null,
@@ -863,23 +926,32 @@ export function createGitHubWebhookService(
           },
           tx
         );
+
+        return {
+          updatedCount,
+          finalOutcome: outcome,
+          finalReason: reason,
+        };
       }
 
-      return scopedConnections.length;
+      return { updatedCount };
     });
   }
 
   async function handleRepositoryEvent(
-    deliveryId: string,
+    delivery: WebhookDeliveryRecord,
     payload: RepositoryWebhookPayload,
     eventTime: Date
   ): Promise<{ outcome: 'PROCESSED' | 'IGNORED'; reason: string }> {
+    const { deliveryId, attemptCount } = delivery;
+
     if (payload.installation?.id !== undefined) {
       const inst = await store.findActiveInstallationByGitHubId(payload.installation.id);
       if (!inst) {
         const reason = `repository.${payload.action} ignored because no active VibeShield installation exists`;
-        await store.completeDelivery({
+        await completeWithFencingOrAbort({
           deliveryId,
+          attemptCount,
           outcome: WebhookDeliveryOutcomeValue.IGNORED,
           outcomeReason: reason,
           githubInstallationId: payload.installation.id,
@@ -888,90 +960,125 @@ export function createGitHubWebhookService(
         return { outcome: WebhookDeliveryOutcomeValue.IGNORED, reason };
       }
 
-      const updatedCount = await applyRepositoryUpdateInOrganization({
+      const result = await applyRepositoryUpdateInOrganization({
         organizationId: inst.organizationId,
         installationRecordId: inst.id,
         payload,
         deliveryId,
+        attemptCount,
         eventTime,
         finalizeDeliveryInTx: true,
       });
 
-      return updatedCount > 0
-        ? {
-            outcome: WebhookDeliveryOutcomeValue.PROCESSED,
-            reason: `Processed repository.${payload.action}`,
-          }
-        : {
-            outcome: WebhookDeliveryOutcomeValue.IGNORED,
-            reason: `No active project connections matched repository.${payload.action}`,
-          };
+      return {
+        outcome: result.finalOutcome ?? WebhookDeliveryOutcomeValue.IGNORED,
+        reason:
+          result.finalReason ??
+          `No active project connections matched repository.${payload.action}`,
+      };
     }
 
-    // Installation omitted: isolate per-organization processing via independent transactions
-    const orgIds = await store.findDistinctOrganizationIdsByActiveRepositoryId(
-      payload.repository.id
-    );
-    if (orgIds.length === 0) {
-      const reason = `No active project connections matched repository.${payload.action}`;
-      await store.completeDelivery({
+    // Installation omitted: resolve target organizations strictly from DB (never from payload),
+    // persist durable target list, skip completed orgs on retry, and finalize only when all finish.
+    let targetOrgIds = delivery.targetOrganizationIds.filter(isValidObjectId);
+    if (targetOrgIds.length === 0) {
+      const discoveredOrgIds = (
+        await store.findDistinctOrganizationIdsByActiveRepositoryId(payload.repository.id)
+      )
+        .filter(isValidObjectId)
+        .sort();
+
+      if (discoveredOrgIds.length === 0) {
+        const reason = `No active project connections matched repository.${payload.action}`;
+        await completeWithFencingOrAbort({
+          deliveryId,
+          attemptCount,
+          outcome: WebhookDeliveryOutcomeValue.IGNORED,
+          outcomeReason: reason,
+          githubInstallationId: null,
+          now: eventTime,
+        });
+        return { outcome: WebhookDeliveryOutcomeValue.IGNORED, reason };
+      }
+
+      if (discoveredOrgIds.length === 1) {
+        const singleResult = await applyRepositoryUpdateInOrganization({
+          organizationId: discoveredOrgIds[0]!,
+          installationRecordId: null,
+          payload,
+          deliveryId,
+          attemptCount,
+          eventTime,
+          finalizeDeliveryInTx: true,
+        });
+        return {
+          outcome: singleResult.finalOutcome ?? WebhookDeliveryOutcomeValue.IGNORED,
+          reason:
+            singleResult.finalReason ??
+            `No active project connections matched repository.${payload.action}`,
+        };
+      }
+
+      const updatedDelivery = await store.setDeliveryTargetOrganizations({
         deliveryId,
-        outcome: WebhookDeliveryOutcomeValue.IGNORED,
-        outcomeReason: reason,
+        attemptCount,
+        targetOrganizationIds: discoveredOrgIds,
+      });
+      if (!updatedDelivery) {
+        throw new GitHubError(
+          503,
+          'WEBHOOK_DELIVERY_LEASE_LOST',
+          'Webhook delivery lease was superseded while persisting target organizations; please retry'
+        );
+      }
+      targetOrgIds = updatedDelivery.targetOrganizationIds;
+    }
+
+    const completedSet = new Set(delivery.completedOrganizationIds);
+    const pendingOrgIds = targetOrgIds.filter((id) => !completedSet.has(id));
+
+    if (pendingOrgIds.length === 0) {
+      const recoveredOutcome =
+        delivery.processedConnectionCount > 0
+          ? WebhookDeliveryOutcomeValue.PROCESSED
+          : WebhookDeliveryOutcomeValue.IGNORED;
+      const recoveredReason =
+        delivery.processedConnectionCount > 0
+          ? targetOrgIds.length > 1
+            ? `Processed repository.${payload.action} across ${targetOrgIds.length} organizations`
+            : `Processed repository.${payload.action}`
+          : `No active project connections matched repository.${payload.action}`;
+
+      await completeWithFencingOrAbort({
+        deliveryId,
+        attemptCount,
+        outcome: recoveredOutcome,
+        outcomeReason: recoveredReason,
         githubInstallationId: null,
         now: eventTime,
       });
-      return { outcome: WebhookDeliveryOutcomeValue.IGNORED, reason };
+      return { outcome: recoveredOutcome, reason: recoveredReason };
     }
 
-    if (orgIds.length === 1) {
-      const updatedCount = await applyRepositoryUpdateInOrganization({
-        organizationId: orgIds[0]!,
+    let finalOutcome: 'PROCESSED' | 'IGNORED' = WebhookDeliveryOutcomeValue.IGNORED;
+    let finalReason = `No active project connections matched repository.${payload.action}`;
+
+    for (let idx = 0; idx < pendingOrgIds.length; idx++) {
+      const isLastPending = idx === pendingOrgIds.length - 1;
+      const stepResult = await applyRepositoryUpdateInOrganization({
+        organizationId: pendingOrgIds[idx]!,
         installationRecordId: null,
         payload,
         deliveryId,
+        attemptCount,
         eventTime,
-        finalizeDeliveryInTx: true,
+        finalizeDeliveryInTx: isLastPending,
       });
-      return updatedCount > 0
-        ? {
-            outcome: WebhookDeliveryOutcomeValue.PROCESSED,
-            reason: `Processed repository.${payload.action}`,
-          }
-        : {
-            outcome: WebhookDeliveryOutcomeValue.IGNORED,
-            reason: `No active project connections matched repository.${payload.action}`,
-          };
+      if (isLastPending) {
+        finalOutcome = stepResult.finalOutcome ?? WebhookDeliveryOutcomeValue.IGNORED;
+        finalReason = stepResult.finalReason ?? finalReason;
+      }
     }
-
-    let totalUpdated = 0;
-    for (const orgId of orgIds) {
-      totalUpdated += await applyRepositoryUpdateInOrganization({
-        organizationId: orgId,
-        installationRecordId: null,
-        payload,
-        deliveryId,
-        eventTime,
-        finalizeDeliveryInTx: false,
-      });
-    }
-
-    const finalOutcome =
-      totalUpdated > 0
-        ? WebhookDeliveryOutcomeValue.PROCESSED
-        : WebhookDeliveryOutcomeValue.IGNORED;
-    const finalReason =
-      totalUpdated > 0
-        ? `Processed repository.${payload.action} across ${orgIds.length} organizations`
-        : `No active project connections matched repository.${payload.action}`;
-
-    await store.completeDelivery({
-      deliveryId,
-      outcome: finalOutcome,
-      outcomeReason: finalReason,
-      githubInstallationId: null,
-      now: eventTime,
-    });
 
     return { outcome: finalOutcome, reason: finalReason };
   }
@@ -1077,12 +1184,15 @@ export function createGitHubWebhookService(
         return waitForInFlightDelivery(deliveryId, event, rawAction);
       }
 
+      const attemptCount = claim.delivery.attemptCount;
+
       try {
         // 5. Handle unsupported event names safely as IGNORED
         if (!isSupportedEvent(event)) {
           const reason = `Unsupported webhook event: ${event}`;
-          await store.completeDelivery({
+          await completeWithFencingOrAbort({
             deliveryId,
+            attemptCount,
             outcome: WebhookDeliveryOutcomeValue.IGNORED,
             outcomeReason: reason,
             githubInstallationId: rawInstallationId,
@@ -1107,8 +1217,9 @@ export function createGitHubWebhookService(
             )
           ) {
             const reason = `Unsupported action ${parsedInstallation.action} for installation`;
-            await store.completeDelivery({
+            await completeWithFencingOrAbort({
               deliveryId,
+              attemptCount,
               outcome: WebhookDeliveryOutcomeValue.IGNORED,
               outcomeReason: reason,
               githubInstallationId: parsedInstallation.installation.id,
@@ -1124,7 +1235,12 @@ export function createGitHubWebhookService(
             };
           }
 
-          const outcome = await handleInstallationEvent(deliveryId, parsedInstallation, eventTime);
+          const outcome = await handleInstallationEvent(
+            deliveryId,
+            attemptCount,
+            parsedInstallation,
+            eventTime
+          );
           return {
             deliveryId,
             event,
@@ -1142,8 +1258,9 @@ export function createGitHubWebhookService(
             )
           ) {
             const reason = `Unsupported action ${parsedInstallationRepos.action} for installation_repositories`;
-            await store.completeDelivery({
+            await completeWithFencingOrAbort({
               deliveryId,
+              attemptCount,
               outcome: WebhookDeliveryOutcomeValue.IGNORED,
               outcomeReason: reason,
               githubInstallationId: parsedInstallationRepos.installation.id,
@@ -1161,6 +1278,7 @@ export function createGitHubWebhookService(
 
           const outcome = await handleInstallationRepositoriesEvent(
             deliveryId,
+            attemptCount,
             parsedInstallationRepos,
             eventTime
           );
@@ -1179,8 +1297,9 @@ export function createGitHubWebhookService(
             !(REPOSITORY_SUPPORTED_ACTIONS as readonly string[]).includes(parsedRepository.action)
           ) {
             const reason = `Unsupported action ${parsedRepository.action} for repository`;
-            await store.completeDelivery({
+            await completeWithFencingOrAbort({
               deliveryId,
+              attemptCount,
               outcome: WebhookDeliveryOutcomeValue.IGNORED,
               outcomeReason: reason,
               githubInstallationId: parsedRepository.installation?.id ?? null,
@@ -1196,7 +1315,7 @@ export function createGitHubWebhookService(
             };
           }
 
-          const outcome = await handleRepositoryEvent(deliveryId, parsedRepository, eventTime);
+          const outcome = await handleRepositoryEvent(claim.delivery, parsedRepository, eventTime);
           return {
             deliveryId,
             event,
@@ -1217,6 +1336,7 @@ export function createGitHubWebhookService(
         try {
           await store.failDelivery({
             deliveryId,
+            attemptCount,
             errorCode,
             errorMessage,
             now: now(),

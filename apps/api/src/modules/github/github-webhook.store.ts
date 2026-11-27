@@ -2,6 +2,7 @@ import type { ClientSession } from 'mongoose';
 import {
   acquireOrganizationMutationLock,
   computeConnectionIsActive,
+  getEffectiveConnectionStatus,
   GitHubInstallationModel,
   IntegrationAuditActorTypeValue,
   IntegrationAuditLogModel,
@@ -10,6 +11,7 @@ import {
   ProjectRepositoryConnectionModel,
   RepositoryAccessStateValue,
   runInTransaction,
+  WEBHOOK_DELIVERY_MAX_ORGANIZATIONS,
   WebhookDeliveryModel,
   WebhookDeliveryOutcomeValue,
   type GitHubAccountType,
@@ -23,7 +25,6 @@ import {
 import type { PublicGitHubInstallation } from './github.types.js';
 import type { PublicProjectRepositoryConnection } from './github-connection.types.js';
 import type { WebhookDeliveryRecord } from './github-webhook.types.js';
-import { getEffectiveConnectionStatus } from '@vibeshield/database';
 
 export type WebhookTransactionContext = ClientSession | unknown;
 
@@ -51,9 +52,24 @@ export interface GitHubWebhookStore {
     staleLeaseBefore: Date;
   }): Promise<ClaimWebhookDeliveryResult>;
   getDeliveryByDeliveryId(deliveryId: string): Promise<WebhookDeliveryRecord | null>;
+  setDeliveryTargetOrganizations(input: {
+    deliveryId: string;
+    attemptCount: number;
+    targetOrganizationIds: string[];
+  }): Promise<WebhookDeliveryRecord | null>;
+  recordOrganizationProgress(
+    input: {
+      deliveryId: string;
+      attemptCount: number;
+      organizationId: string;
+      processedConnectionsDelta: number;
+    },
+    tx: WebhookTransactionContext
+  ): Promise<WebhookDeliveryRecord | null>;
   completeDelivery(
     input: {
       deliveryId: string;
+      attemptCount: number;
       outcome: Extract<WebhookDeliveryOutcome, 'PROCESSED' | 'IGNORED'>;
       outcomeReason: string | null;
       githubInstallationId?: number | null;
@@ -63,6 +79,7 @@ export interface GitHubWebhookStore {
   ): Promise<WebhookDeliveryRecord | null>;
   failDelivery(input: {
     deliveryId: string;
+    attemptCount: number;
     errorCode: string;
     errorMessage: string;
     now: Date;
@@ -166,6 +183,9 @@ function toWebhookDeliveryRecord(doc: {
   errorCode?: string | null;
   errorMessage?: string | null;
   attemptCount?: number;
+  targetOrganizationIds?: Array<{ toString(): string }>;
+  completedOrganizationIds?: Array<{ toString(): string }>;
+  processedConnectionCount?: number;
   processingStartedAt?: Date | null;
   processedAt?: Date | null;
   failedAt?: Date | null;
@@ -184,6 +204,9 @@ function toWebhookDeliveryRecord(doc: {
     errorCode: doc.errorCode ?? null,
     errorMessage: doc.errorMessage ?? null,
     attemptCount: doc.attemptCount ?? 1,
+    targetOrganizationIds: (doc.targetOrganizationIds ?? []).map((id) => id.toString()),
+    completedOrganizationIds: (doc.completedOrganizationIds ?? []).map((id) => id.toString()),
+    processedConnectionCount: doc.processedConnectionCount ?? 0,
     processingStartedAt: doc.processingStartedAt ?? null,
     processedAt: doc.processedAt ?? null,
     failedAt: doc.failedAt ?? null,
@@ -396,10 +419,7 @@ export const mongooseGitHubWebhookStore: GitHubWebhookStore = {
             githubInstallationId: input.githubInstallationId,
             outcome: WebhookDeliveryOutcomeValue.PROCESSING,
             outcomeReason: null,
-            errorCode: null,
-            errorMessage: null,
             processingStartedAt: input.now,
-            failedAt: null,
           },
           $inc: { attemptCount: 1 },
         },
@@ -435,12 +455,69 @@ export const mongooseGitHubWebhookStore: GitHubWebhookStore = {
     return doc ? toWebhookDeliveryRecord(doc) : null;
   },
 
+  async setDeliveryTargetOrganizations(input) {
+    const uniqueValidIds = Array.from(new Set(input.targetOrganizationIds)).filter(isValidObjectId);
+    if (uniqueValidIds.length > WEBHOOK_DELIVERY_MAX_ORGANIZATIONS) {
+      throw new Error(
+        `Webhook delivery exceeds maximum organization fanout (${WEBHOOK_DELIVERY_MAX_ORGANIZATIONS})`
+      );
+    }
+
+    const updated = await WebhookDeliveryModel.findOneAndUpdate(
+      {
+        deliveryId: input.deliveryId,
+        outcome: WebhookDeliveryOutcomeValue.PROCESSING,
+        attemptCount: input.attemptCount,
+        'targetOrganizationIds.0': { $exists: false },
+      },
+      {
+        $set: { targetOrganizationIds: uniqueValidIds },
+      },
+      { returnDocument: 'after', runValidators: true }
+    );
+    if (updated) {
+      return toWebhookDeliveryRecord(updated);
+    }
+
+    const existing = await WebhookDeliveryModel.findOne({ deliveryId: input.deliveryId });
+    if (
+      existing &&
+      existing.outcome === WebhookDeliveryOutcomeValue.PROCESSING &&
+      existing.attemptCount === input.attemptCount
+    ) {
+      return toWebhookDeliveryRecord(existing);
+    }
+    return null;
+  },
+
+  async recordOrganizationProgress(input, tx) {
+    if (!isValidObjectId(input.organizationId)) {
+      return null;
+    }
+    const session = asSession(tx);
+    const doc = await WebhookDeliveryModel.findOneAndUpdate(
+      {
+        deliveryId: input.deliveryId,
+        outcome: WebhookDeliveryOutcomeValue.PROCESSING,
+        attemptCount: input.attemptCount,
+        completedOrganizationIds: { $ne: input.organizationId },
+      },
+      {
+        $addToSet: { completedOrganizationIds: input.organizationId },
+        $inc: { processedConnectionCount: Math.max(0, input.processedConnectionsDelta) },
+      },
+      { returnDocument: 'after', runValidators: true, ...(session ? { session } : {}) }
+    );
+    return doc ? toWebhookDeliveryRecord(doc) : null;
+  },
+
   async completeDelivery(input, tx) {
     const session = asSession(tx);
     const doc = await WebhookDeliveryModel.findOneAndUpdate(
       {
         deliveryId: input.deliveryId,
         outcome: WebhookDeliveryOutcomeValue.PROCESSING,
+        attemptCount: input.attemptCount,
       },
       {
         $set: {
@@ -452,6 +529,7 @@ export const mongooseGitHubWebhookStore: GitHubWebhookStore = {
           processedAt: input.now,
           errorCode: null,
           errorMessage: null,
+          failedAt: null,
         },
       },
       { returnDocument: 'after', runValidators: true, ...(session ? { session } : {}) }
@@ -463,6 +541,7 @@ export const mongooseGitHubWebhookStore: GitHubWebhookStore = {
     const doc = await WebhookDeliveryModel.findOneAndUpdate(
       {
         deliveryId: input.deliveryId,
+        attemptCount: input.attemptCount,
         outcome: {
           $in: [WebhookDeliveryOutcomeValue.PROCESSING, WebhookDeliveryOutcomeValue.FAILED],
         },

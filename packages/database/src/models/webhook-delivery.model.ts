@@ -1,4 +1,4 @@
-import { Schema, type HydratedDocument, type Model } from 'mongoose';
+import { Schema, type HydratedDocument, type Model, type Types } from 'mongoose';
 import { getOrCreateModel } from '../utils/normalization.js';
 import { redactGitHubSecrets } from '../utils/redaction.js';
 
@@ -12,6 +12,8 @@ export const WebhookDeliveryOutcomeValue = {
   FAILED: 'FAILED',
 } as const satisfies Record<WebhookDeliveryOutcome, WebhookDeliveryOutcome>;
 
+export const WEBHOOK_DELIVERY_MAX_ORGANIZATIONS = 1000;
+
 const SHA256_HEX_REGEX = /^[a-f0-9]{64}$/;
 
 function isNullablePositiveInteger(value: unknown): boolean {
@@ -20,6 +22,14 @@ function isNullablePositiveInteger(value: unknown): boolean {
 
 function isPositiveInteger(value: unknown): boolean {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1;
+}
+
+function isNonNegativeInteger(value: unknown): boolean {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+function isBoundedObjectIdArray(value: unknown): boolean {
+  return Array.isArray(value) && value.length <= WEBHOOK_DELIVERY_MAX_ORGANIZATIONS;
 }
 
 export interface WebhookDeliveryAttributes {
@@ -33,6 +43,9 @@ export interface WebhookDeliveryAttributes {
   errorCode: string | null;
   errorMessage: string | null;
   attemptCount: number;
+  targetOrganizationIds: Types.ObjectId[];
+  completedOrganizationIds: Types.ObjectId[];
+  processedConnectionCount: number;
   processingStartedAt: Date | null;
   processedAt: Date | null;
   failedAt: Date | null;
@@ -125,6 +138,31 @@ export const webhookDeliverySchema = new Schema<WebhookDeliveryAttributes>(
       validate: {
         validator: isPositiveInteger,
         message: 'Webhook attempt count must be a positive integer',
+      },
+    },
+    targetOrganizationIds: {
+      type: [{ type: Schema.Types.ObjectId, ref: 'Organization' }],
+      default: () => [],
+      validate: {
+        validator: isBoundedObjectIdArray,
+        message: `Target organization IDs cannot exceed ${WEBHOOK_DELIVERY_MAX_ORGANIZATIONS} entries`,
+      },
+    },
+    completedOrganizationIds: {
+      type: [{ type: Schema.Types.ObjectId, ref: 'Organization' }],
+      default: () => [],
+      validate: {
+        validator: isBoundedObjectIdArray,
+        message: `Completed organization IDs cannot exceed ${WEBHOOK_DELIVERY_MAX_ORGANIZATIONS} entries`,
+      },
+    },
+    processedConnectionCount: {
+      type: Number,
+      required: true,
+      default: 0,
+      validate: {
+        validator: isNonNegativeInteger,
+        message: 'Processed connection count must be a non-negative integer',
       },
     },
     processingStartedAt: {

@@ -28,6 +28,9 @@ export interface WebhookDeliveryRecord {
   errorCode: string | null;
   errorMessage: string | null;
   attemptCount: number;
+  targetOrganizationIds: string[];
+  completedOrganizationIds: string[];
+  processedConnectionCount: number;
   processingStartedAt: Date | null;
   processedAt: Date | null;
   failedAt: Date | null;
