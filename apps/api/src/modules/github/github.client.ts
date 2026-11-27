@@ -15,6 +15,22 @@ const GITHUB_USER_AGENT = 'VibeShield-API';
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_TRANSIENT_GET_RETRIES = 1;
 const MAX_USER_INSTALLATION_PAGES = 10;
+const MAX_INSTALLATION_REPOSITORY_PAGES = 20;
+
+function toPublicGitHubRepository(
+  repo: z.infer<typeof gitHubRepositorySchema>
+): PublicGitHubRepository {
+  return {
+    githubRepositoryId: repo.id,
+    name: repo.name,
+    fullName: repo.full_name,
+    ownerLogin: repo.owner.login,
+    defaultBranch: repo.default_branch,
+    isPrivate: repo.private,
+    isArchived: repo.archived,
+    htmlUrl: repo.html_url,
+  };
+}
 
 const positiveIntSchema = z.number().int().min(1);
 
@@ -106,6 +122,12 @@ export interface GitHubInstallationRepositoriesPage {
   hasNextPage: boolean;
 }
 
+export type GitHubRepositoryProbeResult =
+  | { status: 'ACCESSIBLE'; repository: PublicGitHubRepository }
+  | { status: 'ACCESS_REVOKED' }
+  | { status: 'NOT_FOUND' }
+  | { status: 'GONE' };
+
 export interface GitHubClient {
   exchangeOAuthCode(input: {
     code: string;
@@ -119,6 +141,14 @@ export interface GitHubClient {
     installationToken: string,
     options: { page: number; perPage: number }
   ): Promise<GitHubInstallationRepositoriesPage>;
+  findInstallationRepositoryById(
+    installationToken: string,
+    githubRepositoryId: number
+  ): Promise<PublicGitHubRepository | null>;
+  probeRepositoryById(
+    installationToken: string,
+    githubRepositoryId: number
+  ): Promise<GitHubRepositoryProbeResult>;
 }
 
 export interface CreateGitHubClientOptions {
@@ -659,17 +689,115 @@ export function createGitHubClient(options: CreateGitHubClientOptions): GitHubCl
       return {
         totalCount: data.total_count,
         hasNextPage,
-        repositories: data.repositories.map((repo) => ({
-          githubRepositoryId: repo.id,
-          name: repo.name,
-          fullName: repo.full_name,
-          ownerLogin: repo.owner.login,
-          defaultBranch: repo.default_branch,
-          isPrivate: repo.private,
-          isArchived: repo.archived,
-          htmlUrl: repo.html_url,
-        })),
+        repositories: data.repositories.map(toPublicGitHubRepository),
       };
+    },
+
+    async findInstallationRepositoryById(
+      installationToken: string,
+      githubRepositoryId: number
+    ): Promise<PublicGitHubRepository | null> {
+      let nextUrl: string | null = `${apiBaseUrl}/installation/repositories?per_page=100&page=1`;
+
+      for (
+        let pageIndex = 0;
+        pageIndex < MAX_INSTALLATION_REPOSITORY_PAGES && nextUrl;
+        pageIndex += 1
+      ) {
+        const { data, headers } = await requestGitHubApi(
+          nextUrl,
+          { method: 'GET' },
+          listInstallationRepositoriesResponseSchema,
+          {
+            bearerToken: installationToken,
+            notFoundCode: 'GITHUB_INSTALLATION_NOT_FOUND',
+            notFoundMessage: 'GitHub App installation repositories could not be found',
+            forbiddenCode: 'GITHUB_ACCESS_DENIED',
+            forbiddenMessage: 'GitHub installation lacks permissions to list repositories',
+          }
+        );
+
+        const match = data.repositories.find((repo) => repo.id === githubRepositoryId);
+        if (match) {
+          return toPublicGitHubRepository(match);
+        }
+
+        nextUrl = parseLinkNextUrl(headers.get('link'), apiBaseUrl);
+      }
+
+      return null;
+    },
+
+    async probeRepositoryById(
+      installationToken: string,
+      githubRepositoryId: number
+    ): Promise<GitHubRepositoryProbeResult> {
+      const response = await executeFetch(
+        `${apiBaseUrl}/repositories/${githubRepositoryId}`,
+        {
+          method: 'GET',
+          headers: {
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': GITHUB_API_VERSION,
+            'User-Agent': GITHUB_USER_AGENT,
+            Authorization: `Bearer ${installationToken}`,
+          },
+        },
+        installationToken
+      );
+
+      if (response.ok) {
+        const json = await parseJsonSafely(response);
+        const validated = gitHubRepositorySchema.safeParse(json);
+        if (!validated.success) {
+          throw new GitHubError(
+            502,
+            'INVALID_GITHUB_RESPONSE',
+            'Received unexpected repository metadata format from GitHub'
+          );
+        }
+        return {
+          status: 'ACCESSIBLE',
+          repository: toPublicGitHubRepository(validated.data),
+        };
+      }
+
+      const ghMessage = safeRedact(await readSafeErrorMessage(response), installationToken);
+      if (isRateLimitResponse(response.status, response.headers, ghMessage)) {
+        const retryAfterSeconds = parseRetryAfterSeconds(response.headers, now().getTime());
+        throw new GitHubError(
+          429,
+          'GITHUB_RATE_LIMITED',
+          'GitHub API rate limit exceeded; please retry shortly',
+          { retryAfterSeconds }
+        );
+      }
+
+      if (response.status === 401) {
+        throw new GitHubError(
+          502,
+          'GITHUB_AUTH_FAILED',
+          'GitHub authentication failed while verifying repository state'
+        );
+      }
+
+      if (response.status === 403) {
+        return { status: 'ACCESS_REVOKED' };
+      }
+
+      if (response.status === 410) {
+        return { status: 'GONE' };
+      }
+
+      if (response.status === 404) {
+        return { status: 'NOT_FOUND' };
+      }
+
+      throw new GitHubError(
+        502,
+        'GITHUB_API_ERROR',
+        'Unexpected error response received from GitHub'
+      );
     },
   };
 }

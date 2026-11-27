@@ -75,6 +75,7 @@ export interface ProjectRepositoryConnection {
   ownerLogin: string;
   repoName: string;
   fullName: string;
+  htmlUrl: string;
   defaultBranch: string;
   isPrivate: boolean;
   isArchivedOnGitHub: boolean;

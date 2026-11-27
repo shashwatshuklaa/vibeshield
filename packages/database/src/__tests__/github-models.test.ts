@@ -349,6 +349,7 @@ describe('GitHub Integration Database Models and Redaction', () => {
         ownerLogin: '  acme-sec  ',
         repoName: '  backend-api  ',
         fullName: '  acme-sec/backend-api  ',
+        htmlUrl: '  https://github.com/acme-sec/backend-api  ',
         defaultBranch: '  main  ',
         isPrivate: true,
         connectedByUserId: new Types.ObjectId(),
@@ -359,6 +360,23 @@ describe('GitHub Integration Database Models and Redaction', () => {
       expect(valid.repositoryAccessState).toBe('CONNECTED');
       expect(valid.installationAvailability).toBe('ACTIVE');
       expect(valid.fullName).toBe('acme-sec/backend-api');
+      expect(valid.htmlUrl).toBe('https://github.com/acme-sec/backend-api');
+
+      const invalidHtmlUrl = new ProjectRepositoryConnectionModel({
+        organizationId: new Types.ObjectId(),
+        projectId: new Types.ObjectId(),
+        installationRecordId: new Types.ObjectId(),
+        githubInstallationId: 501,
+        githubRepositoryId: 90001,
+        ownerLogin: 'acme-sec',
+        repoName: 'backend-api',
+        fullName: 'acme-sec/backend-api',
+        htmlUrl: 'javascript:alert(1)',
+        defaultBranch: 'main',
+        isPrivate: true,
+        connectedByUserId: new Types.ObjectId(),
+      });
+      expect(await getValidationError(invalidHtmlUrl)).toBeDefined();
 
       const disconnected = new ProjectRepositoryConnectionModel({
         organizationId: new Types.ObjectId(),

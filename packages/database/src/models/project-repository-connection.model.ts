@@ -46,6 +46,21 @@ function isPositiveInteger(value: unknown): boolean {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1;
 }
 
+function isValidHttpUrl(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  if (typeof value !== 'string') {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Computes whether a project repository connection occupies its active uniqueness slot.
  * Only explicit disconnection (either at repository or parent installation level) clears `isActive`.
@@ -98,6 +113,7 @@ export interface ProjectRepositoryConnectionAttributes {
   ownerLogin: string;
   repoName: string;
   fullName: string;
+  htmlUrl?: string;
   defaultBranch: string;
   isPrivate: boolean;
   isArchivedOnGitHub: boolean;
@@ -183,6 +199,16 @@ export const projectRepositoryConnectionSchema: Schema<ProjectRepositoryConnecti
         validate: {
           validator: (value: string) => FULL_NAME_REGEX.test(value),
           message: 'Repository full name must follow owner/repo format',
+        },
+      },
+      htmlUrl: {
+        type: String,
+        trim: true,
+        maxlength: [500, 'Repository HTML URL cannot exceed 500 characters'],
+        default: undefined,
+        validate: {
+          validator: isValidHttpUrl,
+          message: 'Repository HTML URL must be a valid HTTP/HTTPS URL',
         },
       },
       defaultBranch: {

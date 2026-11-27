@@ -5,6 +5,7 @@ import type { GitHubRuntimeConfig } from './config/env.js';
 import type { AuthRouterDependencies } from './modules/auth/auth.routes.js';
 import type { AuthRuntimeConfig } from './modules/auth/auth.types.js';
 import type { GitHubService } from './modules/github/github.service.js';
+import type { GitHubRepositoryConnectionService } from './modules/github/github-connection.service.js';
 import type { HealthDependencies } from './modules/health/health.controller.js';
 import type { OrganizationRouterDependencies } from './modules/organizations/organization.routes.js';
 import type { ProjectService } from './modules/projects/project.service.js';
@@ -21,6 +22,7 @@ export interface CreateAppOptions {
   organizations?: OrganizationRouterDependencies;
   projectService?: ProjectService;
   githubService?: GitHubService;
+  repositoryConnectionService?: GitHubRepositoryConnectionService;
   githubConfig?: GitHubRuntimeConfig | null;
 }
 
@@ -38,6 +40,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
     organizations,
     projectService,
     githubService,
+    repositoryConnectionService,
     githubConfig,
   } = options;
   const app = express();
@@ -66,16 +69,24 @@ export function createApp(options: CreateAppOptions = {}): Express {
         ...organizations,
         ...(projectService && !organizations.projectService ? { projectService } : {}),
         ...(githubService && !organizations.githubService ? { githubService } : {}),
+        ...(repositoryConnectionService && !organizations.repositoryConnectionService
+          ? { repositoryConnectionService }
+          : {}),
         ...(githubConfig !== undefined && organizations.githubConfig === undefined
           ? { githubConfig }
           : {}),
       }
-    : resolvedAuthDeps || projectService || githubService || githubConfig !== undefined
+    : resolvedAuthDeps ||
+        projectService ||
+        githubService ||
+        repositoryConnectionService ||
+        githubConfig !== undefined
       ? {
           authService: resolvedAuthDeps?.authService,
           authConfig: resolvedAuthDeps?.config,
           projectService,
           githubService,
+          repositoryConnectionService,
           githubConfig,
         }
       : undefined;

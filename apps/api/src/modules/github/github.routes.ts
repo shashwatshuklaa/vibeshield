@@ -4,9 +4,15 @@ import { requireOrganizationPermission } from '../../middlewares/authorize-organ
 import { OrganizationPermission } from '../organizations/organization.permissions.js';
 import { createGitHubController } from './github.controller.js';
 import { createGitHubService, type GitHubService } from './github.service.js';
+import { createGitHubRepositoryConnectionController } from './github-connection.controller.js';
+import {
+  createGitHubRepositoryConnectionService,
+  type GitHubRepositoryConnectionService,
+} from './github-connection.service.js';
 
 export interface GitHubRouterDependencies {
   githubService?: GitHubService;
+  repositoryConnectionService?: GitHubRepositoryConnectionService;
   githubConfig?: GitHubRuntimeConfig | null;
   requireOrgMembership: RequestHandler;
 }
@@ -18,7 +24,13 @@ export function createGitHubRouter(dependencies: GitHubRouterDependencies): Rout
   const router: Router = Router({ mergeParams: true });
   const githubService =
     dependencies.githubService ?? createGitHubService({ config: dependencies.githubConfig });
+  const repositoryConnectionService =
+    dependencies.repositoryConnectionService ??
+    createGitHubRepositoryConnectionService({ config: dependencies.githubConfig });
   const controller = createGitHubController(githubService);
+  const connectionController = createGitHubRepositoryConnectionController(
+    repositoryConnectionService
+  );
   const { requireOrgMembership } = dependencies;
 
   router.post(
@@ -50,6 +62,12 @@ export function createGitHubRouter(dependencies: GitHubRouterDependencies): Rout
     requireOrgMembership,
     requireOrganizationPermission(OrganizationPermission.GITHUB_INTEGRATION_READ),
     controller.listRepositories
+  );
+  router.get(
+    '/connections',
+    requireOrgMembership,
+    requireOrganizationPermission(OrganizationPermission.GITHUB_INTEGRATION_READ),
+    connectionController.listByOrganization
   );
 
   return router;
