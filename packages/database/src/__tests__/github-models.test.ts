@@ -447,10 +447,10 @@ describe('GitHub Integration Database Models and Redaction', () => {
   });
 
   describe('WebhookDeliveryModel', () => {
-    it('validates delivery fields, enums, sha256 digest, unique deliveryId, and TTL index', async () => {
+    it('validates delivery fields, enums, sha256 digest, error redaction, unique deliveryId, and TTL index', async () => {
       expect(WebhookDeliveryModel.modelName).toBe('WebhookDelivery');
       expect(WebhookDeliveryModel.collection.name).toBe('webhook_deliveries');
-      expect(WEBHOOK_DELIVERY_OUTCOMES).toEqual(['PROCESSED', 'IGNORED', 'FAILED']);
+      expect(WEBHOOK_DELIVERY_OUTCOMES).toEqual(['PROCESSING', 'PROCESSED', 'IGNORED', 'FAILED']);
 
       const sha = createHash('sha256').update('{"action":"created"}').digest('hex');
       const doc = new WebhookDeliveryModel({
@@ -460,12 +460,15 @@ describe('GitHub Integration Database Models and Redaction', () => {
         githubInstallationId: 999,
         payloadSha256: sha.toUpperCase(),
         outcome: WebhookDeliveryOutcomeValue.PROCESSED,
+        errorMessage: 'Upstream error with Bearer secret_token_123456',
         expiresAt: new Date(Date.now() + 86_400_000),
       });
 
       expect(await getValidationError(doc)).toBeUndefined();
       expect(doc.deliveryId).toBe('123e4567-e89b-12d3-a456-426614174000');
       expect(doc.payloadSha256).toBe(sha);
+      expect(doc.attemptCount).toBe(1);
+      expect(doc.errorMessage).toBe('Upstream error with Bearer [REDACTED]');
 
       const invalid = new WebhookDeliveryModel({
         deliveryId: 'id-1',

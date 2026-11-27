@@ -1,10 +1,12 @@
 import { Schema, type HydratedDocument, type Model } from 'mongoose';
 import { getOrCreateModel } from '../utils/normalization.js';
+import { redactGitHubSecrets } from '../utils/redaction.js';
 
-export const WEBHOOK_DELIVERY_OUTCOMES = ['PROCESSED', 'IGNORED', 'FAILED'] as const;
+export const WEBHOOK_DELIVERY_OUTCOMES = ['PROCESSING', 'PROCESSED', 'IGNORED', 'FAILED'] as const;
 export type WebhookDeliveryOutcome = (typeof WEBHOOK_DELIVERY_OUTCOMES)[number];
 
 export const WebhookDeliveryOutcomeValue = {
+  PROCESSING: 'PROCESSING',
   PROCESSED: 'PROCESSED',
   IGNORED: 'IGNORED',
   FAILED: 'FAILED',
@@ -16,6 +18,10 @@ function isNullablePositiveInteger(value: unknown): boolean {
   return value === null || (typeof value === 'number' && Number.isInteger(value) && value >= 1);
 }
 
+function isPositiveInteger(value: unknown): boolean {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1;
+}
+
 export interface WebhookDeliveryAttributes {
   deliveryId: string;
   event: string;
@@ -23,6 +29,13 @@ export interface WebhookDeliveryAttributes {
   githubInstallationId: number | null;
   payloadSha256: string;
   outcome: WebhookDeliveryOutcome;
+  outcomeReason: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  attemptCount: number;
+  processingStartedAt: Date | null;
+  processedAt: Date | null;
+  failedAt: Date | null;
   receivedAt: Date;
   expiresAt: Date;
 }
@@ -84,6 +97,47 @@ export const webhookDeliverySchema = new Schema<WebhookDeliveryAttributes>(
         values: WEBHOOK_DELIVERY_OUTCOMES,
         message: 'Invalid webhook delivery outcome',
       },
+    },
+    outcomeReason: {
+      type: String,
+      trim: true,
+      maxlength: [500, 'Webhook outcome reason cannot exceed 500 characters'],
+      default: null,
+    },
+    errorCode: {
+      type: String,
+      trim: true,
+      maxlength: [64, 'Webhook error code cannot exceed 64 characters'],
+      default: null,
+    },
+    errorMessage: {
+      type: String,
+      trim: true,
+      maxlength: [500, 'Webhook error message cannot exceed 500 characters'],
+      set: (value: unknown) =>
+        typeof value === 'string' ? redactGitHubSecrets(value).slice(0, 500) : value,
+      default: null,
+    },
+    attemptCount: {
+      type: Number,
+      required: true,
+      default: 1,
+      validate: {
+        validator: isPositiveInteger,
+        message: 'Webhook attempt count must be a positive integer',
+      },
+    },
+    processingStartedAt: {
+      type: Date,
+      default: null,
+    },
+    processedAt: {
+      type: Date,
+      default: null,
+    },
+    failedAt: {
+      type: Date,
+      default: null,
     },
     receivedAt: {
       type: Date,

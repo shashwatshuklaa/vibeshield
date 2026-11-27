@@ -6,6 +6,8 @@ import type { AuthRouterDependencies } from './modules/auth/auth.routes.js';
 import type { AuthRuntimeConfig } from './modules/auth/auth.types.js';
 import type { GitHubService } from './modules/github/github.service.js';
 import type { GitHubRepositoryConnectionService } from './modules/github/github-connection.service.js';
+import { createGitHubWebhookRouter } from './modules/github/github-webhook.routes.js';
+import type { GitHubWebhookService } from './modules/github/github-webhook.service.js';
 import type { HealthDependencies } from './modules/health/health.controller.js';
 import type { OrganizationRouterDependencies } from './modules/organizations/organization.routes.js';
 import type { ProjectService } from './modules/projects/project.service.js';
@@ -16,6 +18,7 @@ import { errorHandler } from './middlewares/error-handler.js';
 export interface CreateAppOptions {
   apiPrefix?: string;
   bodyLimit?: string;
+  webhookBodyLimit?: string;
   health?: HealthDependencies;
   auth?: AuthRouterDependencies;
   authConfig?: AuthRuntimeConfig;
@@ -23,6 +26,7 @@ export interface CreateAppOptions {
   projectService?: ProjectService;
   githubService?: GitHubService;
   repositoryConnectionService?: GitHubRepositoryConnectionService;
+  webhookService?: GitHubWebhookService;
   githubConfig?: GitHubRuntimeConfig | null;
 }
 
@@ -34,6 +38,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
   const {
     apiPrefix = '/api/v1',
     bodyLimit = '1mb',
+    webhookBodyLimit,
     health,
     auth,
     authConfig,
@@ -41,6 +46,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
     projectService,
     githubService,
     repositoryConnectionService,
+    webhookService,
     githubConfig,
   } = options;
   const app = express();
@@ -48,7 +54,18 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // 1. Security Headers via Helmet
   app.use(helmet());
 
-  // 2. Request body and cookie parsing with strict payload limit
+  // 2. Scoped GitHub Webhook Router BEFORE global express.json() so X-Hub-Signature-256
+  // is verified strictly against exact raw request bytes without re-serialization
+  app.use(
+    `${apiPrefix}/webhooks`,
+    createGitHubWebhookRouter({
+      webhookService,
+      githubConfig,
+      webhookBodyLimit,
+    })
+  );
+
+  // 3. Request body and cookie parsing with strict payload limit for all standard JSON routes
   app.use(express.json({ limit: bodyLimit }));
   app.use(cookieParser());
 
