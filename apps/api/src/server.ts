@@ -1,8 +1,17 @@
 import type { Server } from 'node:http';
 import type { Express } from 'express';
 import { connectDatabase, disconnectDatabase, formatSafeError } from '@vibeshield/database';
+import {
+  closeQueueResources,
+  createScanJobsQueue,
+  formatSafeRedisError,
+  RedisConnectionManager,
+  type ManagedQueueHandle,
+  type QueueRuntimeConfig,
+  type RedisConnectionStatus,
+} from '@vibeshield/queue';
 import { createApp, type CreateAppOptions } from './app.js';
-import { getApiConfig, toAuthConfig, toGitHubConfig } from './config/env.js';
+import { getApiConfig, toAuthConfig, toGitHubConfig, toQueueConfig } from './config/env.js';
 
 export interface ServerLogger {
   info?: (message: string) => void;
@@ -14,6 +23,9 @@ export interface ServerDependencies {
   envSource?: Record<string, string | undefined>;
   connectDb?: (uri: string) => Promise<void>;
   disconnectDb?: () => Promise<void>;
+  connectQueue?: (config: QueueRuntimeConfig) => Promise<void>;
+  disconnectQueue?: () => Promise<void>;
+  getQueueStatus?: () => RedisConnectionStatus & { required?: boolean };
   createAppFn?: (options?: CreateAppOptions) => Express;
   logger?: ServerLogger;
   shutdownTimeoutMs?: number;
@@ -21,6 +33,7 @@ export interface ServerDependencies {
 
 export interface ShutdownDependencies {
   disconnectDb?: () => Promise<void>;
+  disconnectQueue?: () => Promise<void>;
   logger?: ServerLogger;
   shutdownTimeoutMs?: number;
 }
@@ -35,19 +48,24 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 
 let activeServer: Server | null = null;
 let activeDisconnectDb: () => Promise<void> = disconnectDatabase;
+let activeDisconnectQueue: () => Promise<void> = async () => undefined;
 let shutdownPromise: Promise<void> | null = null;
 
 /**
  * Starts the VibeShield API server following the strict lifecycle sequence:
  * 1. Validate environment configuration.
  * 2. Connect to MongoDB.
- * 3. Start the HTTP server only after database connection succeeds.
+ * 3. Initialize optional Redis & BullMQ queue infrastructure if enabled.
+ * 4. Start the HTTP server only after required dependencies succeed.
  */
 export async function startServer(dependencies: ServerDependencies = {}): Promise<Server> {
   const {
     envSource,
     connectDb = (uri: string) => connectDatabase(uri),
     disconnectDb = () => disconnectDatabase(),
+    connectQueue,
+    disconnectQueue,
+    getQueueStatus,
     createAppFn = createApp,
     logger = DEFAULT_LOGGER,
   } = dependencies;
@@ -58,12 +76,87 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
   // 2. Establish MongoDB connection before binding HTTP port
   await connectDb(config.MONGODB_URI);
 
-  // 3. Instantiate Express application
+  // 3. Initialize optional Redis & BullMQ foundation explicitly when enabled
+  const queueConfig = toQueueConfig(config);
+  let ownedRedisManager: RedisConnectionManager | null = null;
+  let ownedScanQueue: ManagedQueueHandle | null = null;
+
+  const resolvedDisconnectQueue: () => Promise<void> = disconnectQueue
+    ? disconnectQueue
+    : async () => {
+        if (ownedScanQueue || ownedRedisManager) {
+          await closeQueueResources(
+            [ownedScanQueue],
+            ownedRedisManager ?? new RedisConnectionManager({ logger })
+          );
+          ownedScanQueue = null;
+          ownedRedisManager = null;
+        }
+      };
+
+  const resolvedGetQueueStatus: () => RedisConnectionStatus & { required?: boolean } =
+    getQueueStatus ??
+    (() => {
+      if (!queueConfig) {
+        return { enabled: false, state: 'disabled', isConnected: false, required: false };
+      }
+      if (!ownedRedisManager) {
+        return {
+          enabled: true,
+          state: 'not_initialized',
+          isConnected: false,
+          required: queueConfig.required,
+        };
+      }
+      return {
+        ...ownedRedisManager.getStatus(true),
+        required: queueConfig.required,
+      };
+    });
+
+  if (queueConfig) {
+    try {
+      if (connectQueue) {
+        await connectQueue(queueConfig);
+      } else {
+        ownedRedisManager = new RedisConnectionManager({ logger });
+        await ownedRedisManager.connect(queueConfig.redis);
+        ownedScanQueue = createScanJobsQueue(ownedRedisManager, {
+          defaultJobOptions: {
+            attempts: queueConfig.defaultAttempts,
+            backoff: {
+              type: 'exponential',
+              delay: queueConfig.backoffDelayMs,
+            },
+          },
+        });
+      }
+    } catch (queueError) {
+      const safeQueueError = formatSafeRedisError(queueError);
+      if (queueConfig.required) {
+        await resolvedDisconnectQueue().catch(() => undefined);
+        await disconnectDb().catch(() => undefined);
+        throw queueError;
+      }
+      logger.warn?.(
+        `[VibeShield API] Optional queue initialization unavailable; continuing without queue readiness: ${safeQueueError}`
+      );
+    }
+  }
+
+  // 4. Instantiate Express application
   const authConfig = toAuthConfig(config);
   const githubConfig = toGitHubConfig(config);
-  const app = createAppFn({ apiPrefix: config.API_PREFIX, authConfig, githubConfig });
+  const app = createAppFn({
+    apiPrefix: config.API_PREFIX,
+    authConfig,
+    githubConfig,
+    health: {
+      getQueueStatus: resolvedGetQueueStatus,
+    },
+  });
 
-  // 4. Bind and listen on configured host and port
+  // 5. Bind and listen on configured host and port
   const port = config.PORT ?? 4000;
   const host = config.HOST;
 
@@ -94,9 +187,17 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
 
     activeServer = startedServer;
     activeDisconnectDb = disconnectDb;
+    activeDisconnectQueue = resolvedDisconnectQueue;
     return startedServer;
   } catch (error) {
-    // Ensure database connection is not left dangling if HTTP server fails to bind
+    // Ensure queue and database connections are not left dangling if HTTP server fails to bind
+    try {
+      await resolvedDisconnectQueue();
+    } catch (queueDisconnectError) {
+      logger.error?.(
+        `[VibeShield API] Failed to disconnect Redis/queue after HTTP listen failure: ${formatSafeRedisError(queueDisconnectError)}`
+      );
+    }
     try {
       await disconnectDb();
     } catch (disconnectError) {
@@ -109,7 +210,7 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
 }
 
 /**
- * Gracefully shuts down the HTTP server and disconnects MongoDB.
+ * Gracefully shuts down the HTTP server, queue/Redis connections, and MongoDB.
  * Deduplicates concurrent shutdown calls and enforces a close timeout so the process never hangs.
  */
 export function shutdownServer(
@@ -122,6 +223,7 @@ export function shutdownServer(
 
   const {
     disconnectDb = activeDisconnectDb,
+    disconnectQueue = activeDisconnectQueue,
     logger = DEFAULT_LOGGER,
     shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
   } = dependencies;
@@ -146,6 +248,17 @@ export function shutdownServer(
     }
 
     try {
+      await disconnectQueue();
+    } catch (error) {
+      if (!shutdownError) {
+        shutdownError = error instanceof Error ? error : new Error(formatSafeRedisError(error));
+      }
+      logger.error?.(
+        `[VibeShield API] Error while disconnecting Redis/queue: ${formatSafeRedisError(error)}`
+      );
+    }
+
+    try {
       await disconnectDb();
       logger.info?.('[VibeShield API] MongoDB connection closed.');
     } catch (error) {
@@ -158,6 +271,7 @@ export function shutdownServer(
     } finally {
       activeServer = null;
       activeDisconnectDb = disconnectDatabase;
+      activeDisconnectQueue = async () => undefined;
       shutdownPromise = null;
     }
 
@@ -216,6 +330,7 @@ async function closeHttpServerWithTimeout(
 export function resetServerStateForTests(): void {
   activeServer = null;
   activeDisconnectDb = disconnectDatabase;
+  activeDisconnectQueue = async () => undefined;
   shutdownPromise = null;
 }
 

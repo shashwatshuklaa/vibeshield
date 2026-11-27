@@ -109,7 +109,7 @@ pnpm run test:integration
 
 - **`GET /`**: Service identity and documentation pointer.
 - **`GET /api/v1/health/live`**: Liveness probe indicating the Node.js API process is operational. Independent of MongoDB availability.
-- **`GET /api/v1/health/ready`**: Readiness probe checking MongoDB connection status. Returns HTTP `200` when connected and HTTP `503` when unavailable or disconnected.
+- **`GET /api/v1/health/ready`**: Readiness probe checking MongoDB connectivity and reporting queue status (`disabled`, `connected`, `not_initialized`, or `unavailable` under `checks.queue`). Returns HTTP `200` when MongoDB is connected (and any required Redis queue is connected), or HTTP `503` when MongoDB or a required Redis connection is down. Optional disabled/unavailable queues do not fail API readiness.
 - **`GET /api/v1/health`**: Backward-compatible process health endpoint (behaves identically to `/api/v1/health/live`).
 - **`POST /api/v1/auth/register`**: Register a new user (`email`, `displayName`, `password`), handling concurrent duplicate emails via MongoDB unique index (`409`).
 - **`POST /api/v1/auth/login`**: Authenticate user, create a hashed session, set `vs_refresh_token` HttpOnly cookie, and return `{ user, accessToken, expiresIn }`.

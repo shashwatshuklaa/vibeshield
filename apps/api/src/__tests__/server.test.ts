@@ -241,4 +241,83 @@ describe('API Server Lifecycle Integration', () => {
     expect(disconnectDb).toHaveBeenCalledTimes(1);
     expect(server.listening).toBe(false);
   });
+
+  it('initializes optional queue on startup when QUEUE_ENABLED=true, disconnects on shutdown, and fails closed when REDIS_REQUIRED=true', async () => {
+    const events: string[] = [];
+    const logger = createMockLogger();
+    const port = await getFreePort();
+    const connectDb = vi.fn(async () => {
+      events.push('db:connect');
+    });
+    const disconnectDb = vi.fn(async () => {
+      events.push('db:disconnect');
+    });
+    const connectQueue = vi.fn(async () => {
+      events.push('queue:connect');
+    });
+    const disconnectQueue = vi.fn(async () => {
+      events.push('queue:disconnect');
+    });
+
+    const server = await startServer({
+      envSource: {
+        NODE_ENV: 'test',
+        PORT: String(port),
+        HOST: '127.0.0.1',
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_test',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+        QUEUE_ENABLED: 'true',
+        REDIS_URL: 'redis://:secretPass@127.0.0.1:6379/0',
+      },
+      connectDb,
+      disconnectDb,
+      connectQueue,
+      disconnectQueue,
+      getQueueStatus: () => ({
+        enabled: true,
+        state: 'connected',
+        isConnected: true,
+        required: false,
+      }),
+      logger,
+    });
+
+    expect(events).toEqual(['db:connect', 'queue:connect']);
+    expect(server.listening).toBe(true);
+
+    await shutdownServer('SIGTERM', { disconnectDb, disconnectQueue, logger });
+    expect(events).toEqual(['db:connect', 'queue:connect', 'queue:disconnect', 'db:disconnect']);
+
+    // Required Redis outage fails startup and cleans up MongoDB without leaking credentials
+    const exitSpy = vi.fn();
+    const failingLogger = createMockLogger();
+    const dbDisconnectSpy = vi.fn(async () => undefined);
+    const failedBoot = await bootstrapServer({
+      envSource: {
+        NODE_ENV: 'test',
+        PORT: String(await getFreePort()),
+        HOST: '127.0.0.1',
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_test',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+        QUEUE_ENABLED: 'true',
+        REDIS_REQUIRED: 'true',
+        REDIS_URL: 'redis://:SuperSecretRedisPW@127.0.0.1:6379/0',
+      },
+      connectDb: vi.fn(async () => undefined),
+      disconnectDb: dbDisconnectSpy,
+      connectQueue: vi.fn(async () => {
+        throw new Error('ECONNREFUSED redis://:SuperSecretRedisPW@127.0.0.1:6379/0');
+      }),
+      disconnectQueue: vi.fn(async () => undefined),
+      logger: failingLogger,
+      exit: exitSpy,
+    });
+
+    expect(failedBoot).toBeUndefined();
+    expect(dbDisconnectSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(failingLogger.error.mock.calls.map((c) => String(c[0])).join('\n')).not.toContain(
+      'SuperSecretRedisPW'
+    );
+  });
 });

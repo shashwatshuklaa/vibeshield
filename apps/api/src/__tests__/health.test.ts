@@ -135,5 +135,86 @@ describe('Health and Readiness Endpoints', () => {
       expect(JSON.stringify(res.body)).not.toContain('secret');
       expect(JSON.stringify(res.body)).not.toContain('internal:27017');
     });
+
+    it('distinguishes disabled, connected, not_initialized, and unavailable queue readiness without failing unrelated API readiness when optional', async () => {
+      const baseDbUp = () => ({
+        state: 'connected' as const,
+        readyState: 1,
+        isConnected: true,
+      });
+
+      const disabledRes = await request(
+        createApp({
+          health: {
+            getDatabaseStatus: baseDbUp,
+            getQueueStatus: () => ({
+              enabled: false,
+              state: 'disabled',
+              isConnected: false,
+              required: false,
+            }),
+          },
+        })
+      ).get('/api/v1/health/ready');
+      expect(disabledRes.status).toBe(200);
+      expect(disabledRes.body.checks.queue).toEqual({
+        status: 'disabled',
+        state: 'disabled',
+        required: false,
+      });
+
+      const connectedRes = await request(
+        createApp({
+          health: {
+            getDatabaseStatus: baseDbUp,
+            getQueueStatus: () => ({
+              enabled: true,
+              state: 'connected',
+              isConnected: true,
+              required: true,
+            }),
+          },
+        })
+      ).get('/api/v1/health/ready');
+      expect(connectedRes.status).toBe(200);
+      expect(connectedRes.body.checks.queue).toEqual({
+        status: 'connected',
+        state: 'connected',
+        required: true,
+      });
+
+      const optionalUnavailableRes = await request(
+        createApp({
+          health: {
+            getDatabaseStatus: baseDbUp,
+            getQueueStatus: () => ({
+              enabled: true,
+              state: 'unavailable',
+              isConnected: false,
+              required: false,
+            }),
+          },
+        })
+      ).get('/api/v1/health/ready');
+      expect(optionalUnavailableRes.status).toBe(200);
+      expect(optionalUnavailableRes.body.checks.queue.status).toBe('unavailable');
+
+      const requiredUnavailableRes = await request(
+        createApp({
+          health: {
+            getDatabaseStatus: baseDbUp,
+            getQueueStatus: () => ({
+              enabled: true,
+              state: 'not_initialized',
+              isConnected: false,
+              required: true,
+            }),
+          },
+        })
+      ).get('/api/v1/health/ready');
+      expect(requiredUnavailableRes.status).toBe(503);
+      expect(requiredUnavailableRes.body.status).toBe('not_ready');
+      expect(requiredUnavailableRes.body.checks.queue.status).toBe('not_initialized');
+    });
   });
 });

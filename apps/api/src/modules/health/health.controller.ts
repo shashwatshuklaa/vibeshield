@@ -4,6 +4,7 @@ import {
   type DatabaseConnectionState,
   type DatabaseConnectionStatus,
 } from '@vibeshield/database';
+import type { RedisConnectionState, RedisConnectionStatus } from '@vibeshield/queue';
 
 export interface HealthCheckResponse {
   status: 'ok';
@@ -14,6 +15,8 @@ export interface HealthCheckResponse {
   version: string;
 }
 
+export type QueueReadinessStatus = 'disabled' | 'connected' | 'unavailable' | 'not_initialized';
+
 export interface ReadinessCheckResponse {
   status: 'ready' | 'not_ready';
   service: 'vibeshield-api';
@@ -23,11 +26,17 @@ export interface ReadinessCheckResponse {
       status: 'up' | 'down';
       state: DatabaseConnectionState;
     };
+    queue: {
+      status: QueueReadinessStatus;
+      state: RedisConnectionState;
+      required: boolean;
+    };
   };
 }
 
 export interface HealthDependencies {
   getDatabaseStatus?: () => DatabaseConnectionStatus;
+  getQueueStatus?: () => RedisConnectionStatus & { required?: boolean };
 }
 
 /**
@@ -60,6 +69,7 @@ export function createReadinessHandler(
   dependencies: HealthDependencies = {}
 ): (_req: Request, res: Response) => void {
   const resolveDatabaseStatus = dependencies.getDatabaseStatus ?? getDatabaseStatus;
+  const resolveQueueStatus = dependencies.getQueueStatus;
 
   return (_req: Request, res: Response): void => {
     let dbState: DatabaseConnectionState = 'disconnected';
@@ -74,8 +84,38 @@ export function createReadinessHandler(
       isDbConnected = false;
     }
 
+    let queueCheckStatus: QueueReadinessStatus = 'disabled';
+    let queueConnectionState: RedisConnectionState = 'disabled';
+    let queueRequired = false;
+
+    if (resolveQueueStatus) {
+      try {
+        const qStatus = resolveQueueStatus();
+        queueRequired = Boolean(qStatus.required);
+        if (!qStatus.enabled) {
+          queueCheckStatus = 'disabled';
+          queueConnectionState = 'disabled';
+        } else if (qStatus.isConnected) {
+          queueCheckStatus = 'connected';
+          queueConnectionState = qStatus.state;
+        } else if (qStatus.state === 'not_initialized') {
+          queueCheckStatus = 'not_initialized';
+          queueConnectionState = 'not_initialized';
+        } else {
+          queueCheckStatus = 'unavailable';
+          queueConnectionState = qStatus.state;
+        }
+      } catch {
+        queueCheckStatus = 'unavailable';
+        queueConnectionState = 'unavailable';
+      }
+    }
+
+    const queueBlocksReadiness = queueRequired && queueCheckStatus !== 'connected';
+    const isOverallReady = isDbConnected && !queueBlocksReadiness;
+
     const response: ReadinessCheckResponse = {
-      status: isDbConnected ? 'ready' : 'not_ready',
+      status: isOverallReady ? 'ready' : 'not_ready',
       service: 'vibeshield-api',
       timestamp: new Date().toISOString(),
       checks: {
@@ -83,9 +123,14 @@ export function createReadinessHandler(
           status: isDbConnected ? 'up' : 'down',
           state: dbState,
         },
+        queue: {
+          status: queueCheckStatus,
+          state: queueConnectionState,
+          required: queueRequired,
+        },
       },
     };
 
-    res.status(isDbConnected ? 200 : 503).json(response);
+    res.status(isOverallReady ? 200 : 503).json(response);
   };
 }

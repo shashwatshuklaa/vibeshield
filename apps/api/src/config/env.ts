@@ -5,6 +5,12 @@ import {
   redactGitHubSecrets,
   SLUG_REGEX,
 } from '@vibeshield/database';
+import {
+  DEFAULT_QUEUE_POLICY,
+  DEFAULT_REDIS_OPTIONS,
+  isValidRedisUrl,
+  type QueueRuntimeConfig,
+} from '@vibeshield/queue';
 import { baseEnvSchema, validateEnv, z } from '@vibeshield/env';
 import type { AuthRuntimeConfig } from '../modules/auth/auth.types.js';
 
@@ -273,9 +279,105 @@ const baseApiEnvSchema = baseEnvSchema.extend({
         'Must be a valid HTTP/HTTPS callback URL without wildcards, query parameters, or fragments',
     })
     .optional(),
+
+  /**
+   * Explicitly enables optional Redis & BullMQ queue integration in the API process.
+   */
+  QUEUE_ENABLED: z
+    .enum(['true', 'false'])
+    .transform((value) => value === 'true')
+    .optional(),
+
+  /**
+   * When true alongside QUEUE_ENABLED=true, API startup fails closed if Redis cannot be reached.
+   */
+  REDIS_REQUIRED: z
+    .enum(['true', 'false'])
+    .transform((value) => value === 'true')
+    .optional(),
+
+  /**
+   * Redis connection URI (redis:// or rediss://). Required when QUEUE_ENABLED=true.
+   */
+  REDIS_URL: z
+    .string()
+    .trim()
+    .min(1)
+    .refine(isValidRedisUrl, {
+      message: 'Must be a valid Redis connection URI (redis:// or rediss://)',
+    })
+    .optional(),
+
+  /**
+   * TCP connection timeout in milliseconds for Redis connections (100-60000).
+   */
+  REDIS_CONNECT_TIMEOUT_MS: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'Must be a positive integer timeout in milliseconds')
+    .transform(Number)
+    .refine((ms) => ms >= 100 && ms <= 60_000, {
+      message: 'Must be between 100 and 60000 milliseconds',
+    })
+    .optional(),
+
+  /**
+   * Command timeout in milliseconds for non-blocking Queue producer Redis operations (100-60000).
+   */
+  REDIS_COMMAND_TIMEOUT_MS: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'Must be a positive integer timeout in milliseconds')
+    .transform(Number)
+    .refine((ms) => ms >= 100 && ms <= 60_000, {
+      message: 'Must be between 100 and 60000 milliseconds',
+    })
+    .optional(),
+
+  /**
+   * Default bounded BullMQ job attempts before moving a job to failed (1-20).
+   */
+  QUEUE_DEFAULT_ATTEMPTS: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'Must be a positive integer attempt count')
+    .transform(Number)
+    .refine((attempts) => attempts >= 1 && attempts <= 20, {
+      message: 'Must be between 1 and 20 attempts',
+    })
+    .optional(),
+
+  /**
+   * Base delay in milliseconds for exponential job retry backoff (100-60000).
+   */
+  QUEUE_BACKOFF_DELAY_MS: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'Must be a positive integer backoff delay in milliseconds')
+    .transform(Number)
+    .refine((ms) => ms >= 100 && ms <= 60_000, {
+      message: 'Must be between 100 and 60000 milliseconds',
+    })
+    .optional(),
 });
 
 export const apiEnvSchema = baseApiEnvSchema.superRefine((env, ctx) => {
+  if (env.REDIS_REQUIRED && !env.QUEUE_ENABLED) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['QUEUE_ENABLED'],
+      message: 'QUEUE_ENABLED must be true when REDIS_REQUIRED is true',
+    });
+  }
+
+  if (env.QUEUE_ENABLED && env.REDIS_URL === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['REDIS_URL'],
+      message: 'REDIS_URL is required when QUEUE_ENABLED is true',
+    });
+  }
+
   const hasAnyGitHubSetting =
     REQUIRED_GITHUB_ENV_KEYS.some((key) => env[key] !== undefined) ||
     env.GITHUB_WEBHOOK_SECRET_PREVIOUS !== undefined;
@@ -361,6 +463,30 @@ export function toGitHubConfig(env: ApiEnv): GitHubRuntimeConfig | null {
     ...(env.GITHUB_WEBHOOK_SECRET_PREVIOUS !== undefined
       ? { previousWebhookSecret: env.GITHUB_WEBHOOK_SECRET_PREVIOUS }
       : {}),
+  };
+}
+
+/**
+ * Extracts validated optional Redis & BullMQ queue runtime configuration, or returns `null` when
+ * queue functionality is disabled (`QUEUE_ENABLED !== true`).
+ */
+export function toQueueConfig(env: ApiEnv): QueueRuntimeConfig | null {
+  if (!env.QUEUE_ENABLED || !env.REDIS_URL) {
+    return null;
+  }
+
+  return {
+    enabled: true,
+    required: env.REDIS_REQUIRED === true,
+    redis: {
+      url: env.REDIS_URL,
+      connectTimeoutMs: env.REDIS_CONNECT_TIMEOUT_MS ?? DEFAULT_REDIS_OPTIONS.connectTimeoutMs,
+      ...(env.REDIS_COMMAND_TIMEOUT_MS !== undefined
+        ? { commandTimeoutMs: env.REDIS_COMMAND_TIMEOUT_MS }
+        : {}),
+    },
+    defaultAttempts: env.QUEUE_DEFAULT_ATTEMPTS ?? DEFAULT_QUEUE_POLICY.attempts,
+    backoffDelayMs: env.QUEUE_BACKOFF_DELAY_MS ?? DEFAULT_QUEUE_POLICY.backoff.delay ?? 1000,
   };
 }
 

@@ -15,6 +15,7 @@
   "dependencies": {
     "@vibeshield/database": "workspace:*",
     "@vibeshield/env": "workspace:*",
+    "@vibeshield/queue": "workspace:*",
     "@vibeshield/types": "workspace:*",
     "argon2": "^0.45.2",
     "cookie-parser": "^1.4.7",

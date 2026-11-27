@@ -33,15 +33,17 @@ const DEFAULT_LOGGER: Required<DatabaseLogger> = {
 };
 
 const MONGO_URI_PATTERN = /mongodb(?:\+srv)?:\/\/[^\s'"`]+/gi;
+const REDIS_URI_PATTERN = /rediss?:\/\/[^\s'"`]+/gi;
 const CREDENTIAL_SEGMENT_PATTERN = /([^\s/:@]+):([^\s/@]+)@/g;
 
 /**
- * Redacts MongoDB URIs and embedded user:password credentials from arbitrary strings
+ * Redacts MongoDB URIs, Redis URIs, and embedded user:password credentials from arbitrary strings
  * so secrets never leak into logs or thrown error messages.
  */
 export function redactMongoUri(input: string): string {
   return input
     .replace(MONGO_URI_PATTERN, '[REDACTED_MONGODB_URI]')
+    .replace(REDIS_URI_PATTERN, '[REDACTED_REDIS_URL]')
     .replace(CREDENTIAL_SEGMENT_PATTERN, '[REDACTED_CREDENTIALS]@');
 }
 

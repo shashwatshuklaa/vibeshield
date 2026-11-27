@@ -1,0 +1,383 @@
+import { EventEmitter } from 'node:events';
+import { describe, expect, it, vi } from 'vitest';
+import { ScanStatus } from '@vibeshield/types';
+import {
+  buildDefaultJobOptions,
+  buildRedisConnectionOptions,
+  buildScanJobId,
+  closeQueueResources,
+  DEFAULT_QUEUE_POLICY,
+  defaultRedisManager,
+  formatSafeRedisError,
+  inspectQueueHealth,
+  isTlsRedisUrl,
+  isValidQueueName,
+  isValidRedisUrl,
+  JOB_PRIORITIES,
+  MAX_JOB_PAYLOAD_BYTES,
+  QUEUE_NAMES,
+  redactRedisUrl,
+  RedisConnectionError,
+  RedisConnectionManager,
+  validateScanQueueJobPayload,
+  type RedisClientLike,
+} from '../index.js';
+
+class MockRedisClient extends EventEmitter implements RedisClientLike {
+  public status = 'wait';
+  public connectCalls = 0;
+  public pingCalls = 0;
+  public quitCalls = 0;
+  public disconnectCalls = 0;
+  public shouldFailConnect: Error | null = null;
+  public shouldFailQuit: Error | null = null;
+
+  async connect(): Promise<void> {
+    this.connectCalls += 1;
+    if (this.shouldFailConnect) {
+      this.status = 'end';
+      throw this.shouldFailConnect;
+    }
+    this.status = 'ready';
+    this.emit('ready');
+  }
+
+  async ping(): Promise<string> {
+    this.pingCalls += 1;
+    return 'PONG';
+  }
+
+  async quit(): Promise<string> {
+    this.quitCalls += 1;
+    if (this.shouldFailQuit) {
+      throw this.shouldFailQuit;
+    }
+    this.status = 'end';
+    this.emit('end');
+    return 'OK';
+  }
+
+  disconnect(): void {
+    this.disconnectCalls += 1;
+    this.status = 'end';
+  }
+}
+
+describe('@vibeshield/queue Unit Tests', () => {
+  describe('Redis URL validation, TLS, and credential redaction', () => {
+    it('validates redis:// and rediss:// URLs and rejects invalid URLs or DB indexes', () => {
+      expect(isValidRedisUrl('redis://localhost:6379')).toBe(true);
+      expect(isValidRedisUrl('redis://default:s3cr3t@cache.internal:6380/2')).toBe(true);
+      expect(isValidRedisUrl('rediss://:tlsSecret@redis.prod.example.com:6380/0')).toBe(true);
+
+      expect(isTlsRedisUrl('rediss://redis.prod.example.com:6380')).toBe(true);
+      expect(isTlsRedisUrl('redis://localhost:6379')).toBe(false);
+
+      expect(isValidRedisUrl('')).toBe(false);
+      expect(isValidRedisUrl('http://localhost:6379')).toBe(false);
+      expect(isValidRedisUrl('mongodb://localhost:27017')).toBe(false);
+      expect(isValidRedisUrl('redis://localhost:99999')).toBe(false);
+      expect(isValidRedisUrl('redis://localhost:6379/99')).toBe(false);
+      expect(isValidRedisUrl('redis://localhost:6379/notadb')).toBe(false);
+      expect(isValidRedisUrl('redis://bad host:6379')).toBe(false);
+    });
+
+    it('redacts Redis URLs, passwords, and secrets from error formatting', () => {
+      const secretUrl = 'rediss://admin:UltraSecretRedisPass99!@cache.prod.internal:6380/1';
+      const rawMsg = `ECONNREFUSED connecting to ${secretUrl} password=UltraSecretRedisPass99!`;
+      const redacted = redactRedisUrl(rawMsg);
+
+      expect(redacted).not.toContain('UltraSecretRedisPass99!');
+      expect(redacted).not.toContain('cache.prod.internal');
+      expect(redacted).toContain('[REDACTED_REDIS_URL]');
+
+      const safeErr = formatSafeRedisError(new Error('Auth failed: myPlainSecret42'), [
+        'myPlainSecret42',
+      ]);
+      expect(safeErr).not.toContain('myPlainSecret42');
+      expect(safeErr).toContain('[REDACTED_SECRET]');
+    });
+
+    it('builds role-separated ioredis options cleanly with strict TLS defaults', () => {
+      const queueOpts = buildRedisConnectionOptions(
+        {
+          url: 'rediss://user:passSecret@redis.internal:6380/3',
+          connectTimeoutMs: 2500,
+          commandTimeoutMs: 4000,
+          maxRetriesPerRequest: 2,
+        },
+        'queue'
+      );
+
+      expect(queueOpts.host).toBe('redis.internal');
+      expect(queueOpts.port).toBe(6380);
+      expect(queueOpts.db).toBe(3);
+      expect(queueOpts.connectTimeout).toBe(2500);
+      expect(queueOpts.commandTimeout).toBe(4000);
+      expect(queueOpts.maxRetriesPerRequest).toBe(2);
+      expect(queueOpts.enableOfflineQueue).toBe(false);
+      expect(queueOpts.tls).toEqual({ rejectUnauthorized: true });
+
+      const workerOpts = buildRedisConnectionOptions(
+        {
+          url: 'redis://localhost:6379/0',
+          connectTimeoutMs: 3000,
+          commandTimeoutMs: 4000,
+        },
+        'worker'
+      );
+      expect(workerOpts.maxRetriesPerRequest).toBeNull();
+      expect(workerOpts.enableOfflineQueue).toBe(true);
+      expect(workerOpts.commandTimeout).toBeUndefined();
+      expect(workerOpts.tls).toBeUndefined();
+
+      expect(() => buildRedisConnectionOptions({ url: 'http://localhost:6379' })).toThrow(
+        RedisConnectionError
+      );
+      expect(() =>
+        buildRedisConnectionOptions({ url: 'redis://localhost:6379', connectTimeoutMs: 10 })
+      ).toThrow(/connectTimeoutMs/i);
+    });
+  });
+
+  describe('RedisConnectionManager lifecycle', () => {
+    it('does not connect automatically on import and reports disabled/not_initialized states cleanly', () => {
+      expect(defaultRedisManager.getState()).toBe('not_initialized');
+      expect(defaultRedisManager.getStatus(false)).toEqual({
+        enabled: false,
+        state: 'disabled',
+        isConnected: false,
+      });
+      expect(defaultRedisManager.getStatus(true)).toEqual({
+        enabled: true,
+        state: 'not_initialized',
+        isConnected: false,
+      });
+    });
+
+    it('deduplicates concurrent connects, handles reconnection/error events without secret leaks, and closes idempotently', async () => {
+      const createdClients: MockRedisClient[] = [];
+      const logs: string[] = [];
+      const manager = new RedisConnectionManager({
+        logger: {
+          info: (m) => logs.push(m),
+          warn: (m) => logs.push(m),
+          error: (m) => logs.push(m),
+        },
+        createClient: () => {
+          const client = new MockRedisClient();
+          createdClients.push(client);
+          return client;
+        },
+      });
+
+      const url = 'redis://:SuperSecretPass123@localhost:6379/0';
+      await Promise.all([manager.connect({ url }), manager.connect({ url })]);
+
+      expect(createdClients).toHaveLength(1);
+      expect(createdClients[0]?.connectCalls).toBe(1);
+      expect(manager.isConnected()).toBe(true);
+      expect(await manager.ping()).toBe(true);
+
+      // Reconnecting with same URL is a no-op
+      await manager.connect({ url });
+      expect(createdClients).toHaveLength(1);
+
+      // Reject connecting to a different URL while active
+      await expect(manager.connect({ url: 'redis://localhost:6380/0' })).rejects.toThrow(
+        /already connected/i
+      );
+
+      // Reconnecting, error, & end events preserve safety and state without leaking secrets
+      createdClients[0]!.status = 'reconnecting';
+      createdClients[0]?.emit('reconnecting');
+      expect(manager.getStatus(true).state).toBe('reconnecting');
+      createdClients[0]!.status = 'close';
+      createdClients[0]?.emit('error', new Error('Failed auth with SuperSecretPass123'));
+      createdClients[0]?.emit('end');
+      expect(manager.getState()).toBe('unavailable');
+      expect(logs.join('\n')).not.toContain('SuperSecretPass123');
+
+      await Promise.all([manager.disconnect(), manager.disconnect()]);
+      expect(createdClients[0]?.quitCalls).toBe(1);
+      expect(manager.getState()).toBe('not_initialized');
+    });
+
+    it('marks state unavailable, closes socket, and redacts password if initial connect fails', async () => {
+      const client = new MockRedisClient();
+      const secretPass = 'TopSecretPass987!';
+      client.shouldFailConnect = new Error(
+        `connect ECONNREFUSED redis://:${secretPass}@localhost:6379`
+      );
+      const errors: string[] = [];
+
+      const manager = new RedisConnectionManager({
+        logger: { error: (m) => errors.push(m) },
+        createClient: () => client,
+      });
+
+      await expect(
+        manager.connect({ url: `redis://:${secretPass}@localhost:6379/0` })
+      ).rejects.toThrow(RedisConnectionError);
+
+      expect(manager.getState()).toBe('unavailable');
+      expect(client.disconnectCalls).toBe(1);
+      expect(errors.join('\n')).not.toContain(secretPass);
+    });
+  });
+
+  describe('Job contracts, defaults, and queue utilities', () => {
+    it('enforces colon-free queue names, stable job IDs, and bounded defaults', () => {
+      expect(QUEUE_NAMES.SCAN_JOBS).toBe('vibeshield-v1-scan-jobs');
+      expect(isValidQueueName(QUEUE_NAMES.SCAN_JOBS)).toBe(true);
+      expect(isValidQueueName('vibeshield:scan')).toBe(false);
+      expect(isValidQueueName('')).toBe(false);
+
+      expect(
+        buildScanJobId({
+          organizationId: 'org_123',
+          projectId: 'proj_456',
+          scanId: 'scan_789',
+        })
+      ).toBe('scan-org_123-proj_456-scan_789');
+
+      expect(() =>
+        buildScanJobId({
+          organizationId: 'org:colon',
+          projectId: 'proj',
+          scanId: 'scan',
+        })
+      ).toThrow();
+
+      const defaults = buildDefaultJobOptions();
+      expect(defaults.attempts).toBe(DEFAULT_QUEUE_POLICY.attempts);
+      expect(defaults.backoff).toEqual({ type: 'exponential', delay: 1000 });
+      expect(defaults.removeOnComplete).toEqual(DEFAULT_QUEUE_POLICY.removeOnComplete);
+      expect(defaults.removeOnFail).toEqual(DEFAULT_QUEUE_POLICY.removeOnFail);
+      expect(defaults.sizeLimit).toBe(MAX_JOB_PAYLOAD_BYTES);
+
+      // Prevents disabling bounded retention or exceeding bounded retries
+      const hardened = buildDefaultJobOptions({ attempts: 999, removeOnComplete: false });
+      expect(hardened.attempts).toBe(DEFAULT_QUEUE_POLICY.attempts);
+      expect(hardened.removeOnComplete).toEqual(DEFAULT_QUEUE_POLICY.removeOnComplete);
+      expect(JOB_PRIORITIES.HIGH).toBeLessThan(JOB_PRIORITIES.NORMAL);
+    });
+
+    it('validates minimal scan payloads and rejects credentials, oversized payloads, and ownership mismatches', () => {
+      const valid = validateScanQueueJobPayload({
+        scanId: 'scan-1',
+        organizationId: 'org-1',
+        projectId: 'proj-1',
+        installationRecordId: 'inst-1',
+        githubRepositoryId: 12345,
+        commitHash: 'abc1234def',
+        branch: 'main',
+        status: ScanStatus.QUEUED,
+        metadata: {
+          organizationId: 'org-1',
+          projectId: 'proj-1',
+          triggeredByUserId: 'user-1',
+          triggerSource: 'manual',
+          enqueuedAt: '2026-11-27T12:00:00Z',
+        },
+      });
+      expect(valid.scanId).toBe('scan-1');
+
+      expect(() =>
+        validateScanQueueJobPayload({
+          scanId: 'scan-1',
+          organizationId: 'org-1',
+          projectId: 'proj-1',
+          commitHash: 'abc1234',
+          branch: 'main',
+          status: ScanStatus.QUEUED,
+          accessToken: 'ghs_should_never_be_queued',
+          metadata: {
+            organizationId: 'org-1',
+            projectId: 'proj-1',
+            triggerSource: 'manual',
+            enqueuedAt: '2026-11-27T12:00:00Z',
+          },
+        })
+      ).toThrow(/sensitive key/i);
+
+      expect(() =>
+        validateScanQueueJobPayload({
+          scanId: 'scan-1',
+          organizationId: 'org-1',
+          projectId: 'proj-1',
+          commitHash: 'abc1234',
+          branch: 'ghp_1234567890abcdef',
+          status: ScanStatus.QUEUED,
+          metadata: {
+            organizationId: 'org-1',
+            projectId: 'proj-1',
+            triggerSource: 'manual',
+            enqueuedAt: '2026-11-27T12:00:00Z',
+          },
+        })
+      ).toThrow(/credentials/i);
+
+      expect(() =>
+        validateScanQueueJobPayload({
+          scanId: 'scan-1',
+          organizationId: 'org-1',
+          projectId: 'proj-1',
+          commitHash: 'abc1234',
+          branch: 'main',
+          status: ScanStatus.QUEUED,
+          metadata: {
+            organizationId: 'org-2',
+            projectId: 'proj-1',
+            triggerSource: 'manual',
+            enqueuedAt: '2026-11-27T12:00:00Z',
+          },
+        })
+      ).toThrow(/ownership/i);
+    });
+
+    it('inspects queue health and shuts down owned handles + Redis cleanly', async () => {
+      const client = new MockRedisClient();
+      const manager = new RedisConnectionManager({ createClient: () => client });
+      await manager.connect({ url: 'redis://localhost:6379/0' });
+
+      const closeQueueSpy = vi.fn(async () => undefined);
+      const fakeHandle = {
+        name: QUEUE_NAMES.SCAN_JOBS,
+        queue: {
+          getJobCounts: vi.fn(async () => ({
+            waiting: 2,
+            active: 1,
+            delayed: 0,
+            failed: 1,
+            completed: 5,
+          })),
+        } as unknown as Parameters<typeof inspectQueueHealth>[0] extends infer H
+          ? H extends { queue: infer Q }
+            ? Q
+            : never
+          : never,
+        close: closeQueueSpy,
+      };
+
+      const health = await inspectQueueHealth(fakeHandle, manager, true);
+      expect(health).toEqual({
+        queueName: QUEUE_NAMES.SCAN_JOBS,
+        redis: { enabled: true, state: 'connected', isConnected: true },
+        counts: { waiting: 2, active: 1, delayed: 0, failed: 1, completed: 5 },
+      });
+
+      const disabledHealth = await inspectQueueHealth(null, manager, false);
+      expect(disabledHealth.redis).toEqual({
+        enabled: false,
+        state: 'disabled',
+        isConnected: false,
+      });
+
+      await closeQueueResources([fakeHandle], manager);
+      expect(closeQueueSpy).toHaveBeenCalledTimes(1);
+      expect(client.quitCalls).toBe(1);
+      expect(manager.getState()).toBe('not_initialized');
+    });
+  });
+});

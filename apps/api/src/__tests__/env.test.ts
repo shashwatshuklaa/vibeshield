@@ -6,6 +6,7 @@ import {
   redactGitHubEnvSecrets,
   toAuthConfig,
   toGitHubConfig,
+  toQueueConfig,
 } from '../config/env.js';
 
 const TEST_JWT_SECRET = 'test_jwt_access_secret_minimum_32_characters_long';
@@ -271,6 +272,62 @@ describe('API Environment Configuration', () => {
         GITHUB_CLIENT_SECRET: TEST_CLIENT_SECRET,
         GITHUB_WEBHOOK_SECRET: TEST_WEBHOOK_SECRET,
         GITHUB_CALLBACK_URL: 'http://app.vibeshield.io/integrations/github/callback',
+      })
+    ).toThrow(EnvValidationError);
+  });
+
+  it('validates optional Redis/BullMQ configuration cleanly without leaking Redis credentials', () => {
+    const disabledConfig = getApiConfig({
+      MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+      JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+    });
+    expect(toQueueConfig(disabledConfig)).toBeNull();
+
+    const enabledConfig = getApiConfig({
+      MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+      JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+      QUEUE_ENABLED: 'true',
+      REDIS_REQUIRED: 'true',
+      REDIS_URL: 'rediss://default:secretRedisPass@cache.internal:6380/2',
+      REDIS_CONNECT_TIMEOUT_MS: '2500',
+      REDIS_COMMAND_TIMEOUT_MS: '4000',
+      QUEUE_DEFAULT_ATTEMPTS: '5',
+      QUEUE_BACKOFF_DELAY_MS: '1500',
+    });
+
+    expect(toQueueConfig(enabledConfig)).toEqual({
+      enabled: true,
+      required: true,
+      redis: {
+        url: 'rediss://default:secretRedisPass@cache.internal:6380/2',
+        connectTimeoutMs: 2500,
+        commandTimeoutMs: 4000,
+      },
+      defaultAttempts: 5,
+      backoffDelayMs: 1500,
+    });
+
+    // Reject missing REDIS_URL when QUEUE_ENABLED=true and invalid REDIS_URL without leaking secrets
+    let caught: unknown;
+    try {
+      getApiConfig({
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+        QUEUE_ENABLED: 'true',
+        REDIS_URL: 'http://user:SecretRedisPassword@localhost:6379',
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(EnvValidationError);
+    expect((caught as EnvValidationError).message).not.toContain('SecretRedisPassword');
+
+    expect(() =>
+      getApiConfig({
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_dev',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+        QUEUE_ENABLED: 'true',
       })
     ).toThrow(EnvValidationError);
   });
