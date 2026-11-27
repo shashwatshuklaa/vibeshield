@@ -16,6 +16,7 @@ export interface GitHubRuntimeConfig {
   clientSecret: string;
   webhookSecret: string;
   previousWebhookSecret?: string;
+  callbackUrl: string;
 }
 
 export const REQUIRED_GITHUB_ENV_KEYS = [
@@ -25,7 +26,26 @@ export const REQUIRED_GITHUB_ENV_KEYS = [
   'GITHUB_CLIENT_ID',
   'GITHUB_CLIENT_SECRET',
   'GITHUB_WEBHOOK_SECRET',
+  'GITHUB_CALLBACK_URL',
 ] as const;
+
+export function isValidGitHubCallbackUrl(raw: string): boolean {
+  if (typeof raw !== 'string' || raw.includes('*') || /\s/.test(raw)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Normalizes escaped newline sequences (`\n` and `\r\n`) in PEM private key configuration.
@@ -241,6 +261,18 @@ const baseApiEnvSchema = baseEnvSchema.extend({
    * Optional previous GitHub webhook HMAC secret for zero-downtime secret rotation.
    */
   GITHUB_WEBHOOK_SECRET_PREVIOUS: z.string().min(32).max(256).optional(),
+
+  /**
+   * Optional exact registered GitHub App OAuth callback URL (no wildcards, queries, or fragments).
+   */
+  GITHUB_CALLBACK_URL: z
+    .string()
+    .trim()
+    .refine(isValidGitHubCallbackUrl, {
+      message:
+        'Must be a valid HTTP/HTTPS callback URL without wildcards, query parameters, or fragments',
+    })
+    .optional(),
 });
 
 export const apiEnvSchema = baseApiEnvSchema.superRefine((env, ctx) => {
@@ -258,6 +290,17 @@ export const apiEnvSchema = baseApiEnvSchema.superRefine((env, ctx) => {
         code: z.ZodIssueCode.custom,
         path: [key],
         message: 'Missing required GitHub integration environment variable',
+      });
+    }
+  }
+
+  if (env.NODE_ENV === 'production' && env.GITHUB_CALLBACK_URL !== undefined) {
+    const parsed = new URL(env.GITHUB_CALLBACK_URL);
+    if (parsed.protocol !== 'https:') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['GITHUB_CALLBACK_URL'],
+        message: 'GITHUB_CALLBACK_URL must use HTTPS in production',
       });
     }
   }
@@ -301,7 +344,8 @@ export function toGitHubConfig(env: ApiEnv): GitHubRuntimeConfig | null {
     env.GITHUB_APP_PRIVATE_KEY === undefined ||
     env.GITHUB_CLIENT_ID === undefined ||
     env.GITHUB_CLIENT_SECRET === undefined ||
-    env.GITHUB_WEBHOOK_SECRET === undefined
+    env.GITHUB_WEBHOOK_SECRET === undefined ||
+    env.GITHUB_CALLBACK_URL === undefined
   ) {
     return null;
   }
@@ -313,6 +357,7 @@ export function toGitHubConfig(env: ApiEnv): GitHubRuntimeConfig | null {
     clientId: env.GITHUB_CLIENT_ID,
     clientSecret: env.GITHUB_CLIENT_SECRET,
     webhookSecret: env.GITHUB_WEBHOOK_SECRET,
+    callbackUrl: env.GITHUB_CALLBACK_URL,
     ...(env.GITHUB_WEBHOOK_SECRET_PREVIOUS !== undefined
       ? { previousWebhookSecret: env.GITHUB_WEBHOOK_SECRET_PREVIOUS }
       : {}),

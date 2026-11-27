@@ -22,6 +22,12 @@ import { createJwtService } from '../modules/auth/jwt.service.js';
 import { createPasswordService } from '../modules/auth/password.service.js';
 import { createGitHubClient } from '../modules/github/github.client.js';
 import { createGitHubAppJwt } from '../modules/github/github.jwt.js';
+import {
+  decryptPkceVerifier,
+  derivePkceS256Challenge,
+  encryptPkceVerifier,
+  generatePkcePair,
+} from '../modules/github/github.pkce.js';
 import { createGitHubService } from '../modules/github/github.service.js';
 import type { GitHubIntegrationStore } from '../modules/github/github.store.js';
 import type { PublicGitHubInstallation } from '../modules/github/github.types.js';
@@ -58,6 +64,7 @@ const TEST_GITHUB_CONFIG: GitHubRuntimeConfig = {
   clientId: 'Iv1.testclient1234',
   clientSecret: 'gh_client_secret_test_value_123456',
   webhookSecret: 'whsec_test_webhook_secret_at_least_32_chars',
+  callbackUrl: 'http://localhost:5173/integrations/github/callback',
 };
 
 function makeObjectId(counter: number): string {
@@ -119,8 +126,11 @@ function createInMemoryGitHubHarness(
     string,
     {
       stateHash: string;
+      kind: 'OAUTH_AUTHORIZE' | 'INSTALLATION_SELECTION';
       userId: string;
       organizationId: string;
+      encryptedCodeVerifier: string | null;
+      allowedInstallationIds: number[];
       usedAt: Date | null;
       expiresAt: Date;
     }
@@ -333,8 +343,14 @@ function createInMemoryGitHubHarness(
     },
     async createOAuthState(input) {
       oauthStates.set(input.stateHash, {
-        ...input,
+        stateHash: input.stateHash,
+        kind: input.kind,
+        userId: input.userId,
+        organizationId: input.organizationId,
+        encryptedCodeVerifier: input.encryptedCodeVerifier,
+        allowedInstallationIds: input.allowedInstallationIds ?? [],
         usedAt: null,
+        expiresAt: input.expiresAt,
       });
     },
     async consumeOAuthState(input) {
@@ -346,10 +362,16 @@ function createInMemoryGitHubHarness(
         rec.usedAt !== null ||
         rec.expiresAt.getTime() <= input.now.getTime()
       ) {
-        return false;
+        return null;
       }
+      const envelope = rec.encryptedCodeVerifier;
       rec.usedAt = input.now;
-      return true;
+      rec.encryptedCodeVerifier = null;
+      return {
+        kind: rec.kind,
+        encryptedCodeVerifier: envelope,
+        allowedInstallationIds: rec.allowedInstallationIds,
+      };
     },
     async findActiveInstallationByGitHubId(githubInstallationId) {
       return (
@@ -534,6 +556,56 @@ describe('GitHub App Client, JWT Generation, Installation Flow & Repository Disc
       expect(verified).toBe(true);
     });
 
+    it('generates S256 PKCE pairs, encrypts verifier bound to user/org/state, and rejects invalid/tampered/cross-context verifiers', () => {
+      const pair = generatePkcePair();
+      expect(pair.codeChallengeMethod).toBe('S256');
+      expect(pair.codeVerifier.length).toBeGreaterThanOrEqual(43);
+      expect(derivePkceS256Challenge(pair.codeVerifier)).toBe(pair.codeChallenge);
+
+      expect(() => derivePkceS256Challenge('too-short')).toThrow(/RFC 7636/i);
+
+      const stateHash = createHash('sha256').update('state-1').digest('hex');
+      const envelope = encryptPkceVerifier({
+        codeVerifier: pair.codeVerifier,
+        secretKeyMaterial: TEST_GITHUB_CONFIG.clientSecret,
+        stateHash,
+        userId: 'user-1',
+        organizationId: 'org-1',
+      });
+      expect(envelope).not.toContain(pair.codeVerifier);
+
+      expect(
+        decryptPkceVerifier({
+          envelope,
+          secretKeyMaterial: TEST_GITHUB_CONFIG.clientSecret,
+          stateHash,
+          userId: 'user-1',
+          organizationId: 'org-1',
+        })
+      ).toBe(pair.codeVerifier);
+
+      // Cross-user or cross-org or wrong stateHash context fails AEAD AAD check
+      expect(() =>
+        decryptPkceVerifier({
+          envelope,
+          secretKeyMaterial: TEST_GITHUB_CONFIG.clientSecret,
+          stateHash,
+          userId: 'user-2',
+          organizationId: 'org-1',
+        })
+      ).toThrow(/invalid/i);
+
+      expect(() =>
+        decryptPkceVerifier({
+          envelope,
+          secretKeyMaterial: TEST_GITHUB_CONFIG.clientSecret,
+          stateHash,
+          userId: 'user-1',
+          organizationId: 'org-2',
+        })
+      ).toThrow(/invalid/i);
+    });
+
     it('rejects invalid private keys without leaking key material', () => {
       const badPem = '-----BEGIN PRIVATE KEY-----\nLEAKED_KEY_MATERIAL\n-----END PRIVATE KEY-----';
       let caught: unknown;
@@ -560,7 +632,7 @@ describe('GitHub App Client, JWT Generation, Installation Flow & Repository Disc
         const u = String(url);
         const headers = init?.headers as Record<string, string>;
         expect(headers.Accept).toBe('application/vnd.github+json');
-        expect(headers['X-GitHub-Api-Version']).toBe('2022-11-28');
+        expect(headers['X-GitHub-Api-Version']).toBe('2026-03-10');
         expect(headers['User-Agent']).toBe('VibeShield-API');
 
         if (u.includes('/user/installations') && u.includes('page=1')) {
@@ -661,9 +733,50 @@ describe('GitHub App Client, JWT Generation, Installation Flow & Repository Disc
           throw err;
         },
       });
-      await expect(timeoutClient.exchangeOAuthCode('code_1')).rejects.toMatchObject({
+      await expect(
+        timeoutClient.exchangeOAuthCode({
+          code: 'code_1',
+          codeVerifier: 'v'.repeat(43),
+          redirectUri: TEST_GITHUB_CONFIG.callbackUrl,
+        })
+      ).rejects.toMatchObject({
         statusCode: 504,
         code: 'GITHUB_API_TIMEOUT',
+      });
+
+      // 4b. Redirect URI mismatch and invalid PKCE verifier mapping without credential leakage
+      const redirectMismatchClient = createGitHubClient({
+        config: TEST_GITHUB_CONFIG,
+        fetchImpl: async () =>
+          jsonResponse({
+            error: 'redirect_uri_mismatch',
+            error_description: 'The redirect_uri MUST match the registered callback URL',
+          }),
+      });
+      await expect(
+        redirectMismatchClient.exchangeOAuthCode({
+          code: 'code_1',
+          codeVerifier: 'v'.repeat(43),
+          redirectUri: TEST_GITHUB_CONFIG.callbackUrl,
+        })
+      ).rejects.toMatchObject({
+        statusCode: 400,
+        code: 'GITHUB_REDIRECT_URI_MISMATCH',
+      });
+
+      const invalidVerifierClient = createGitHubClient({
+        config: TEST_GITHUB_CONFIG,
+        fetchImpl: async () => jsonResponse({ error: 'bad_verification_code' }),
+      });
+      await expect(
+        invalidVerifierClient.exchangeOAuthCode({
+          code: 'code_1',
+          codeVerifier: 'wrong_verifier_secret_value_should_not_leak_in_error',
+          redirectUri: TEST_GITHUB_CONFIG.callbackUrl,
+        })
+      ).rejects.toMatchObject({
+        statusCode: 400,
+        code: 'GITHUB_OAUTH_CODE_INVALID',
       });
 
       // 5. Bounded retry on GET 503 + token redaction on network error
@@ -898,12 +1011,17 @@ describe('GitHub App Client, JWT Generation, Installation Flow & Repository Disc
       expect(requestApprovalRes.status).toBe(202);
       expect(requestApprovalRes.body.status).toBe('APPROVAL_REQUESTED');
 
-      // 8b. Separated user OAuth discovery via /installations/authorize-list
+      // 8b. Separated user OAuth discovery via /installations/authorize-list issues single-use linkState
       const startList = await request(h.app)
         .post(`/api/v1/organizations/${orgAId}/github/installations/start`)
         .set('Authorization', `Bearer ${owner.token}`)
         .send({ mode: 'authorize' });
-      const listState = new URL(startList.body.authorizeUrl as string).searchParams.get('state')!;
+      const listStartUrl = new URL(startList.body.authorizeUrl as string);
+      const listState = listStartUrl.searchParams.get('state')!;
+      expect(listStartUrl.searchParams.get('redirect_uri')).toBe(TEST_GITHUB_CONFIG.callbackUrl);
+      expect(listStartUrl.searchParams.get('code_challenge_method')).toBe('S256');
+      expect(listStartUrl.searchParams.get('code_challenge')).toBeTruthy();
+
       const discoverListRes = await request(h.app)
         .post(`/api/v1/organizations/${orgAId}/github/installations/authorize-list`)
         .set('Authorization', `Bearer ${owner.token}`)
@@ -911,6 +1029,82 @@ describe('GitHub App Client, JWT Generation, Installation Flow & Repository Disc
       expect(discoverListRes.status).toBe(200);
       expect(discoverListRes.body.installations).toHaveLength(1);
       expect(discoverListRes.body.installations[0].githubInstallationId).toBe(5001);
+      expect(typeof discoverListRes.body.linkState).toBe('string');
+      const linkState = discoverListRes.body.linkState as string;
+
+      // Reusing already-consumed OAuth state from authorize-list for /complete must fail cleanly
+      const reusedOAuthRes = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: listState, code: 'oauth_code', installationId: 5001 });
+      expect(reusedOAuthRes.status).toBe(400);
+      expect(reusedOAuthRes.body.error.code).toBe('INVALID_OAUTH_STATE');
+
+      // Using linkState for an installation ID NOT owned by the user fails cleanly with 403 and consumes linkState
+      const unownedLinkStateRes = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: linkState, installationId: 99999 });
+      expect(unownedLinkStateRes.status).toBe(403);
+      expect(unownedLinkStateRes.body.error.code).toBe('GITHUB_INSTALLATION_NOT_OWNED');
+
+      // Replaying consumed linkState fails
+      const replayLinkStateRes = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: linkState, installationId: 5001 });
+      expect(replayLinkStateRes.status).toBe(400);
+      expect(replayLinkStateRes.body.error.code).toBe('INVALID_OAUTH_STATE');
+
+      // User-controlled redirectUri / callbackUrl injection is strictly rejected; access_denied consumes state
+      const startCancel = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/start`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ mode: 'authorize', redirectUri: 'https://evil.example/steal' });
+      expect(startCancel.status).toBe(400);
+
+      const startCancelOk = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/start`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ mode: 'authorize' });
+      const cancelState = new URL(startCancelOk.body.authorizeUrl as string).searchParams.get(
+        'state'
+      )!;
+      const cancelRes = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({
+          state: cancelState,
+          error: 'access_denied',
+          errorDescription: 'User cancelled authorization',
+        });
+      expect(cancelRes.status).toBe(400);
+      expect(cancelRes.body.error.code).toBe('GITHUB_OAUTH_CANCELLED');
+
+      const cancelReplayRes = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: cancelState, code: 'oauth_code', installationId: 5001 });
+      expect(cancelReplayRes.status).toBe(400);
+      expect(cancelReplayRes.body.error.code).toBe('INVALID_OAUTH_STATE');
+
+      // Complete Flow B end-to-end cleanly using authorize-list -> valid linkState
+      const startFlowB = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/start`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ mode: 'authorize' });
+      const flowBState = new URL(startFlowB.body.authorizeUrl as string).searchParams.get('state')!;
+      const flowBDiscover = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/authorize-list`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: flowBState, code: 'oauth_code' });
+      expect(flowBDiscover.status).toBe(200);
+      const flowBLinkRes = await request(h.app)
+        .post(`/api/v1/organizations/${orgAId}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: flowBDiscover.body.linkState, installationId: 5001 });
+      expect(flowBLinkRes.status).toBe(200);
+      expect(flowBLinkRes.body.installation.githubInstallationId).toBe(5001);
 
       // 9. Successful linking in Org A, then blocking same active installationId in Org B (without leaking Org A)
       const start5 = await request(h.app)

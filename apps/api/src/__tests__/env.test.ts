@@ -173,6 +173,7 @@ describe('API Environment Configuration', () => {
       GITHUB_CLIENT_SECRET: TEST_CLIENT_SECRET,
       GITHUB_WEBHOOK_SECRET: TEST_WEBHOOK_SECRET,
       GITHUB_WEBHOOK_SECRET_PREVIOUS: TEST_WEBHOOK_SECRET_PREVIOUS,
+      GITHUB_CALLBACK_URL: 'https://app.vibeshield.io/integrations/github/callback',
     });
 
     const ghConfig = toGitHubConfig(config);
@@ -184,6 +185,7 @@ describe('API Environment Configuration', () => {
       clientSecret: TEST_CLIENT_SECRET,
       webhookSecret: TEST_WEBHOOK_SECRET,
       previousWebhookSecret: TEST_WEBHOOK_SECRET_PREVIOUS,
+      callbackUrl: 'https://app.vibeshield.io/integrations/github/callback',
     });
 
     const leakedText = `Failed with secret ${TEST_CLIENT_SECRET}, ${TEST_WEBHOOK_SECRET}, and ${escapedPem}`;
@@ -214,10 +216,11 @@ describe('API Environment Configuration', () => {
       'GITHUB_CLIENT_ID',
       'GITHUB_CLIENT_SECRET',
       'GITHUB_WEBHOOK_SECRET',
+      'GITHUB_CALLBACK_URL',
     ]);
   });
 
-  it('rejects invalid PEM keys and malformed GitHub settings without leaking secret values', () => {
+  it('rejects invalid PEM keys, wildcard or non-HTTPS production callback URLs, and malformed GitHub settings without leaking secrets', () => {
     const malformedPem =
       '-----BEGIN PRIVATE KEY-----\nSECRET_BODY_DO_NOT_LEAK\n-----END PRIVATE KEY-----';
     const shortWebhook = 'too_short_webhook_secret_leak';
@@ -234,6 +237,7 @@ describe('API Environment Configuration', () => {
         GITHUB_CLIENT_ID: 'short',
         GITHUB_CLIENT_SECRET: shortClientSecret,
         GITHUB_WEBHOOK_SECRET: shortWebhook,
+        GITHUB_CALLBACK_URL: 'https://*.vibeshield.io/callback?open=1',
       });
     } catch (error) {
       caught = error;
@@ -248,9 +252,26 @@ describe('API Environment Configuration', () => {
       'GITHUB_CLIENT_ID',
       'GITHUB_CLIENT_SECRET',
       'GITHUB_WEBHOOK_SECRET',
+      'GITHUB_CALLBACK_URL',
     ]);
     expect(err.message).not.toContain('SECRET_BODY_DO_NOT_LEAK');
     expect(err.message).not.toContain(shortWebhook);
     expect(err.message).not.toContain(shortClientSecret);
+
+    // Reject plain HTTP callback URL in production
+    expect(() =>
+      getApiConfig({
+        NODE_ENV: 'production',
+        MONGODB_URI: 'mongodb://localhost:27017/vibeshield_prod',
+        JWT_ACCESS_SECRET: TEST_JWT_SECRET,
+        GITHUB_APP_ID: '123456',
+        GITHUB_APP_SLUG: 'vibeshield-prod',
+        GITHUB_APP_PRIVATE_KEY: generateEphemeralTestRsaPem(),
+        GITHUB_CLIENT_ID: 'Iv1.prodclientid12',
+        GITHUB_CLIENT_SECRET: TEST_CLIENT_SECRET,
+        GITHUB_WEBHOOK_SECRET: TEST_WEBHOOK_SECRET,
+        GITHUB_CALLBACK_URL: 'http://app.vibeshield.io/integrations/github/callback',
+      })
+    ).toThrow(EnvValidationError);
   });
 });

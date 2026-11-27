@@ -10,7 +10,7 @@ import {
 
 const OFFICIAL_GITHUB_API_ORIGIN = 'https://api.github.com';
 const OFFICIAL_GITHUB_OAUTH_ORIGIN = 'https://github.com';
-const GITHUB_API_VERSION = '2022-11-28';
+const GITHUB_API_VERSION = '2026-03-10';
 const GITHUB_USER_AGENT = 'VibeShield-API';
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_TRANSIENT_GET_RETRIES = 1;
@@ -107,7 +107,11 @@ export interface GitHubInstallationRepositoriesPage {
 }
 
 export interface GitHubClient {
-  exchangeOAuthCode(code: string): Promise<string>;
+  exchangeOAuthCode(input: {
+    code: string;
+    codeVerifier: string;
+    redirectUri: string;
+  }): Promise<string>;
   listUserInstallations(userAccessToken: string): Promise<DiscoveredUserGitHubInstallation[]>;
   getAppInstallation(installationId: number): Promise<AuthoritativeGitHubInstallation>;
   createInstallationAccessToken(installationId: number): Promise<string>;
@@ -439,20 +443,30 @@ export function createGitHubClient(options: CreateGitHubClientOptions): GitHubCl
   }
 
   return {
-    async exchangeOAuthCode(code: string): Promise<string> {
-      const response = await executeFetch(`${oauthBaseUrl}/login/oauth/access_token`, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'User-Agent': GITHUB_USER_AGENT,
+    async exchangeOAuthCode(input: {
+      code: string;
+      codeVerifier: string;
+      redirectUri: string;
+    }): Promise<string> {
+      const response = await executeFetch(
+        `${oauthBaseUrl}/login/oauth/access_token`,
+        {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'User-Agent': GITHUB_USER_AGENT,
+          },
+          body: JSON.stringify({
+            client_id: config.clientId,
+            client_secret: config.clientSecret,
+            code: input.code,
+            redirect_uri: input.redirectUri,
+            code_verifier: input.codeVerifier,
+          }),
         },
-        body: JSON.stringify({
-          client_id: config.clientId,
-          client_secret: config.clientSecret,
-          code,
-        }),
-      });
+        input.codeVerifier
+      );
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -480,10 +494,24 @@ export function createGitHubClient(options: CreateGitHubClientOptions): GitHubCl
       }
 
       if (parsed.data.error || !parsed.data.access_token) {
+        if (parsed.data.error === 'redirect_uri_mismatch') {
+          throw new GitHubError(
+            400,
+            'GITHUB_REDIRECT_URI_MISMATCH',
+            'GitHub OAuth redirect URI did not match the registered callback URL'
+          );
+        }
+        if (parsed.data.error === 'incorrect_client_credentials') {
+          throw new GitHubError(
+            502,
+            'GITHUB_AUTH_FAILED',
+            'GitHub OAuth application credentials failed verification'
+          );
+        }
         throw new GitHubError(
           400,
           'GITHUB_OAUTH_CODE_INVALID',
-          'GitHub authorization code is invalid or expired'
+          'GitHub authorization code or PKCE verifier is invalid or expired'
         );
       }
 

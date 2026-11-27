@@ -68,8 +68,11 @@ export {
 } from './github-installation.model.js';
 
 export {
+  GITHUB_OAUTH_STATE_KINDS,
+  GitHubOAuthStateKindValue,
   githubOAuthStateSchema,
   GitHubOAuthStateModel,
+  type GitHubOAuthStateKind,
   type GitHubOAuthStateAttributes,
   type GitHubOAuthStateDocument,
 } from './github-oauth-state.model.js';

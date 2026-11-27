@@ -1,14 +1,15 @@
 const PEM_PRIVATE_KEY_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:\\n|[\s\S])*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 
-const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{16,})\b/g;
+const GITHUB_TOKEN_PATTERN =
+  /\b(?:gh[pousr]_[A-Za-z0-9_=-]{10,}(?:\.[A-Za-z0-9_=-]+)*|github_pat_[A-Za-z0-9_]{16,})\b/g;
 
 const AUTH_HEADER_CREDENTIAL_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}\b/gi;
 
 const X_ACCESS_TOKEN_URL_PATTERN = /(x-access-token:)[^\s@]+/gi;
 
 const SENSITIVE_AUDIT_KEY_PATTERN =
-  /token|secret|private.?key|password|authorization|cookie|pem|credential|signature|api.?key/i;
+  /token|secret|private.?key|password|authorization|cookie|pem|credential|signature|api.?key|verifier/i;
 
 export const AUDIT_METADATA_MAX_BYTES = 4096;
 const AUDIT_METADATA_MAX_DEPTH = 3;

@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import {
   GitHubInstallationStatusValue,
+  GitHubOAuthStateKindValue,
   IntegrationAuditActionValue,
   isValidObjectId,
 } from '@vibeshield/database';
@@ -11,12 +12,14 @@ import {
 } from '../organizations/organization.permissions.js';
 import { OrganizationError } from '../organizations/organization.types.js';
 import { createGitHubClient, type GitHubClient } from './github.client.js';
+import { decryptPkceVerifier, encryptPkceVerifier, generatePkcePair } from './github.pkce.js';
 import { mongooseGitHubIntegrationStore, type GitHubIntegrationStore } from './github.store.js';
 import {
   GitHubError,
   type CompleteGitHubInstallationInput,
   type CompleteGitHubInstallationResult,
-  type DiscoveredUserGitHubInstallation,
+  type DiscoverUserInstallationsInput,
+  type DiscoverUserInstallationsResult,
   type ListGitHubRepositoriesQuery,
   type PaginatedGitHubRepositoriesResult,
   type PublicGitHubInstallation,
@@ -25,6 +28,7 @@ import {
 } from './github.types.js';
 
 const DEFAULT_OAUTH_STATE_TTL_SECONDS = 600; // 10 minutes
+const DEFAULT_SELECTION_STATE_TTL_SECONDS = 300; // 5 minutes
 
 export interface GitHubServiceDependencies {
   config?: GitHubRuntimeConfig | null;
@@ -44,8 +48,8 @@ export interface GitHubService {
   discoverUserInstallations(
     actorUserId: string,
     organizationId: string,
-    input: { state: string; code: string }
-  ): Promise<DiscoveredUserGitHubInstallation[]>;
+    input: DiscoverUserInstallationsInput
+  ): Promise<DiscoverUserInstallationsResult>;
   completeInstallation(
     actorUserId: string,
     organizationId: string,
@@ -72,8 +76,8 @@ function isMongoDuplicateKeyError(error: unknown): boolean {
 
 /**
  * Creates the GitHub App installation and repository discovery service.
- * Enforces state hashing/anti-replay, GitHub user installation ownership verification,
- * authoritative App metadata fetching, and transactional organization locking.
+ * Enforces S256 PKCE, encrypted single-use state+verifier binding, strict callback URI
+ * validation, GitHub user installation ownership verification, and transactional org locking.
  */
 export function createGitHubService(dependencies: GitHubServiceDependencies = {}): GitHubService {
   const store = dependencies.store ?? mongooseGitHubIntegrationStore;
@@ -131,23 +135,45 @@ export function createGitHubService(dependencies: GitHubServiceDependencies = {}
 
       const rawState = generateState();
       const stateHash = hashOAuthState(rawState);
+      const pkce = generatePkcePair();
+      const encryptedCodeVerifier = encryptPkceVerifier({
+        codeVerifier: pkce.codeVerifier,
+        secretKeyMaterial: config.clientSecret,
+        stateHash,
+        userId: actorUserId,
+        organizationId,
+      });
+
       const expiresAt = new Date(now().getTime() + oauthStateTtlSeconds * 1000);
 
       await store.createOAuthState({
         stateHash,
+        kind: GitHubOAuthStateKindValue.OAUTH_AUTHORIZE,
         userId: actorUserId,
         organizationId,
+        encryptedCodeVerifier,
         expiresAt,
       });
 
-      const authorizeUrl =
+      const url =
         input.mode === 'authorize'
-          ? `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(config.clientId)}&state=${encodeURIComponent(rawState)}`
-          : `https://github.com/apps/${encodeURIComponent(config.appSlug)}/installations/new?state=${encodeURIComponent(rawState)}`;
+          ? new URL('https://github.com/login/oauth/authorize')
+          : new URL(
+              `https://github.com/apps/${encodeURIComponent(config.appSlug)}/installations/new`
+            );
+
+      if (input.mode === 'authorize') {
+        url.searchParams.set('client_id', config.clientId);
+        url.searchParams.set('redirect_uri', config.callbackUrl);
+      }
+
+      url.searchParams.set('state', rawState);
+      url.searchParams.set('code_challenge', pkce.codeChallenge);
+      url.searchParams.set('code_challenge_method', pkce.codeChallengeMethod);
 
       return {
         mode: input.mode,
-        authorizeUrl,
+        authorizeUrl: url.toString(),
         expiresAt,
       };
     },
@@ -155,17 +181,24 @@ export function createGitHubService(dependencies: GitHubServiceDependencies = {}
     async discoverUserInstallations(
       actorUserId: string,
       organizationId: string,
-      input: { state: string; code: string }
-    ): Promise<DiscoveredUserGitHubInstallation[]> {
+      input: DiscoverUserInstallationsInput
+    ): Promise<DiscoverUserInstallationsResult> {
+      const config = requireGitHubConfig();
       const client = requireGitHubClient();
+      const currentNow = now();
+      const stateHash = hashOAuthState(input.state);
 
       const consumed = await store.consumeOAuthState({
-        stateHash: hashOAuthState(input.state),
+        stateHash,
         userId: actorUserId,
         organizationId,
-        now: now(),
+        now: currentNow,
       });
-      if (!consumed) {
+      if (
+        !consumed ||
+        consumed.kind !== GitHubOAuthStateKindValue.OAUTH_AUTHORIZE ||
+        !consumed.encryptedCodeVerifier
+      ) {
         throw new GitHubError(
           400,
           'INVALID_OAUTH_STATE',
@@ -173,8 +206,41 @@ export function createGitHubService(dependencies: GitHubServiceDependencies = {}
         );
       }
 
-      const userAccessToken = await client.exchangeOAuthCode(input.code);
-      return client.listUserInstallations(userAccessToken);
+      const codeVerifier = decryptPkceVerifier({
+        envelope: consumed.encryptedCodeVerifier,
+        secretKeyMaterial: config.clientSecret,
+        stateHash,
+        userId: actorUserId,
+        organizationId,
+      });
+
+      const userAccessToken = await client.exchangeOAuthCode({
+        code: input.code,
+        codeVerifier,
+        redirectUri: config.callbackUrl,
+      });
+      const installations = await client.listUserInstallations(userAccessToken);
+
+      // Issue a dedicated, single-use selection state so /complete does not reuse the consumed OAuth state
+      const linkState = generateState();
+      const linkStateHash = hashOAuthState(linkState);
+      const expiresAt = new Date(now().getTime() + DEFAULT_SELECTION_STATE_TTL_SECONDS * 1000);
+
+      await store.createOAuthState({
+        stateHash: linkStateHash,
+        kind: GitHubOAuthStateKindValue.INSTALLATION_SELECTION,
+        userId: actorUserId,
+        organizationId,
+        encryptedCodeVerifier: null,
+        allowedInstallationIds: installations.map((inst) => inst.githubInstallationId),
+        expiresAt,
+      });
+
+      return {
+        installations,
+        linkState,
+        expiresAt,
+      };
     },
 
     async completeInstallation(
@@ -182,11 +248,13 @@ export function createGitHubService(dependencies: GitHubServiceDependencies = {}
       organizationId: string,
       input: CompleteGitHubInstallationInput
     ): Promise<CompleteGitHubInstallationResult> {
+      const config = requireGitHubConfig();
       const client = requireGitHubClient();
       const currentNow = now();
+      const stateHash = hashOAuthState(input.state);
 
       const consumed = await store.consumeOAuthState({
-        stateHash: hashOAuthState(input.state),
+        stateHash,
         userId: actorUserId,
         organizationId,
         now: currentNow,
@@ -199,6 +267,21 @@ export function createGitHubService(dependencies: GitHubServiceDependencies = {}
         );
       }
 
+      if (input.error) {
+        if (input.error === 'access_denied') {
+          throw new GitHubError(
+            400,
+            'GITHUB_OAUTH_CANCELLED',
+            'GitHub authorization was cancelled by the user'
+          );
+        }
+        throw new GitHubError(
+          400,
+          'GITHUB_OAUTH_FAILED',
+          'GitHub authorization could not be completed'
+        );
+      }
+
       if (input.setupAction === 'request' && input.installationId === undefined) {
         return {
           status: 'APPROVAL_REQUESTED',
@@ -206,14 +289,6 @@ export function createGitHubService(dependencies: GitHubServiceDependencies = {}
           message:
             'GitHub organization administrator approval is required before this installation can be linked',
         };
-      }
-
-      if (!input.code) {
-        throw new GitHubError(
-          400,
-          'GITHUB_USER_AUTHORIZATION_REQUIRED',
-          'GitHub user OAuth authorization code is required to verify installation ownership'
-        );
       }
 
       if (input.installationId === undefined) {
@@ -226,19 +301,57 @@ export function createGitHubService(dependencies: GitHubServiceDependencies = {}
 
       const targetInstallationId = input.installationId;
 
-      // Verify ownership via GitHub API before opening a database transaction lock
-      const userAccessToken = await client.exchangeOAuthCode(input.code);
-      const userInstallations = await client.listUserInstallations(userAccessToken);
-      const ownsInstallation = userInstallations.some(
-        (inst) => inst.githubInstallationId === targetInstallationId
-      );
+      if (consumed.kind === GitHubOAuthStateKindValue.INSTALLATION_SELECTION) {
+        const isAllowed = consumed.allowedInstallationIds.includes(targetInstallationId);
+        if (!isAllowed) {
+          throw new GitHubError(
+            403,
+            'GITHUB_INSTALLATION_NOT_OWNED',
+            'The authenticated GitHub account does not have access to this installation'
+          );
+        }
+      } else {
+        if (!input.code) {
+          throw new GitHubError(
+            400,
+            'GITHUB_USER_AUTHORIZATION_REQUIRED',
+            'GitHub user OAuth authorization code is required to verify installation ownership'
+          );
+        }
+        if (!consumed.encryptedCodeVerifier) {
+          throw new GitHubError(
+            400,
+            'INVALID_OAUTH_STATE',
+            'GitHub authorization state is invalid, expired, or has already been used'
+          );
+        }
 
-      if (!ownsInstallation) {
-        throw new GitHubError(
-          403,
-          'GITHUB_INSTALLATION_NOT_OWNED',
-          'The authenticated GitHub account does not have access to this installation'
+        const codeVerifier = decryptPkceVerifier({
+          envelope: consumed.encryptedCodeVerifier,
+          secretKeyMaterial: config.clientSecret,
+          stateHash,
+          userId: actorUserId,
+          organizationId,
+        });
+
+        // Verify ownership via GitHub API before opening a database transaction lock
+        const userAccessToken = await client.exchangeOAuthCode({
+          code: input.code,
+          codeVerifier,
+          redirectUri: config.callbackUrl,
+        });
+        const userInstallations = await client.listUserInstallations(userAccessToken);
+        const ownsInstallation = userInstallations.some(
+          (inst) => inst.githubInstallationId === targetInstallationId
         );
+
+        if (!ownsInstallation) {
+          throw new GitHubError(
+            403,
+            'GITHUB_INSTALLATION_NOT_OWNED',
+            'The authenticated GitHub account does not have access to this installation'
+          );
+        }
       }
 
       const authoritative = await client.getAppInstallation(targetInstallationId);

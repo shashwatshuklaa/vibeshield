@@ -1,4 +1,4 @@
-import { generateKeyPairSync, randomBytes } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import request from 'supertest';
@@ -54,6 +54,7 @@ const TEST_GITHUB_CONFIG: GitHubRuntimeConfig = {
   clientId: 'Iv1.integrationclient',
   clientSecret: 'gh_integration_client_secret_value_1234',
   webhookSecret: 'whsec_integration_webhook_secret_min_32_chars',
+  callbackUrl: 'http://localhost:5173/integrations/github/callback',
 };
 
 describe.skipIf(!REPLICA_URI)(
@@ -62,6 +63,7 @@ describe.skipIf(!REPLICA_URI)(
     let mockServer: http.Server;
     let mockBaseUrl = '';
     let activeMockSecretIat = '';
+    let expectedPkceChallenge: string | null = null;
 
     beforeAll(async () => {
       await connectDatabase(REPLICA_URI!, { serverSelectionTimeoutMS: 10_000 });
@@ -81,8 +83,32 @@ describe.skipIf(!REPLICA_URI)(
         res.setHeader('content-type', 'application/json');
 
         if (req.method === 'POST' && url.startsWith('/login/oauth/access_token')) {
-          res.writeHead(200);
-          res.end(JSON.stringify({ access_token: 'ghu_mock_oauth_user_token_123456' }));
+          const chunks: Buffer[] = [];
+          req.on('data', (chunk: Buffer) => chunks.push(chunk));
+          req.on('end', () => {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+              code?: string;
+              code_verifier?: string;
+              redirect_uri?: string;
+            };
+            if (parsed.redirect_uri !== TEST_GITHUB_CONFIG.callbackUrl) {
+              res.writeHead(200);
+              res.end(JSON.stringify({ error: 'redirect_uri_mismatch' }));
+              return;
+            }
+            if (expectedPkceChallenge !== null) {
+              const computed = parsed.code_verifier
+                ? createHash('sha256').update(parsed.code_verifier, 'ascii').digest('base64url')
+                : '';
+              if (computed !== expectedPkceChallenge) {
+                res.writeHead(200);
+                res.end(JSON.stringify({ error: 'bad_verification_code' }));
+                return;
+              }
+            }
+            res.writeHead(200);
+            res.end(JSON.stringify({ access_token: 'ghu_mock_oauth_user_token_123456' }));
+          });
           return;
         }
         if (req.method === 'GET' && url.startsWith('/user/installations')) {
@@ -168,6 +194,7 @@ describe.skipIf(!REPLICA_URI)(
     });
 
     beforeEach(async () => {
+      expectedPkceChallenge = null;
       await Promise.all([
         IntegrationAuditLogModel.deleteMany({}),
         GitHubOAuthStateModel.deleteMany({}),
@@ -238,7 +265,20 @@ describe.skipIf(!REPLICA_URI)(
         .post(`/api/v1/organizations/${orgId}/github/installations/start`)
         .set('Authorization', `Bearer ${owner.token}`)
         .send({ mode: 'install' });
-      const rawState = new URL(startRes.body.authorizeUrl as string).searchParams.get('state')!;
+      const authorizeUrl = new URL(startRes.body.authorizeUrl as string);
+      const rawState = authorizeUrl.searchParams.get('state')!;
+      expectedPkceChallenge = authorizeUrl.searchParams.get('code_challenge');
+      expect(authorizeUrl.searchParams.get('code_challenge_method')).toBe('S256');
+      expect(expectedPkceChallenge).toBeTruthy();
+
+      // Verify stateHash & encryptedCodeVerifier are hidden by default and not plaintext in MongoDB
+      const rawStateDoc = await GitHubOAuthStateModel.findOne({ organizationId: orgId });
+      expect(rawStateDoc?.stateHash).toBeUndefined();
+      expect(rawStateDoc?.encryptedCodeVerifier).toBeUndefined();
+      const privilegedStateDoc = await GitHubOAuthStateModel.findOne({
+        organizationId: orgId,
+      }).select('+stateHash +encryptedCodeVerifier');
+      expect(privilegedStateDoc?.encryptedCodeVerifier).toMatch(/^v1\./);
 
       // Concurrent parallel completions with identical state: exactly 1 succeeds, 1 fails state check
       const [r1, r2] = await Promise.all([
@@ -254,6 +294,13 @@ describe.skipIf(!REPLICA_URI)(
 
       const statuses = [r1.status, r2.status].sort((a, b) => a - b);
       expect(statuses).toEqual([400, 200].sort((a, b) => a - b));
+
+      // Verify encryptedCodeVerifier is wiped to null after atomic consumption
+      const postConsumeDoc = await GitHubOAuthStateModel.findOne({ organizationId: orgId }).select(
+        '+encryptedCodeVerifier'
+      );
+      expect(postConsumeDoc?.usedAt).toBeInstanceOf(Date);
+      expect(postConsumeDoc?.encryptedCodeVerifier).toBeNull();
 
       expect(await GitHubInstallationModel.countDocuments({ organizationId: orgId })).toBe(1);
       expect(await IntegrationAuditLogModel.countDocuments({ organizationId: orgId })).toBe(1);
@@ -384,6 +431,58 @@ describe.skipIf(!REPLICA_URI)(
       expect(resB.status).toBe(409);
       expect(resB.body.error.code).toBe('GITHUB_INSTALLATION_UNAVAILABLE');
       expect(await GitHubInstallationModel.countDocuments({ organizationId: orgB.id })).toBe(0);
+    });
+
+    it('supports separated OAuth authorize -> authorize-list -> complete via single-use INSTALLATION_SELECTION state in MongoDB', async () => {
+      const app = createIntegrationApp();
+      const owner = await seedUserAndToken(app, 'gh-sep-owner@test.dev');
+      const org = (
+        await request(app)
+          .post('/api/v1/organizations')
+          .set('Authorization', `Bearer ${owner.token}`)
+          .send({ name: 'Separated Org', slug: 'gh-separated-org' })
+      ).body.organization;
+
+      const startRes = await request(app)
+        .post(`/api/v1/organizations/${org.id}/github/installations/start`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ mode: 'authorize' });
+      const authorizeUrl = new URL(startRes.body.authorizeUrl as string);
+      const oauthState = authorizeUrl.searchParams.get('state')!;
+      expectedPkceChallenge = authorizeUrl.searchParams.get('code_challenge');
+      expect(authorizeUrl.searchParams.get('redirect_uri')).toBe(TEST_GITHUB_CONFIG.callbackUrl);
+
+      const discoverRes = await request(app)
+        .post(`/api/v1/organizations/${org.id}/github/installations/authorize-list`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: oauthState, code: 'oauth_code' });
+      expect(discoverRes.status).toBe(200);
+      expect(discoverRes.body.installations).toHaveLength(1);
+      const linkState = discoverRes.body.linkState as string;
+
+      // Second use of consumed OAuth state must fail
+      const replayOAuth = await request(app)
+        .post(`/api/v1/organizations/${org.id}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: oauthState, code: 'oauth_code', installationId: 3001 });
+      expect(replayOAuth.status).toBe(400);
+
+      // Complete via single-use linkState
+      const linkRes = await request(app)
+        .post(`/api/v1/organizations/${org.id}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: linkState, installationId: 3001 });
+      expect(linkRes.status).toBe(200);
+      expect(linkRes.body.status).toBe('CONNECTED');
+      expect(linkRes.body.installation.githubInstallationId).toBe(3001);
+      expect(await GitHubInstallationModel.countDocuments({ organizationId: org.id })).toBe(1);
+
+      // Replay of linkState must fail
+      const replayLink = await request(app)
+        .post(`/api/v1/organizations/${org.id}/github/installations/complete`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ state: linkState, installationId: 3001 });
+      expect(replayLink.status).toBe(400);
     });
   }
 );

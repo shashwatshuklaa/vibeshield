@@ -64,6 +64,7 @@ describe('GitHub Integration Database Models and Redaction', () => {
         'gho=gho_abcdef1234567890',
         'ghu=ghu_1122334455667788',
         'ghs=ghs_installationToken998877',
+        'ghs_jwt=ghs_77777_eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signaturePart99',
         'ghr=ghr_refreshToken11223344',
         'pat=github_pat_11ABCDEF0123456789_xyz',
         'auth=Bearer header.payload.signature',
@@ -80,6 +81,8 @@ describe('GitHub Integration Database Models and Redaction', () => {
       expect(redacted).not.toContain('gho_abcdef1234567890');
       expect(redacted).not.toContain('ghu_1122334455667788');
       expect(redacted).not.toContain('ghs_installationToken998877');
+      expect(redacted).not.toContain('eyJhbGciOiJFUzI1NiJ9');
+      expect(redacted).not.toContain('signaturePart99');
       expect(redacted).not.toContain('ghr_refreshToken11223344');
       expect(redacted).not.toContain('github_pat_11ABCDEF0123456789_xyz');
       expect(redacted).not.toContain('header.payload.signature');
@@ -224,16 +227,19 @@ describe('GitHub Integration Database Models and Redaction', () => {
   });
 
   describe('GitHubOAuthStateModel', () => {
-    it('normalizes and protects stateHash via select: false and serialization redaction', async () => {
+    it('normalizes and protects stateHash and encryptedCodeVerifier via select: false and serialization redaction', async () => {
       expect(GitHubOAuthStateModel.modelName).toBe('GitHubOAuthState');
       expect(GitHubOAuthStateModel.collection.name).toBe('github_oauth_states');
       expect(githubOAuthStateSchema.path('stateHash').options.select).toBe(false);
+      expect(githubOAuthStateSchema.path('encryptedCodeVerifier').options.select).toBe(false);
 
       const digest = createHash('sha256').update('raw_state_token').digest('hex').toUpperCase();
       const doc = new GitHubOAuthStateModel({
         stateHash: `  ${digest}  `,
+        kind: 'OAUTH_AUTHORIZE',
         userId: new Types.ObjectId(),
         organizationId: new Types.ObjectId(),
+        encryptedCodeVerifier: 'v1.iv.tag.ciphertext',
         expiresAt: new Date(Date.now() + 600_000),
       });
 
@@ -244,6 +250,8 @@ describe('GitHub Integration Database Models and Redaction', () => {
       const obj = doc.toObject() as unknown as Record<string, unknown>;
       expect(json.stateHash).toBeUndefined();
       expect(obj.stateHash).toBeUndefined();
+      expect(json.encryptedCodeVerifier).toBeUndefined();
+      expect(obj.encryptedCodeVerifier).toBeUndefined();
       expect(json.__v).toBeUndefined();
 
       const badDoc = new GitHubOAuthStateModel({

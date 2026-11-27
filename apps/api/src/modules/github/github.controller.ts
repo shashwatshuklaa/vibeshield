@@ -43,12 +43,12 @@ export function createGitHubController(githubService: GitHubService) {
           return;
         }
         const parsed = discoverUserInstallationsSchema.parse(req.body);
-        const installations = await githubService.discoverUserInstallations(
+        const result = await githubService.discoverUserInstallations(
           req.auth.user.id,
           req.organizationAuth.organization.id,
           parsed
         );
-        res.status(200).json({ installations });
+        res.status(200).json(result);
       } catch (error) {
         next(error);
       }

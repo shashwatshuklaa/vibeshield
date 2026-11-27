@@ -69,11 +69,19 @@ export interface DiscoverUserInstallationsInput {
   code: string;
 }
 
+export interface DiscoverUserInstallationsResult {
+  installations: DiscoveredUserGitHubInstallation[];
+  linkState: string;
+  expiresAt: Date;
+}
+
 export interface CompleteGitHubInstallationInput {
   state: string;
   code?: string;
   installationId?: number;
   setupAction?: GitHubSetupAction;
+  error?: string;
+  errorDescription?: string;
 }
 
 export interface CompleteGitHubInstallationResult {

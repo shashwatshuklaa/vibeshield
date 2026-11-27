@@ -13,6 +13,7 @@ import {
   runInTransaction,
   type GitHubAccountType,
   type GitHubInstallationStatus,
+  type GitHubOAuthStateKind,
   type GitHubRepositorySelection,
   type IntegrationAuditAction,
 } from '@vibeshield/database';
@@ -38,6 +39,12 @@ export interface UpsertGitHubInstallationInput {
   lastSyncedAt: Date;
 }
 
+export interface ConsumedOAuthState {
+  kind: GitHubOAuthStateKind;
+  encryptedCodeVerifier: string | null;
+  allowedInstallationIds: number[];
+}
+
 export interface GitHubIntegrationStore {
   withTransaction<T>(work: (tx: GitHubTransactionContext) => Promise<T>): Promise<T>;
   acquireOrganizationLock(organizationId: string, tx: GitHubTransactionContext): Promise<boolean>;
@@ -48,8 +55,11 @@ export interface GitHubIntegrationStore {
   ): Promise<AuthorizedOrganizationMembership | null>;
   createOAuthState(input: {
     stateHash: string;
+    kind: GitHubOAuthStateKind;
     userId: string;
     organizationId: string;
+    encryptedCodeVerifier: string | null;
+    allowedInstallationIds?: number[];
     expiresAt: Date;
   }): Promise<void>;
   consumeOAuthState(input: {
@@ -57,7 +67,7 @@ export interface GitHubIntegrationStore {
     userId: string;
     organizationId: string;
     now: Date;
-  }): Promise<boolean>;
+  }): Promise<ConsumedOAuthState | null>;
   findActiveInstallationByGitHubId(
     githubInstallationId: number,
     tx?: GitHubTransactionContext
@@ -185,8 +195,13 @@ export const mongooseGitHubIntegrationStore: GitHubIntegrationStore = {
   async createOAuthState(input) {
     await GitHubOAuthStateModel.create({
       stateHash: input.stateHash,
+      kind: input.kind,
       userId: input.userId,
       organizationId: input.organizationId,
+      encryptedCodeVerifier: input.encryptedCodeVerifier,
+      ...(input.allowedInstallationIds !== undefined
+        ? { allowedInstallationIds: input.allowedInstallationIds }
+        : {}),
       usedAt: null,
       expiresAt: input.expiresAt,
     });
@@ -194,7 +209,7 @@ export const mongooseGitHubIntegrationStore: GitHubIntegrationStore = {
 
   async consumeOAuthState(input) {
     if (!isValidObjectId(input.userId) || !isValidObjectId(input.organizationId)) {
-      return false;
+      return null;
     }
     const consumed = await GitHubOAuthStateModel.findOneAndUpdate(
       {
@@ -205,13 +220,25 @@ export const mongooseGitHubIntegrationStore: GitHubIntegrationStore = {
         expiresAt: { $gt: input.now },
       },
       {
-        $set: { usedAt: input.now },
+        $set: {
+          usedAt: input.now,
+          encryptedCodeVerifier: null,
+        },
       },
       {
         returnDocument: 'before',
       }
-    );
-    return Boolean(consumed);
+    ).select('+encryptedCodeVerifier');
+
+    if (!consumed) {
+      return null;
+    }
+
+    return {
+      kind: consumed.kind,
+      encryptedCodeVerifier: consumed.encryptedCodeVerifier ?? null,
+      allowedInstallationIds: consumed.allowedInstallationIds ?? [],
+    };
   },
 
   async findActiveInstallationByGitHubId(githubInstallationId, tx) {
