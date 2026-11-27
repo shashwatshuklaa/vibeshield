@@ -315,6 +315,25 @@ importers:
         specifier: ^5.7.3
         version: 5.9.3
 
+  workers/security-worker:
+    dependencies:
+      '@vibeshield/env':
+        specifier: workspace:*
+        version: link:../../packages/env
+      '@vibeshield/queue':
+        specifier: workspace:*
+        version: link:../../packages/queue
+      '@vibeshield/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.1
+        version: 22.20.5
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+
 packages:
 
   '@emnapi/core@2.0.0-beta.2':

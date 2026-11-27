@@ -15,16 +15,17 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
 - **`apps/*`**: User-facing applications and core services.
   - **`apps/api`** (`@vibeshield/api`): Modular monolith backend API (Express + Helmet). *(Implemented)*
   - **`apps/web`**: Security dashboard frontend (React + Vite). *(Planned)*
-- **`workers/*`**: Asynchronous background workers, security analysis jobs, and event consumers. *(Planned)*
+- **`workers/*`**: Asynchronous background workers and job consumers.
+  - **`workers/security-worker`** (`@vibeshield/security-worker`): Dedicated standalone BullMQ security worker runtime consuming `vibeshield-v1-scan-jobs` independently of `apps/api`. *(Runtime Foundation Implemented; security scanners pending)*
 - **`packages/*`**: Shared internal libraries, type definitions, security rules, and utility packages.
   - **`packages/types`** (`@vibeshield/types`): Shared domain contracts, enums, and entities. *(Implemented)*
   - **`packages/config`** (`@vibeshield/config`): Shared TypeScript presets (`node.json`, `react.json`). *(Implemented)*
   - **`packages/env`** (`@vibeshield/env`): Secure environment validation and schema utilities with secret redaction. *(Implemented)*
   - **`packages/database`** (`@vibeshield/database`): Reusable MongoDB connectivity and connection lifecycle management built on Mongoose. *(Implemented)*
-  - Other shared packages (`queue`): *(Planned)*
+  - **`packages/queue`** (`@vibeshield/queue`): Shared Redis lifecycle management, BullMQ queue & worker factories, job contracts, and secret redaction. *(Implemented)*
 
 > [!NOTE]
-> `@vibeshield/api`, `@vibeshield/types`, `@vibeshield/config`, `@vibeshield/env`, and `@vibeshield/database` are active workspaces. Web UI and background workers are planned architecture components.
+> `@vibeshield/api`, `@vibeshield/security-worker`, `@vibeshield/types`, `@vibeshield/config`, `@vibeshield/env`, `@vibeshield/database`, and `@vibeshield/queue` are active workspaces. Web UI, scanner execution, and AI analysis/remediation are pending next phases.
 
 ## Prerequisites
 
@@ -59,7 +60,12 @@ VibeShield is structured as a **pnpm workspace monorepo** to maintain code modul
    pnpm --filter @vibeshield/api dev
    ```
 
+6. **Run Worker Tests or Worker Entrypoint** (standalone worker runtime):
+   ```bash
+   pnpm --filter @vibeshield/security-worker test
+   ```
+
 ## Development Status
 
-- **Status**: Redis & BullMQ queue infrastructure foundation established (Task 1.7.1 completed; security workers and scanner orchestration pending next tasks).
-- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), secure environment configuration (`@vibeshield/env`), MongoDB connection lifecycle, transactions, and core/GitHub foundation models (`@vibeshield/database`: `User`, `Organization`, `OrganizationMembership`, `Project`, `Session`, `RotatedRefreshToken`, `GitHubInstallation`, `GitHubOAuthState`, `ProjectRepositoryConnection`, `WebhookDelivery`, `IntegrationAuditLog`), shared Redis/BullMQ queue infrastructure (`@vibeshield/queue`: redacted `redis://`/`rediss://` lifecycle, role-separated Queue/Worker options, `vibeshield-v1-scan-jobs` factory, bounded retry/retention defaults, and strict credential-free payload validation), and Express backend service (`@vibeshield/api` with Argon2id auth, HS256 JWT access tokens, rotating HttpOnly refresh sessions, multi-tenant organization CRUD, RBAC permission matrix, transactional ownership transfer, organization-scoped project CRUD with pagination/search/archive/restore, hardened GitHub App installation flow, repository discovery, project-to-repository connection/sync/disconnect lifecycle, HMAC-verified GitHub webhook receiver with idempotent delivery tracking, and liveness/readiness probes including optional queue readiness) are active. Production scan workers, security scanner integrations, frontend UI, and AI analysis/remediation are pending next phases.
+- **Status**: Dedicated security worker runtime foundation established (Task 1.7.2 completed; security scanners and scan orchestration pending next tasks).
+- Foundational pnpm monorepo structure, shared domain contracts (`@vibeshield/types`), shared TypeScript presets (`@vibeshield/config`), secure environment configuration (`@vibeshield/env`), MongoDB connection lifecycle, transactions, and core/GitHub foundation models (`@vibeshield/database`: `User`, `Organization`, `OrganizationMembership`, `Project`, `Session`, `RotatedRefreshToken`, `GitHubInstallation`, `GitHubOAuthState`, `ProjectRepositoryConnection`, `WebhookDelivery`, `IntegrationAuditLog`), shared Redis/BullMQ queue infrastructure (`@vibeshield/queue`: redacted `redis://`/`rediss://` lifecycle, role-separated Queue/Worker options, `vibeshield-v1-scan-jobs` queue & worker factories, bounded retry/retention defaults, and strict credential-free payload validation), standalone security worker runtime (`workers/security-worker`: fail-fast processor boundary, bounded concurrency/lock/stalled settings, `UnrecoverableError` payload guarding, and grace-bounded shutdown), and Express backend service (`@vibeshield/api` with Argon2id auth, HS256 JWT access tokens, rotating HttpOnly refresh sessions, multi-tenant organization CRUD, RBAC permission matrix, transactional ownership transfer, organization-scoped project CRUD with pagination/search/archive/restore, hardened GitHub App installation flow, repository discovery, project-to-repository connection/sync/disconnect lifecycle, HMAC-verified GitHub webhook receiver with idempotent delivery tracking, and liveness/readiness probes including optional queue readiness) are active. Production scan engines, repository cloning/sandboxing, webhook job triggering, frontend UI, and AI analysis/remediation are pending next phases.

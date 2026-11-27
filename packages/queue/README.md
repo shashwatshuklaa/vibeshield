@@ -14,11 +14,13 @@ Shared Redis connection lifecycle management, BullMQ queue factories, job contra
   - `queue` role (API producers): bounded `maxRetriesPerRequest` (default `3`), `enableOfflineQueue: false` for fast failure, optional `commandTimeoutMs`.
   - `worker` role (`getWorkerConnectionOptions()`): `maxRetriesPerRequest: null` and no short `commandTimeout` so BullMQ blocking commands never time out prematurely or conflict with API connections.
 - **Explicit Lifecycle (`RedisConnectionManager`)**: Never connects upon module import; deduplicates concurrent `connect()` calls, supports `ping()`/`getStatus()` health inspection, and closes owned queue handles before quitting Redis via `closeQueueResources()`.
-- **Queue Factory & Job Contracts** (`contracts.ts`, `factory.ts`):
+- **Queue & Worker Factories & Job Contracts** (`contracts.ts`, `factory.ts`):
   - Stable, colon-free queue names (`QUEUE_NAMES.SCAN_JOBS = 'vibeshield-v1-scan-jobs'`, prefix `vibeshield`).
   - Minimal `ScanQueueJobPayload` contract reusing `@vibeshield/types` (`ScanStatus`) with strict runtime validation (`validateScanQueueJobPayload`) rejecting tokens, private keys, connection URIs, raw archives, or payloads > 16 KB.
   - Deterministic `buildScanJobId()` helpers (`scan-<org>-<project>-<scanId>`, colon-free).
   - Bounded default retry/backoff (`attempts: 3`, `1000ms` exponential backoff) and bounded retention (`removeOnComplete`: 24h / 1000 count, `removeOnFail`: 7d / 2000 count).
+  - BullMQ Worker factory (`createBullWorker`, `createScanJobsWorker`, `buildWorkerPolicyOptions`, `closeWorkerWithGrace`) enforcing explicit processor injection, `Worker`-role Redis options (`maxRetriesPerRequest: null`), bounded concurrency/lock/stalled recovery defaults (`DEFAULT_WORKER_POLICY`), and deterministic grace-bounded shutdown.
+  - Re-exports `UnrecoverableError`, `Job`, and `Processor` from `bullmq` so downstream workers can classify permanent vs transient failures consistently.
 
 ## Environment Variables & Local Setup
 
@@ -46,6 +48,6 @@ When `QUEUE_ENABLED=false` (the default), the API starts without Redis and unrel
 - **Unit & API tests** (no Docker or Redis required): `pnpm test`
 - **Real Redis & BullMQ integration tests** (ephemeral Docker Redis container): `pnpm run test:integration:redis`
 
-## Future Worker Integration
+## Worker Integration
 
-Future worker processes (`workers/*`) will instantiate a BullMQ `Worker` with `connectionManager.getWorkerConnectionOptions()` and `QUEUE_KEY_PREFIX` to consume `vibeshield-v1-scan-jobs` payloads without importing Express or API controllers. No scanner workers or automated scan triggers are included in this task.
+Dedicated background workers under `workers/*` (starting with `@vibeshield/security-worker`) instantiate BullMQ `Worker` instances via `createScanJobsWorker()` using `Worker`-role Redis connections (`maxRetriesPerRequest: null`), explicit processor registration, and credential-redacted lifecycle logging without importing Express or `apps/api`.

@@ -5,8 +5,12 @@ import {
   buildDefaultJobOptions,
   buildRedisConnectionOptions,
   buildScanJobId,
+  buildWorkerPolicyOptions,
   closeQueueResources,
+  closeWorkerWithGrace,
+  createBullWorker,
   DEFAULT_QUEUE_POLICY,
+  DEFAULT_WORKER_POLICY,
   defaultRedisManager,
   formatSafeRedisError,
   inspectQueueHealth,
@@ -378,6 +382,72 @@ describe('@vibeshield/queue Unit Tests', () => {
       expect(closeQueueSpy).toHaveBeenCalledTimes(1);
       expect(client.quitCalls).toBe(1);
       expect(manager.getState()).toBe('not_initialized');
+    });
+
+    it('validates worker policy defaults, bounded overrides, and worker factory guards', async () => {
+      expect(buildWorkerPolicyOptions()).toEqual(DEFAULT_WORKER_POLICY);
+
+      expect(
+        buildWorkerPolicyOptions({
+          concurrency: 5,
+          lockDuration: 45_000,
+          stalledInterval: 20_000,
+          maxStalledCount: 3,
+          maxStartedAttempts: 4,
+        })
+      ).toEqual({
+        concurrency: 5,
+        lockDuration: 45_000,
+        stalledInterval: 20_000,
+        maxStalledCount: 3,
+        maxStartedAttempts: 4,
+      });
+
+      expect(() => buildWorkerPolicyOptions({ concurrency: 0 })).toThrow(/Worker concurrency/);
+      expect(() => buildWorkerPolicyOptions({ concurrency: 51 })).toThrow(/Worker concurrency/);
+      expect(() => buildWorkerPolicyOptions({ lockDuration: 1000 })).toThrow(/Worker lockDuration/);
+      expect(() => buildWorkerPolicyOptions({ maxStalledCount: -1 })).toThrow(
+        /Worker maxStalledCount/
+      );
+
+      expect(() =>
+        createBullWorker('bad:queue', async () => undefined, {
+          redis: { url: 'redis://localhost:6379' },
+        })
+      ).toThrow(/must not contain colons/i);
+
+      expect(() =>
+        createBullWorker(
+          QUEUE_NAMES.SCAN_JOBS,
+          null as unknown as Parameters<typeof createBullWorker>[1],
+          {
+            redis: { url: 'redis://localhost:6379' },
+          }
+        )
+      ).toThrow(/processor/i);
+
+      expect(() =>
+        createBullWorker(QUEUE_NAMES.SCAN_JOBS, async () => undefined, {
+          redis: { url: 'http://secret:Pass123!@localhost:6379' },
+        })
+      ).toThrowError(RedisConnectionError);
+
+      // Graceful close within timeout
+      const fastClose = vi.fn(async () => undefined);
+      await expect(closeWorkerWithGrace({ close: fastClose }, 500)).resolves.toEqual({
+        timedOut: false,
+      });
+      expect(fastClose).toHaveBeenCalledWith(false);
+
+      // Timed-out close falls back to force=true
+      const slowClose = vi.fn((force?: boolean) =>
+        force ? Promise.resolve() : new Promise<void>(() => {})
+      );
+      await expect(closeWorkerWithGrace({ close: slowClose }, 20)).resolves.toEqual({
+        timedOut: true,
+      });
+      expect(slowClose).toHaveBeenNthCalledWith(1, false);
+      expect(slowClose).toHaveBeenNthCalledWith(2, true);
     });
   });
 });

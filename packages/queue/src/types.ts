@@ -124,3 +124,31 @@ export interface QueueHealthSummary {
     completed: number;
   };
 }
+
+/**
+ * Bounded lifecycle states for a standalone BullMQ worker runtime.
+ */
+export type WorkerLifecycleState =
+  'not_initialized' | 'starting' | 'ready' | 'stopping' | 'stopped' | 'failed';
+
+/**
+ * Configurable concurrency, lock, and stalled-job policy options for BullMQ workers.
+ */
+export interface WorkerPolicyOptions {
+  concurrency?: number;
+  lockDuration?: number;
+  stalledInterval?: number;
+  maxStalledCount?: number;
+  maxStartedAttempts?: number;
+}
+
+/**
+ * Safe runtime health snapshot for a BullMQ worker host without exposing Redis credentials.
+ */
+export interface WorkerHealthSummary {
+  queueName: string;
+  state: WorkerLifecycleState;
+  isReady: boolean;
+  isRunning: boolean;
+  concurrency: number;
+}

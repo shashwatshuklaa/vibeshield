@@ -1,0 +1,25 @@
+{
+  "name": "@vibeshield/security-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/worker.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "dev": "node --watch --experimental-strip-types src/worker.ts",
+    "start": "node dist/worker.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vibeshield/env": "workspace:*",
+    "@vibeshield/queue": "workspace:*",
+    "@vibeshield/types": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.7.3"
+  }
+}
