@@ -17,6 +17,7 @@ import {
   ScanModel,
   toPublicScanRecord,
   transitionScanToInProgress,
+  verifyScanAcquisitionAuthorization,
 } from '../index.js';
 
 function makeValidScanInput(overrides: Record<string, unknown> = {}) {
@@ -317,6 +318,28 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
           now,
         })
       ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+    });
+
+    it('rejects malformed scanId or invalid workerId before querying authorization models', async () => {
+      const findByIdSpy = vi.spyOn(ScanModel, 'findById');
+
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: 'not-an-object-id',
+          leaseToken: 'valid_token_1234567890',
+          workerId: 'security-worker',
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_SCAN_IDENTIFIER' });
+
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: new mongoose.Types.ObjectId().toString(),
+          leaseToken: 'valid_token_1234567890',
+          workerId: '   ',
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_WORKER_ID' });
+
+      expect(findByIdSpy).not.toHaveBeenCalled();
     });
   });
 });

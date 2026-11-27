@@ -1,9 +1,10 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { ClientSession } from 'mongoose';
 import {
   isTerminalScanLifecycleStatus,
   ScanFailureCodeValue,
   ScanLifecycleStatusValue,
+  type AuthorizedScanAcquisitionContext,
   type PublicScanRecord,
   type ScanAcquisitionMetadata,
   type ScanFailureCode,
@@ -11,7 +12,18 @@ import {
   type ScanTriggerSource,
 } from '@vibeshield/types';
 import { redactMongoUri, runInTransaction } from '../connection.js';
+import {
+  GitHubInstallationModel,
+  GitHubInstallationStatusValue,
+} from '../models/github-installation.model.js';
 import { acquireOrganizationMutationLock } from '../models/organization.model.js';
+import { ProjectModel } from '../models/project.model.js';
+import {
+  getEffectiveConnectionStatus,
+  InstallationAvailabilityValue,
+  ProjectRepositoryConnectionModel,
+  RepositoryAccessStateValue,
+} from '../models/project-repository-connection.model.js';
 import { ScanModel, type ScanAttributes } from '../models/scan.model.js';
 import { isValidObjectId } from '../utils/normalization.js';
 import { redactGitHubSecrets } from '../utils/redaction.js';
@@ -1118,4 +1130,318 @@ export async function requestScanCancellation(input: {
       scan: toPublicScanRecord(marked),
     };
   });
+}
+
+export type ScanAcquisitionDenialReason =
+  | 'SCAN_NOT_FOUND'
+  | 'SCAN_NOT_ACQUIRING'
+  | 'SCAN_INACTIVE'
+  | 'SCAN_CANCELLED'
+  | 'INVALID_ATTEMPT_STATE'
+  | 'LEASE_MISSING'
+  | 'WORKER_MISMATCH'
+  | 'INVALID_LEASE_TOKEN'
+  | 'LEASE_EXPIRED'
+  | 'PROJECT_NOT_FOUND'
+  | 'PROJECT_ARCHIVED'
+  | 'CONNECTION_NOT_FOUND'
+  | 'CONNECTION_INACTIVE'
+  | 'CONNECTION_METADATA_MISMATCH'
+  | 'INSTALLATION_NOT_FOUND'
+  | 'INSTALLATION_UNAVAILABLE'
+  | 'INSTALLATION_MISMATCH';
+
+export interface VerifyScanAcquisitionAuthorizationInput {
+  scanId: string;
+  leaseToken: string;
+  workerId: string;
+  now?: Date;
+}
+
+export type VerifyScanAcquisitionAuthorizationResult =
+  | { status: 'AUTHORIZED'; context: AuthorizedScanAcquisitionContext }
+  | { status: 'DENIED'; reason: ScanAcquisitionDenialReason; message: string };
+
+function constantTimeTokenMatch(expectedToken: string, providedToken: string): boolean {
+  if (expectedToken.length === 0 || providedToken.length === 0) {
+    return false;
+  }
+  const expectedDigest = createHash('sha256').update(expectedToken, 'utf8').digest();
+  const providedDigest = createHash('sha256').update(providedToken, 'utf8').digest();
+  return timingSafeEqual(expectedDigest, providedDigest);
+}
+
+/**
+ * Authoritatively verifies whether a leased worker may acquire repository source code for a scan.
+ *
+ * Security invariants enforced server-side from MongoDB authoritative records:
+ * 1. Scan exists, is active, is in `ACQUIRING`, and has no recorded cancellation request.
+ * 2. Active attempt count is within `1..maxAttempts`.
+ * 3. Scan holds a non-expired lease belonging to `workerId` with constant-time `lease.token` match.
+ * 4. Parent Project exists in the same organization and is not archived.
+ * 5. Parent ProjectRepositoryConnection exists in the same organization & project, is effectively
+ *    `CONNECTED` (`isActive: true`), and matches the scan's GitHub installation & repository IDs.
+ * 6. Parent GitHubInstallation exists in the same organization, is `ACTIVE` (`isActive: true`,
+ *    not suspended, not revoked), and matches the installation ID on both scan and connection.
+ *
+ * Note on concurrency: checking across Scan, Project, ProjectRepositoryConnection, and
+ * GitHubInstallation leaves a narrow race window if cancellation, lease reclamation, project
+ * archival, or installation revocation commits concurrently. Future archive download handlers must
+ * re-verify active lease fencing and cancellation immediately before streaming contents or saving
+ * acquisition metadata.
+ */
+export async function verifyScanAcquisitionAuthorization(
+  input: VerifyScanAcquisitionAuthorizationInput,
+  session?: ClientSession
+): Promise<VerifyScanAcquisitionAuthorizationResult> {
+  if (!isValidObjectId(input.scanId)) {
+    throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
+  }
+  const workerId = assertValidWorkerIdentity(input.workerId);
+  const now = input.now ?? new Date();
+
+  const scan = await ScanModel.findById(input.scanId)
+    .select(
+      'organizationId projectId repositoryConnectionId githubInstallationId githubRepositoryId requestedRef requestedCommitHash status isActive attemptCount maxAttempts cancellation.requestedAt lease.workerId lease.expiresAt +lease.token'
+    )
+    .session(session ?? null)
+    .lean();
+
+  if (!scan) {
+    return {
+      status: 'DENIED',
+      reason: 'SCAN_NOT_FOUND',
+      message: 'Scan record was not found.',
+    };
+  }
+
+  if (scan.status !== ScanLifecycleStatusValue.ACQUIRING) {
+    return {
+      status: 'DENIED',
+      reason: 'SCAN_NOT_ACQUIRING',
+      message: 'Scan is not currently in ACQUIRING status.',
+    };
+  }
+
+  if (scan.isActive !== true) {
+    return {
+      status: 'DENIED',
+      reason: 'SCAN_INACTIVE',
+      message: 'Scan is no longer active.',
+    };
+  }
+
+  if (scan.cancellation?.requestedAt !== null && scan.cancellation?.requestedAt !== undefined) {
+    return {
+      status: 'DENIED',
+      reason: 'SCAN_CANCELLED',
+      message: 'Scan cancellation has already been requested.',
+    };
+  }
+
+  if (
+    !Number.isInteger(scan.attemptCount) ||
+    !Number.isInteger(scan.maxAttempts) ||
+    scan.attemptCount < 1 ||
+    scan.attemptCount > scan.maxAttempts
+  ) {
+    return {
+      status: 'DENIED',
+      reason: 'INVALID_ATTEMPT_STATE',
+      message: 'Scan attempt bounds are invalid.',
+    };
+  }
+
+  if (
+    !scan.lease ||
+    typeof scan.lease.workerId !== 'string' ||
+    typeof scan.lease.token !== 'string' ||
+    !scan.lease.expiresAt
+  ) {
+    return {
+      status: 'DENIED',
+      reason: 'LEASE_MISSING',
+      message: 'Scan does not hold an active worker lease.',
+    };
+  }
+
+  if (scan.lease.workerId !== workerId) {
+    return {
+      status: 'DENIED',
+      reason: 'WORKER_MISMATCH',
+      message: 'Scan lease belongs to a different worker.',
+    };
+  }
+
+  const providedLeaseToken = typeof input.leaseToken === 'string' ? input.leaseToken : '';
+  if (!constantTimeTokenMatch(scan.lease.token, providedLeaseToken)) {
+    return {
+      status: 'DENIED',
+      reason: 'INVALID_LEASE_TOKEN',
+      message: 'Invalid worker lease token.',
+    };
+  }
+
+  if (new Date(scan.lease.expiresAt).getTime() <= now.getTime()) {
+    return {
+      status: 'DENIED',
+      reason: 'LEASE_EXPIRED',
+      message: 'Worker lease has expired.',
+    };
+  }
+
+  const project = await ProjectModel.findOne(
+    {
+      _id: scan.projectId,
+      organizationId: scan.organizationId,
+    },
+    {
+      _id: 1,
+      organizationId: 1,
+      archivedAt: 1,
+    }
+  )
+    .session(session ?? null)
+    .lean();
+
+  if (!project || project.organizationId.toString() !== scan.organizationId.toString()) {
+    return {
+      status: 'DENIED',
+      reason: 'PROJECT_NOT_FOUND',
+      message: 'Parent project was not found in the scan organization.',
+    };
+  }
+
+  if (project.archivedAt !== null && project.archivedAt !== undefined) {
+    return {
+      status: 'DENIED',
+      reason: 'PROJECT_ARCHIVED',
+      message: 'Parent project is archived.',
+    };
+  }
+
+  const connection = await ProjectRepositoryConnectionModel.findOne(
+    {
+      _id: scan.repositoryConnectionId,
+      organizationId: scan.organizationId,
+      projectId: scan.projectId,
+    },
+    {
+      _id: 1,
+      organizationId: 1,
+      projectId: 1,
+      installationRecordId: 1,
+      githubInstallationId: 1,
+      githubRepositoryId: 1,
+      repositoryAccessState: 1,
+      installationAvailability: 1,
+      isActive: 1,
+    }
+  )
+    .session(session ?? null)
+    .lean();
+
+  if (
+    !connection ||
+    connection.organizationId.toString() !== scan.organizationId.toString() ||
+    connection.projectId.toString() !== scan.projectId.toString()
+  ) {
+    return {
+      status: 'DENIED',
+      reason: 'CONNECTION_NOT_FOUND',
+      message: 'Project repository connection was not found.',
+    };
+  }
+
+  if (
+    connection.isActive !== true ||
+    connection.repositoryAccessState !== RepositoryAccessStateValue.CONNECTED ||
+    connection.installationAvailability !== InstallationAvailabilityValue.ACTIVE ||
+    getEffectiveConnectionStatus(connection) !== 'CONNECTED'
+  ) {
+    return {
+      status: 'DENIED',
+      reason: 'CONNECTION_INACTIVE',
+      message: 'Project repository connection is not active.',
+    };
+  }
+
+  if (
+    connection.githubRepositoryId !== scan.githubRepositoryId ||
+    connection.githubInstallationId !== scan.githubInstallationId
+  ) {
+    return {
+      status: 'DENIED',
+      reason: 'CONNECTION_METADATA_MISMATCH',
+      message: 'Scan repository or installation metadata does not match the active connection.',
+    };
+  }
+
+  const installation = await GitHubInstallationModel.findOne(
+    {
+      _id: connection.installationRecordId,
+      organizationId: scan.organizationId,
+    },
+    {
+      _id: 1,
+      organizationId: 1,
+      githubInstallationId: 1,
+      status: 1,
+      isActive: 1,
+      suspendedAt: 1,
+      revokedAt: 1,
+    }
+  )
+    .session(session ?? null)
+    .lean();
+
+  if (!installation || installation.organizationId.toString() !== scan.organizationId.toString()) {
+    return {
+      status: 'DENIED',
+      reason: 'INSTALLATION_NOT_FOUND',
+      message: 'GitHub installation record was not found.',
+    };
+  }
+
+  if (
+    installation.status !== GitHubInstallationStatusValue.ACTIVE ||
+    installation.isActive !== true ||
+    (installation.suspendedAt !== null && installation.suspendedAt !== undefined) ||
+    (installation.revokedAt !== null && installation.revokedAt !== undefined)
+  ) {
+    return {
+      status: 'DENIED',
+      reason: 'INSTALLATION_UNAVAILABLE',
+      message: 'GitHub installation is suspended, revoked, or inactive.',
+    };
+  }
+
+  if (
+    installation.githubInstallationId !== scan.githubInstallationId ||
+    installation.githubInstallationId !== connection.githubInstallationId
+  ) {
+    return {
+      status: 'DENIED',
+      reason: 'INSTALLATION_MISMATCH',
+      message: 'GitHub installation identifier does not match the authorized scan binding.',
+    };
+  }
+
+  return {
+    status: 'AUTHORIZED',
+    context: {
+      scanId: scan._id.toString(),
+      organizationId: scan.organizationId.toString(),
+      projectId: scan.projectId.toString(),
+      repositoryConnectionId: scan.repositoryConnectionId.toString(),
+      githubInstallationId: installation.githubInstallationId,
+      githubRepositoryId: connection.githubRepositoryId,
+      requestedRef: scan.requestedRef,
+      requestedCommitHash: scan.requestedCommitHash ?? null,
+      attemptCount: scan.attemptCount,
+      maxAttempts: scan.maxAttempts,
+      workerId: scan.lease.workerId,
+      leaseExpiresAt: scan.lease.expiresAt,
+    },
+  };
 }

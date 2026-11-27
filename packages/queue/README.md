@@ -21,6 +21,9 @@ Shared Redis connection lifecycle management, BullMQ queue factories, job contra
   - Bounded default retry/backoff (`attempts: 3`, `1000ms` exponential backoff) and bounded retention (`removeOnComplete`: 24h / 1000 count, `removeOnFail`: 7d / 2000 count).
   - BullMQ Worker factory (`createBullWorker`, `createScanJobsWorker`, `buildWorkerPolicyOptions`, `closeWorkerWithGrace`) enforcing explicit processor injection, `Worker`-role Redis options (`maxRetriesPerRequest: null`), bounded concurrency/lock/stalled recovery defaults (`DEFAULT_WORKER_POLICY`), and deterministic grace-bounded shutdown.
   - Re-exports `UnrecoverableError`, `Job`, and `Processor` from `bullmq` so downstream workers can classify permanent vs transient failures consistently.
+- **Internal Auth Replay Protection (`consumeInternalAuthNonce`, `buildInternalAuthNonceKey`)**:
+  - Atomically records single-use internal service authentication nonces via `SET <prefix>:internal-auth-nonce:<service>:<nonce> 1 PX <ttlMs> NX`.
+  - Fails closed (`InternalAuthReplayProtectionError`) whenever Redis is disconnected, unavailable, or errors so internal API replay checks never silently pass without Redis backing.
 
 ## Environment Variables & Local Setup
 

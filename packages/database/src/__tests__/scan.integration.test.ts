@@ -14,13 +14,20 @@ import {
   disconnectDatabase,
   failScanWithLease,
   findScanByIdInOrganization,
+  GitHubInstallationModel,
+  GitHubInstallationStatusValue,
+  InstallationAvailabilityValue,
   listScansByProjectInOrganization,
   OrganizationModel,
+  ProjectModel,
+  ProjectRepositoryConnectionModel,
   reclaimExpiredScanLease,
   renewScanWorkerLease,
+  RepositoryAccessStateValue,
   requestScanCancellation,
   ScanModel,
   transitionScanToInProgress,
+  verifyScanAcquisitionAuthorization,
 } from '../index.js';
 
 const REPLICA_URI = process.env.MONGODB_INTEGRATION_URI;
@@ -1074,6 +1081,277 @@ describe.skipIf(!REPLICA_URI)(
       });
       expect(unkeyedFollowUp.status).toBe(ScanLifecycleStatusValue.QUEUED);
       expect(unkeyedFollowUp.isActive).toBe(true);
+    });
+
+    it('enforces every scan acquisition authorization invariant against real MongoDB documents', async () => {
+      await Promise.all([
+        ProjectModel.deleteMany({}),
+        ProjectRepositoryConnectionModel.deleteMany({}),
+        GitHubInstallationModel.deleteMany({}),
+      ]);
+
+      const projectDoc = await ProjectModel.create({
+        organizationId: orgA,
+        name: 'Authz Project',
+        slug: 'authz-project',
+        createdBy: userA,
+      });
+
+      const installationDoc = await GitHubInstallationModel.create({
+        organizationId: orgA,
+        githubInstallationId: 5001,
+        githubAppId: 9001,
+        accountId: 7001,
+        accountLogin: 'acme-sec',
+        accountType: 'Organization',
+        repositorySelection: 'selected',
+        grantedPermissions: { contents: 'read' },
+        status: GitHubInstallationStatusValue.ACTIVE,
+        isActive: true,
+        connectedByUserId: userA,
+        lastSyncedAt: new Date(),
+      });
+
+      const connectionDoc = await ProjectRepositoryConnectionModel.create({
+        organizationId: orgA,
+        projectId: projectDoc._id,
+        installationRecordId: installationDoc._id,
+        githubInstallationId: 5001,
+        githubRepositoryId: 8001,
+        ownerLogin: 'acme-sec',
+        repoName: 'web-app',
+        fullName: 'acme-sec/web-app',
+        defaultBranch: 'main',
+        isPrivate: true,
+        isArchivedOnGitHub: false,
+        repositoryAccessState: RepositoryAccessStateValue.CONNECTED,
+        installationAvailability: InstallationAvailabilityValue.ACTIVE,
+        connectedByUserId: userA,
+        connectedAt: new Date(),
+        lastSyncedAt: new Date(),
+      });
+
+      const t0 = new Date('2026-11-28T01:00:00Z');
+      const queued = await createQueuedScan({
+        organizationId: orgA,
+        projectId: projectDoc._id.toString(),
+        repositoryConnectionId: connectionDoc._id.toString(),
+        githubInstallationId: 5001,
+        githubRepositoryId: 8001,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+
+      // Normal reads must never expose lease.token (`select: false`)
+      const defaultRead = await ScanModel.findById(queued.id).lean();
+      expect((defaultRead?.lease as { token?: string } | null)?.token).toBeUndefined();
+
+      // Still QUEUED (not ACQUIRING) -> denied
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: 'non_existent_token_123456',
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'SCAN_NOT_ACQUIRING' });
+
+      const claimed = await claimQueuedScanForAcquisition({
+        scanId: queued.id,
+        organizationId: orgA,
+        projectId: projectDoc._id.toString(),
+        workerId: 'security-worker',
+        leaseDurationMs: 30_000,
+        now: t0,
+      });
+      expect(claimed.status).toBe('CLAIMED');
+      if (claimed.status !== 'CLAIMED') {
+        throw new Error('Expected scan claim to succeed');
+      }
+
+      // 1. Valid active authorization passes and returns minimal safe context (no leaseToken)
+      const ok = await verifyScanAcquisitionAuthorization({
+        scanId: queued.id,
+        leaseToken: claimed.leaseToken,
+        workerId: 'security-worker',
+        now: new Date(t0.getTime() + 1_000),
+      });
+      expect(ok.status).toBe('AUTHORIZED');
+      if (ok.status !== 'AUTHORIZED') {
+        throw new Error('Expected authorization to succeed');
+      }
+      expect(ok.context).toMatchObject({
+        scanId: queued.id,
+        organizationId: orgA,
+        projectId: projectDoc._id.toString(),
+        repositoryConnectionId: connectionDoc._id.toString(),
+        githubInstallationId: 5001,
+        githubRepositoryId: 8001,
+        requestedRef: 'main',
+        attemptCount: 1,
+        maxAttempts: 3,
+        workerId: 'security-worker',
+      });
+      expect(JSON.stringify(ok.context)).not.toContain(claimed.leaseToken);
+
+      // 2. Missing scan -> SCAN_NOT_FOUND
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: new mongoose.Types.ObjectId().toString(),
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'SCAN_NOT_FOUND' });
+
+      // 3. Wrong lease token (different length & same length) -> INVALID_LEASE_TOKEN
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: 'short',
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'INVALID_LEASE_TOKEN' });
+
+      const sameLengthWrongToken = `${claimed.leaseToken.slice(0, -1)}${claimed.leaseToken.endsWith('0') ? '1' : '0'}`;
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: sameLengthWrongToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'INVALID_LEASE_TOKEN' });
+
+      // 4. Wrong workerId -> WORKER_MISMATCH
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'other-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'WORKER_MISMATCH' });
+
+      // 5. Expired lease -> LEASE_EXPIRED
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: new Date(t0.getTime() + 31_000),
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'LEASE_EXPIRED' });
+
+      // 6. Metadata mismatch -> CONNECTION_METADATA_MISMATCH
+      await ScanModel.updateOne({ _id: queued.id }, { $set: { githubRepositoryId: 9999 } });
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'CONNECTION_METADATA_MISMATCH' });
+      await ScanModel.updateOne({ _id: queued.id }, { $set: { githubRepositoryId: 8001 } });
+
+      // 7. Disconnected/revoked connection -> CONNECTION_INACTIVE
+      await ProjectRepositoryConnectionModel.updateOne(
+        { _id: connectionDoc._id },
+        { $set: { repositoryAccessState: RepositoryAccessStateValue.ACCESS_REVOKED } }
+      );
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'CONNECTION_INACTIVE' });
+      await ProjectRepositoryConnectionModel.updateOne(
+        { _id: connectionDoc._id },
+        { $set: { repositoryAccessState: RepositoryAccessStateValue.CONNECTED } }
+      );
+
+      // 8. Suspended installation -> INSTALLATION_UNAVAILABLE
+      await GitHubInstallationModel.updateOne(
+        { _id: installationDoc._id },
+        {
+          $set: {
+            status: GitHubInstallationStatusValue.SUSPENDED,
+            suspendedAt: t0,
+          },
+        }
+      );
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'INSTALLATION_UNAVAILABLE' });
+      await GitHubInstallationModel.updateOne(
+        { _id: installationDoc._id },
+        {
+          $set: {
+            status: GitHubInstallationStatusValue.ACTIVE,
+            suspendedAt: null,
+          },
+        }
+      );
+
+      // 9. Archived project -> PROJECT_ARCHIVED
+      await ProjectModel.updateOne({ _id: projectDoc._id }, { $set: { archivedAt: t0 } });
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'PROJECT_ARCHIVED' });
+      await ProjectModel.updateOne({ _id: projectDoc._id }, { $set: { archivedAt: null } });
+
+      // 10. Cross-organization project mismatch -> PROJECT_NOT_FOUND
+      await ProjectModel.updateOne({ _id: projectDoc._id }, { $set: { organizationId: orgB } });
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'PROJECT_NOT_FOUND' });
+      await ProjectModel.updateOne({ _id: projectDoc._id }, { $set: { organizationId: orgA } });
+
+      // 11. Cancellation requested -> SCAN_CANCELLED
+      await requestScanCancellation({
+        scanId: queued.id,
+        organizationId: orgA,
+        projectId: projectDoc._id.toString(),
+        requestedByUserId: userA,
+        reason: 'Stop before download',
+        now: t0,
+      });
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'SCAN_CANCELLED' });
+
+      // Clean up test fixtures cleanly
+      await Promise.all([
+        ProjectRepositoryConnectionModel.deleteMany({ _id: connectionDoc._id }),
+        GitHubInstallationModel.deleteMany({ _id: installationDoc._id }),
+        ProjectModel.deleteMany({ _id: projectDoc._id }),
+      ]);
     });
   }
 );

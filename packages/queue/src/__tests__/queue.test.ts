@@ -3,17 +3,20 @@ import { describe, expect, it, vi } from 'vitest';
 import { ScanStatus } from '@vibeshield/types';
 import {
   buildDefaultJobOptions,
+  buildInternalAuthNonceKey,
   buildRedisConnectionOptions,
   buildScanJobId,
   buildWorkerPolicyOptions,
   closeQueueResources,
   closeWorkerWithGrace,
+  consumeInternalAuthNonce,
   createBullWorker,
   DEFAULT_QUEUE_POLICY,
   DEFAULT_WORKER_POLICY,
   defaultRedisManager,
   formatSafeRedisError,
   inspectQueueHealth,
+  InternalAuthReplayProtectionError,
   isTlsRedisUrl,
   isValidQueueName,
   isValidRedisUrl,
@@ -35,6 +38,8 @@ class MockRedisClient extends EventEmitter implements RedisClientLike {
   public disconnectCalls = 0;
   public shouldFailConnect: Error | null = null;
   public shouldFailQuit: Error | null = null;
+  public shouldFailSet: Error | null = null;
+  public readonly nonceKeys = new Map<string, number>();
 
   async connect(): Promise<void> {
     this.connectCalls += 1;
@@ -49,6 +54,28 @@ class MockRedisClient extends EventEmitter implements RedisClientLike {
   async ping(): Promise<string> {
     this.pingCalls += 1;
     return 'PONG';
+  }
+
+  async set(
+    key: string,
+    _value: string,
+    expiryMode: 'PX',
+    ttlMs: number,
+    condition: 'NX'
+  ): Promise<'OK' | null> {
+    if (this.shouldFailSet) {
+      throw this.shouldFailSet;
+    }
+    if (expiryMode !== 'PX' || condition !== 'NX') {
+      throw new Error('Unexpected Redis SET arguments in mock client');
+    }
+    const now = Date.now();
+    const existingExpiry = this.nonceKeys.get(key);
+    if (existingExpiry !== undefined && existingExpiry > now) {
+      return null;
+    }
+    this.nonceKeys.set(key, now + ttlMs);
+    return 'OK';
   }
 
   async quit(): Promise<string> {
@@ -448,6 +475,81 @@ describe('@vibeshield/queue Unit Tests', () => {
       });
       expect(slowClose).toHaveBeenNthCalledWith(1, false);
       expect(slowClose).toHaveBeenNthCalledWith(2, true);
+    });
+  });
+
+  describe('Internal auth replay nonce protection', () => {
+    it('atomically accepts first-seen nonces, blocks replays, isolates namespaces, and fails closed when Redis is unavailable', async () => {
+      const client = new MockRedisClient();
+      const manager = new RedisConnectionManager({
+        createClient: () => client,
+        logger: {},
+      });
+
+      // Fails closed when not connected
+      await expect(
+        consumeInternalAuthNonce(manager, {
+          nonce: 'nonce-1234567890abcdef',
+          ttlMs: 30_000,
+          namespace: 'security-worker',
+        })
+      ).rejects.toThrowError(InternalAuthReplayProtectionError);
+
+      await manager.connect({ url: 'redis://localhost:6379' });
+
+      expect(buildInternalAuthNonceKey('nonce-1234567890abcdef', 'security-worker')).toBe(
+        'vibeshield:internal-auth-nonce:security-worker:nonce-1234567890abcdef'
+      );
+
+      await expect(
+        consumeInternalAuthNonce(manager, {
+          nonce: 'nonce-1234567890abcdef',
+          ttlMs: 30_000,
+          namespace: 'security-worker',
+        })
+      ).resolves.toBe('ACCEPTED');
+
+      await expect(
+        consumeInternalAuthNonce(manager, {
+          nonce: 'nonce-1234567890abcdef',
+          ttlMs: 30_000,
+          namespace: 'security-worker',
+        })
+      ).resolves.toBe('REPLAYED');
+
+      // Different caller namespace does not collide
+      await expect(
+        consumeInternalAuthNonce(manager, {
+          nonce: 'nonce-1234567890abcdef',
+          ttlMs: 30_000,
+          namespace: 'other-worker',
+        })
+      ).resolves.toBe('ACCEPTED');
+
+      // Rejects malformed nonces or bad TTLs before Redis call
+      await expect(
+        consumeInternalAuthNonce(manager, {
+          nonce: 'bad',
+          ttlMs: 30_000,
+        })
+      ).rejects.toThrowError(InternalAuthReplayProtectionError);
+      await expect(
+        consumeInternalAuthNonce(manager, {
+          nonce: 'nonce-1234567890abcdef',
+          ttlMs: 100,
+        })
+      ).rejects.toThrowError(InternalAuthReplayProtectionError);
+
+      // Fails closed if Redis SET errors
+      client.shouldFailSet = new Error('READONLY You cannot write against a read only replica');
+      await expect(
+        consumeInternalAuthNonce(manager, {
+          nonce: 'nonce-second-12345678',
+          ttlMs: 30_000,
+        })
+      ).rejects.toThrowError(InternalAuthReplayProtectionError);
+
+      await manager.disconnect();
     });
   });
 });

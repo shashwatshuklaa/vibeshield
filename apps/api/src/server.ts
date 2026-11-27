@@ -3,6 +3,7 @@ import type { Express } from 'express';
 import { connectDatabase, disconnectDatabase, formatSafeError } from '@vibeshield/database';
 import {
   closeQueueResources,
+  consumeInternalAuthNonce,
   createScanJobsQueue,
   formatSafeRedisError,
   RedisConnectionManager,
@@ -11,7 +12,15 @@ import {
   type RedisConnectionStatus,
 } from '@vibeshield/queue';
 import { createApp, type CreateAppOptions } from './app.js';
-import { getApiConfig, toAuthConfig, toGitHubConfig, toQueueConfig } from './config/env.js';
+import {
+  getApiConfig,
+  toAuthConfig,
+  toGitHubConfig,
+  toInternalApiConfig,
+  toQueueConfig,
+} from './config/env.js';
+import { createInternalApp, type CreateInternalAppOptions } from './internal-app.js';
+import type { InternalWorkerAuthMiddlewareOptions } from './modules/scans/internal-auth.js';
 
 export interface ServerLogger {
   info?: (message: string) => void;
@@ -27,6 +36,9 @@ export interface ServerDependencies {
   disconnectQueue?: () => Promise<void>;
   getQueueStatus?: () => RedisConnectionStatus & { required?: boolean };
   createAppFn?: (options?: CreateAppOptions) => Express;
+  createInternalAppFn?: (options: CreateInternalAppOptions) => Express;
+  consumeInternalAuthNonce?: InternalWorkerAuthMiddlewareOptions['consumeNonce'];
+  verifyScanAuthorization?: CreateInternalAppOptions['verifyAuthorization'];
   logger?: ServerLogger;
   shutdownTimeoutMs?: number;
 }
@@ -47,9 +59,23 @@ const DEFAULT_LOGGER: Required<ServerLogger> = {
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 
 let activeServer: Server | null = null;
+let activeInternalServer: Server | null = null;
 let activeDisconnectDb: () => Promise<void> = disconnectDatabase;
 let activeDisconnectQueue: () => Promise<void> = async () => undefined;
 let shutdownPromise: Promise<void> | null = null;
+
+/**
+ * Returns active public and internal HTTP server handles (primarily for integration/lifecycle tests).
+ */
+export function getActiveServers(): {
+  publicServer: Server | null;
+  internalServer: Server | null;
+} {
+  return {
+    publicServer: activeServer,
+    internalServer: activeInternalServer,
+  };
+}
 
 /**
  * Starts the VibeShield API server following the strict lifecycle sequence:
@@ -67,19 +93,25 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
     disconnectQueue,
     getQueueStatus,
     createAppFn = createApp,
+    createInternalAppFn = createInternalApp,
+    consumeInternalAuthNonce: consumeInternalAuthNonceOverride,
+    verifyScanAuthorization,
     logger = DEFAULT_LOGGER,
+    shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
   } = dependencies;
 
   // 1. Validate environment configuration before any database or network activity
   const config = getApiConfig(envSource);
+  const internalConfig = toInternalApiConfig(config);
 
-  // 2. Establish MongoDB connection before binding HTTP port
+  // 2. Establish MongoDB connection before binding HTTP ports
   await connectDb(config.MONGODB_URI);
 
   // 3. Initialize optional Redis & BullMQ foundation explicitly when enabled
   const queueConfig = toQueueConfig(config);
   let ownedRedisManager: RedisConnectionManager | null = null;
   let ownedScanQueue: ManagedQueueHandle | null = null;
+  const fallbackDisconnectedRedisManager = new RedisConnectionManager({ logger });
 
   const resolvedDisconnectQueue: () => Promise<void> = disconnectQueue
     ? disconnectQueue
@@ -133,7 +165,7 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
       }
     } catch (queueError) {
       const safeQueueError = formatSafeRedisError(queueError);
-      if (queueConfig.required) {
+      if (queueConfig.required || (internalConfig !== null && !consumeInternalAuthNonceOverride)) {
         await resolvedDisconnectQueue().catch(() => undefined);
         await disconnectDb().catch(() => undefined);
         throw queueError;
@@ -156,41 +188,23 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
     },
   });
 
-  // 5. Bind and listen on configured host and port
+  // 5. Bind and listen on configured public host and port
   const port = config.PORT ?? 4000;
   const host = config.HOST;
 
+  let startedPublicServer: Server;
   try {
-    const startedServer = await new Promise<Server>((resolve, reject) => {
-      const candidateServer = app.listen(port, host);
-
-      const onError = (error: Error) => {
-        candidateServer.off('listening', onListening);
-        reject(error);
-      };
-
-      const onListening = () => {
-        candidateServer.off('error', onError);
-        logger.info?.(`[VibeShield API] Server listening on http://${host}:${port}`);
-        logger.info?.(
-          `[VibeShield API] Liveness endpoint at http://${host}:${port}${config.API_PREFIX}/health/live`
-        );
-        logger.info?.(
-          `[VibeShield API] Readiness endpoint at http://${host}:${port}${config.API_PREFIX}/health/ready`
-        );
-        resolve(candidateServer);
-      };
-
-      candidateServer.once('error', onError);
-      candidateServer.once('listening', onListening);
+    startedPublicServer = await listenExpressServer(app, host, port, () => {
+      logger.info?.(`[VibeShield API] Server listening on http://${host}:${port}`);
+      logger.info?.(
+        `[VibeShield API] Liveness endpoint at http://${host}:${port}${config.API_PREFIX}/health/live`
+      );
+      logger.info?.(
+        `[VibeShield API] Readiness endpoint at http://${host}:${port}${config.API_PREFIX}/health/ready`
+      );
     });
-
-    activeServer = startedServer;
-    activeDisconnectDb = disconnectDb;
-    activeDisconnectQueue = resolvedDisconnectQueue;
-    return startedServer;
   } catch (error) {
-    // Ensure queue and database connections are not left dangling if HTTP server fails to bind
+    // Ensure queue and database connections are not left dangling if public HTTP server fails to bind
     try {
       await resolvedDisconnectQueue();
     } catch (queueDisconnectError) {
@@ -207,6 +221,91 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
     }
     throw error;
   }
+
+  // 6. Bind and listen on separate loopback/private internal worker listener when enabled
+  let startedInternalServer: Server | null = null;
+  if (internalConfig) {
+    const consumeNonce =
+      consumeInternalAuthNonceOverride ??
+      ((nonceInput) =>
+        consumeInternalAuthNonce(
+          ownedRedisManager ?? fallbackDisconnectedRedisManager,
+          nonceInput
+        ));
+
+    const internalApp = createInternalAppFn({
+      auth: {
+        workerAuthSecret: internalConfig.workerAuthSecret,
+        timestampToleranceMs: internalConfig.timestampToleranceMs,
+        nonceTtlMs: internalConfig.nonceTtlMs,
+        consumeNonce,
+      },
+      ...(verifyScanAuthorization ? { verifyAuthorization: verifyScanAuthorization } : {}),
+    });
+
+    try {
+      startedInternalServer = await listenExpressServer(
+        internalApp,
+        internalConfig.host,
+        internalConfig.port,
+        () => {
+          logger.info?.(
+            `[VibeShield Internal API] Internal worker listener bound on http://${internalConfig.host}:${internalConfig.port}`
+          );
+        }
+      );
+    } catch (error) {
+      await closeHttpServerWithTimeout(startedPublicServer, shutdownTimeoutMs, logger).catch(
+        (closeError) => {
+          logger.error?.(
+            `[VibeShield API] Failed to close public HTTP server after internal listener failure: ${formatSafeError(closeError)}`
+          );
+        }
+      );
+      await resolvedDisconnectQueue().catch((queueDisconnectError) => {
+        logger.error?.(
+          `[VibeShield API] Failed to disconnect Redis/queue after internal listener failure: ${formatSafeRedisError(queueDisconnectError)}`
+        );
+      });
+      await disconnectDb().catch((disconnectError) => {
+        logger.error?.(
+          `[VibeShield API] Failed to disconnect MongoDB after internal listener failure: ${formatSafeError(disconnectError)}`
+        );
+      });
+      throw error;
+    }
+  }
+
+  activeServer = startedPublicServer;
+  activeInternalServer = startedInternalServer;
+  activeDisconnectDb = disconnectDb;
+  activeDisconnectQueue = resolvedDisconnectQueue;
+  return startedPublicServer;
+}
+
+function listenExpressServer(
+  expressApp: Express,
+  host: string,
+  port: number,
+  onReady: () => void
+): Promise<Server> {
+  return new Promise<Server>((resolve, reject) => {
+    const candidateServer = expressApp.listen(port, host);
+
+    const onError = (error: Error) => {
+      candidateServer.off('listening', onListening);
+      reject(error);
+    };
+
+    const onListening = () => {
+      candidateServer.off('error', onError);
+      onReady();
+      resolve(candidateServer);
+    };
+
+    candidateServer.once('error', onError);
+    candidateServer.once('listening', onListening);
+  });
 }
 
 /**
@@ -229,18 +328,33 @@ export function shutdownServer(
   } = dependencies;
 
   const serverToClose = activeServer;
+  const internalServerToClose = activeInternalServer;
 
   shutdownPromise = (async () => {
     let shutdownError: Error | null = null;
 
     logger.info?.(`[VibeShield API] Received ${signal}. Starting graceful shutdown...`);
 
+    if (internalServerToClose) {
+      try {
+        await closeHttpServerWithTimeout(internalServerToClose, shutdownTimeoutMs, logger);
+        logger.info?.('[VibeShield Internal API] Internal worker listener closed gracefully.');
+      } catch (error) {
+        shutdownError = error instanceof Error ? error : new Error(formatSafeError(error));
+        logger.error?.(
+          `[VibeShield Internal API] Error while closing internal worker listener: ${formatSafeError(error)}`
+        );
+      }
+    }
+
     if (serverToClose) {
       try {
         await closeHttpServerWithTimeout(serverToClose, shutdownTimeoutMs, logger);
         logger.info?.('[VibeShield API] HTTP server closed gracefully.');
       } catch (error) {
-        shutdownError = error instanceof Error ? error : new Error(formatSafeError(error));
+        if (!shutdownError) {
+          shutdownError = error instanceof Error ? error : new Error(formatSafeError(error));
+        }
         logger.error?.(
           `[VibeShield API] Error while closing HTTP server: ${formatSafeError(error)}`
         );
@@ -270,6 +384,7 @@ export function shutdownServer(
       );
     } finally {
       activeServer = null;
+      activeInternalServer = null;
       activeDisconnectDb = disconnectDatabase;
       activeDisconnectQueue = async () => undefined;
       shutdownPromise = null;
@@ -329,6 +444,7 @@ async function closeHttpServerWithTimeout(
  */
 export function resetServerStateForTests(): void {
   activeServer = null;
+  activeInternalServer = null;
   activeDisconnectDb = disconnectDatabase;
   activeDisconnectQueue = async () => undefined;
   shutdownPromise = null;

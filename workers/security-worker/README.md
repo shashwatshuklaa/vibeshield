@@ -18,8 +18,11 @@ This workspace runs separately from `apps/api`, imports no Express/HTTP server c
   - **Fenced Leases & Recovery**: `claimQueuedScanForAcquisition()` atomically transitions `QUEUED` -> `ACQUIRING`, mints an opaque random `lease.token` (hidden via `select: false` + serialization stripping), and sets `lease.expiresAt`. After crash/timeout (`expiresAt <= now`), `reclaimExpiredScanLease()` rotates `lease.token` and increments `attemptCount` (up to `maxAttempts`, then fails with `LEASE_EXPIRED`). Any prior stalled worker holding an older `lease.token` is atomically rejected (`STALE_OR_CONFLICT`).
   - **Cancellation Semantics**: Cancelling a `QUEUED` scan transitions it directly to `CANCELLED`; cancelling an `ACQUIRING` or `IN_PROGRESS` scan stamps `cancellation.requestedAt`, blocks advancement to `IN_PROGRESS`, and lets the fenced worker finalize `CANCELLED`.
 - **Credential-Safe Logging & Secret Isolation**:
-  - Intentionally excludes GitHub App private keys (`GITHUB_APP_PRIVATE_KEY`), OAuth secrets, and webhook secrets.
+  - Intentionally excludes GitHub App private keys (`GITHUB_APP_PRIVATE_KEY`), OAuth secrets, and webhook secrets, and will never receive raw GitHub installation tokens.
   - Scrubs MongoDB URIs, Redis URLs, and inline credentials from all logs and thrown errors.
+- **Trust Boundaries & Future Hardening**:
+  - In this phase, `@vibeshield/security-worker` acts as a **trusted control-plane orchestrator** connecting directly to MongoDB and Redis to claim/renew/complete scan leases. Future hardening will narrow or replace direct worker database access with narrowly scoped DB roles or API-mediated state RPCs.
+  - Upcoming repository acquisition will invoke the API's dedicated private/loopback listener (`POST /internal/v1/scans/acquire`) authenticated with dedicated HMAC-SHA256 request signing (`INTERNAL_WORKER_AUTH_SECRET`, upgradeable to mTLS/workload identity in production), while actual static analyzers (`Semgrep`, `Gitleaks`, `Trivy`) execute inside restricted, networkless non-root scanner sandboxes holding zero DB, Redis, or GitHub credentials.
 - **Deterministic Idempotent Shutdown**:
   - `SIGINT` / `SIGTERM` and concurrent `stop()` calls deduplicate cleanly, closing BullMQ worker first within `WORKER_SHUTDOWN_GRACE_MS` (falling back to force-close on expiry) and then disconnecting MongoDB.
 

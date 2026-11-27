@@ -4,6 +4,7 @@ import { ScanStatus } from '@vibeshield/types';
 import {
   buildScanJobId,
   closeQueueResources,
+  consumeInternalAuthNonce,
   createScanJobsQueue,
   DEFAULT_QUEUE_POLICY,
   inspectQueueHealth,
@@ -157,5 +158,33 @@ describe.skipIf(!REDIS_URI)('@vibeshield/queue Real Redis & BullMQ Integration T
 
     await closeQueueResources([handle], manager);
     expect(manager.getState()).toBe('not_initialized');
+  });
+
+  it('enforces atomic Redis SET NX PX replay protection under concurrent requests and expires TTL cleanly', async () => {
+    const manager = new RedisConnectionManager();
+    activeManagers.push(manager);
+
+    await manager.connect({
+      url: REDIS_URI!,
+      connectTimeoutMs: 5000,
+    });
+
+    const nonce = `int-nonce-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+    const namespace = 'security-worker-int';
+
+    const results = await Promise.all([
+      consumeInternalAuthNonce(manager, { nonce, ttlMs: 1_000, namespace }),
+      consumeInternalAuthNonce(manager, { nonce, ttlMs: 1_000, namespace }),
+      consumeInternalAuthNonce(manager, { nonce, ttlMs: 1_000, namespace }),
+    ]);
+
+    expect(results.filter((entry) => entry === 'ACCEPTED')).toHaveLength(1);
+    expect(results.filter((entry) => entry === 'REPLAYED')).toHaveLength(2);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_150));
+
+    await expect(
+      consumeInternalAuthNonce(manager, { nonce, ttlMs: 1_000, namespace })
+    ).resolves.toBe('ACCEPTED');
   });
 });

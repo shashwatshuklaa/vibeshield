@@ -133,3 +133,25 @@ export interface PublicScanRecord {
   createdAt: Date | string;
   updatedAt: Date | string;
 }
+
+/**
+ * Minimal, server-authorized acquisition context resolved solely by the API database layer
+ * after verifying scan ownership, active lease fencing, cancellation state, project state,
+ * repository connection state, and GitHub installation status.
+ *
+ * Never contains worker lease fencing tokens, GitHub installation tokens, private keys, or user PII.
+ */
+export interface AuthorizedScanAcquisitionContext {
+  scanId: string;
+  organizationId: string;
+  projectId: string;
+  repositoryConnectionId: string;
+  githubInstallationId: number;
+  githubRepositoryId: number;
+  requestedRef: string;
+  requestedCommitHash: string | null;
+  attemptCount: number;
+  maxAttempts: number;
+  workerId: string;
+  leaseExpiresAt: Date | string;
+}

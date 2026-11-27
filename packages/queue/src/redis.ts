@@ -1,4 +1,5 @@
 import { Redis, type RedisOptions } from 'ioredis';
+import { QUEUE_KEY_PREFIX } from './contracts.js';
 import {
   extractRedisUrlPassword,
   formatSafeRedisError,
@@ -31,6 +32,13 @@ export interface RedisClientLike {
   status: string;
   connect(): Promise<unknown>;
   ping(): Promise<string>;
+  set?(
+    key: string,
+    value: string,
+    expiryMode: 'PX',
+    ttlMs: number,
+    condition: 'NX'
+  ): Promise<'OK' | null>;
   quit(): Promise<unknown>;
   disconnect(reconnect?: boolean): void;
   duplicate?(override?: Partial<RedisOptions>): RedisClientLike;
@@ -366,3 +374,103 @@ export class RedisConnectionManager {
 }
 
 export const defaultRedisManager = new RedisConnectionManager();
+
+const INTERNAL_AUTH_NONCE_REGEX = /^[A-Za-z0-9._-]{16,128}$/;
+const INTERNAL_AUTH_NONCE_NAMESPACE_REGEX = /^[a-z0-9._:-]{1,64}$/;
+const MAX_INTERNAL_AUTH_NONCE_TTL_MS = 3_600_000;
+
+export type ConsumeInternalAuthNonceResult = 'ACCEPTED' | 'REPLAYED';
+
+export class InternalAuthReplayProtectionError extends Error {
+  public readonly code: string;
+
+  constructor(
+    message: string,
+    code = 'INTERNAL_AUTH_REPLAY_PROTECTION_UNAVAILABLE',
+    rawSecrets: string[] = []
+  ) {
+    super(formatSafeRedisError(message, rawSecrets));
+    this.name = 'InternalAuthReplayProtectionError';
+    this.code = code;
+  }
+}
+
+/**
+ * Constructs a canonical, fixed-namespace Redis key for single-use internal worker auth nonces.
+ */
+export function buildInternalAuthNonceKey(nonce: string, namespace = 'default'): string {
+  if (!INTERNAL_AUTH_NONCE_REGEX.test(nonce)) {
+    throw new InternalAuthReplayProtectionError(
+      'Internal authentication nonce format is invalid.',
+      'INVALID_INTERNAL_AUTH_NONCE'
+    );
+  }
+  if (!INTERNAL_AUTH_NONCE_NAMESPACE_REGEX.test(namespace)) {
+    throw new InternalAuthReplayProtectionError(
+      'Internal authentication nonce namespace format is invalid.',
+      'INVALID_INTERNAL_AUTH_NAMESPACE'
+    );
+  }
+  return `${QUEUE_KEY_PREFIX}:internal-auth-nonce:${namespace}:${nonce}`;
+}
+
+/**
+ * Atomically records a single-use internal authentication nonce in Redis (`SET key 1 PX ttl NX`).
+ * Fails closed whenever Redis is disconnected, unavailable, lacks `SET NX PX`, or errors so replay
+ * protection can never silently degrade to fail-open.
+ */
+export async function consumeInternalAuthNonce(
+  manager: Pick<RedisConnectionManager, 'isConnected' | 'getQueueClient'>,
+  input: {
+    nonce: string;
+    ttlMs: number;
+    namespace?: string;
+  }
+): Promise<ConsumeInternalAuthNonceResult> {
+  const key = buildInternalAuthNonceKey(input.nonce, input.namespace ?? 'default');
+
+  if (
+    !Number.isInteger(input.ttlMs) ||
+    input.ttlMs < 1_000 ||
+    input.ttlMs > MAX_INTERNAL_AUTH_NONCE_TTL_MS
+  ) {
+    throw new InternalAuthReplayProtectionError(
+      `Internal auth nonce TTL must be an integer between 1000 and ${MAX_INTERNAL_AUTH_NONCE_TTL_MS} ms.`,
+      'INVALID_INTERNAL_AUTH_TTL'
+    );
+  }
+
+  if (!manager.isConnected()) {
+    throw new InternalAuthReplayProtectionError(
+      'Redis replay protection store is not connected.',
+      'REDIS_REPLAY_STORE_UNAVAILABLE'
+    );
+  }
+
+  let client: RedisClientLike;
+  try {
+    client = manager.getQueueClient();
+  } catch (error) {
+    throw new InternalAuthReplayProtectionError(
+      `Redis replay protection store is unavailable: ${formatSafeRedisError(error)}`,
+      'REDIS_REPLAY_STORE_UNAVAILABLE'
+    );
+  }
+
+  if (typeof client.set !== 'function') {
+    throw new InternalAuthReplayProtectionError(
+      'Redis client does not support atomic SET NX PX replay protection.',
+      'REDIS_REPLAY_STORE_UNSUPPORTED'
+    );
+  }
+
+  try {
+    const reply = await client.set(key, '1', 'PX', input.ttlMs, 'NX');
+    return reply === 'OK' ? 'ACCEPTED' : 'REPLAYED';
+  } catch (error) {
+    throw new InternalAuthReplayProtectionError(
+      `Redis replay protection check failed: ${formatSafeRedisError(error)}`,
+      'REDIS_REPLAY_STORE_ERROR'
+    );
+  }
+}

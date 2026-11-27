@@ -37,6 +37,12 @@ The API extends the foundational environment schema from `@vibeshield/env`. Copy
   - `GITHUB_WEBHOOK_SECRET`: Primary GitHub webhook HMAC secret (min 32 characters).
   - `GITHUB_WEBHOOK_SECRET_PREVIOUS`: Optional previous webhook secret for zero-downtime secret rotation (requires core GitHub settings when set).
   - `GITHUB_CALLBACK_URL`: Exact registered GitHub App OAuth Callback URL without wildcards, query parameters, or fragments (HTTPS required in production).
+- **Internal Worker Acquisition Listener (Optional; disabled unless `INTERNAL_API_ENABLED=true`)**:
+  - `INTERNAL_API_ENABLED`: Set to `true` to bind the separate internal Express listener (`createInternalApp`). Requires `QUEUE_ENABLED=true`, `REDIS_URL`, and `INTERNAL_WORKER_AUTH_SECRET`.
+  - `INTERNAL_API_HOST`: Bind IP/host restricted strictly to `localhost`, loopback (`127.0.0.0/8`, `::1`), or RFC1918/ULA private addresses (`0.0.0.0`, `::`, `169.254.0.0/16`, wildcards, and public hosts are rejected). Default: `127.0.0.1`.
+  - `INTERNAL_API_PORT`: Separate TCP port (must differ from public `PORT`). Default: `4001`.
+  - `INTERNAL_WORKER_AUTH_SECRET`: Dedicated >= 32-char HMAC-SHA256 signing secret distinct from `JWT_ACCESS_SECRET` and all GitHub secrets.
+  - `INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS`: Clock-skew window (`1000`–`300000` ms, default `30000`).
 
 #### Local MongoDB Example
 ```env
@@ -143,6 +149,23 @@ pnpm run test:integration
 - **`POST /api/v1/organizations/:organizationId/projects/:projectId/github/sync`**: Refresh installation suspension/revocation status and authoritative GitHub repository metadata without letting installation unsuspend overwrite `REPO_DELETED` or restore `ACCESS_REVOKED` (`OWNER`, `ADMIN` only).
 - **`DELETE /api/v1/organizations/:organizationId/projects/:projectId/github`**: Safely disconnect a project's GitHub repository (`repositoryAccessState: DISCONNECTED`, `isActive: false`) while preserving historical connection and installation records (`OWNER`, `ADMIN` only).
 - **`POST /api/v1/webhooks/github`**: Unauthenticated GitHub App webhook receiver verified via `X-Hub-Signature-256` HMAC-SHA256 against exact raw request bytes (`GITHUB_WEBHOOK_SECRET` and optional `GITHUB_WEBHOOK_SECRET_PREVIOUS` during rotation), deduplicated via `X-GitHub-Delivery`, and processing `installation`, `installation_repositories`, and `repository` lifecycle events inside per-organization transactions.
+
+## Internal Scan Acquisition Boundary (`createInternalApp`)
+
+To keep GitHub App private keys and least-privilege installation tokens isolated inside `apps/api` while preparing for repository archive acquisition:
+
+- **Listener Isolation**: When `INTERNAL_API_ENABLED=true`, [server.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/server.ts) starts [createInternalApp()](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/internal-app.ts) on a dedicated loopback/private HTTP server (`INTERNAL_API_HOST:INTERNAL_API_PORT`, distinct from `PORT`) and shuts it down alongside the public HTTP server (rolling back public server, queue, and MongoDB if internal binding fails). Public `createApp()` never mounts `/internal/*` routes, and the internal listener exposes no `/api/v1/*` routes.
+- **HMAC-SHA256 Authentication & Fail-Closed Replay Protection** ([internal-auth.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/modules/scans/internal-auth.ts)):
+  - Every request must include `x-vibeshield-service` (`security-worker`), `x-vibeshield-timestamp`, `x-vibeshield-nonce`, and `x-vibeshield-signature` (`sha256=<hex>`).
+  - Middleware captures exact raw request bytes first (`express.raw`) and verifies headers, timestamp skew, caller identity, and `crypto.timingSafeEqual` HMAC-SHA256 over `METHOD\nPATH\nSERVICE\nTIMESTAMP\nNONCE\nBODY_SHA256` **before** JSON deserialization and **before** touching Redis.
+  - Nonce consumption uses atomic Redis `SET ... PX ... NX` via `consumeInternalAuthNonce` (`@vibeshield/queue`), rejecting replays (`401`) and failing closed (`503`) whenever Redis is unavailable.
+- **Authorization & Placeholder Route (`POST /internal/v1/scans/acquire`)**:
+  - Accepts strictly `{ scanId, leaseToken }` (`.strict()`, rejecting caller-supplied organization, project, repository, installation, URL, permission, or token overrides).
+  - Derives caller identity solely from `req.internalAuth.serviceId` and calls `verifyScanAcquisitionAuthorization()` (`@vibeshield/database`) to validate scan lease fencing, cancellation state, non-archived project, active repository connection binding, and active GitHub installation.
+  - In Task 1.7.3.3.1, returns `501 ACQUISITION_NOT_IMPLEMENTED` after authorization passes; no GitHub installation token minting or repository tarball streaming is wired yet.
+- **Deployment & Security Model Notes**:
+  - **Networking**: Default `127.0.0.1` restricts the internal listener to co-located loopback traffic; when deploying `security-worker` in separate containers or pods, bind `INTERNAL_API_HOST` explicitly to a private VPC/pod IP (never `0.0.0.0`) enforced by ingress firewall / Kubernetes `NetworkPolicy`.
+  - **Residual Risk & Upgrade Path**: Shared symmetric HMAC (`INTERNAL_WORKER_AUTH_SECRET`) prevents unauthorized unauthenticated callers from reaching internal handlers, but host compromise on the worker exposes the signing key; production deployments should layer **mTLS / workload identity** on top of or in place of static shared secrets, narrow worker MongoDB privileges away from broader collections, and isolate untrusted scanner execution in dedicated restricted sandboxes without DB/Redis/GitHub secrets.
 
 ## Organization & RBAC Architecture
 

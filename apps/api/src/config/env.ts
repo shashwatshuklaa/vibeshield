@@ -1,4 +1,5 @@
 import { createPrivateKey } from 'node:crypto';
+import { isIP } from 'node:net';
 import {
   isValidMongoUri,
   normalizeSlug,
@@ -23,6 +24,73 @@ export interface GitHubRuntimeConfig {
   webhookSecret: string;
   previousWebhookSecret?: string;
   callbackUrl: string;
+}
+
+export interface InternalApiRuntimeConfig {
+  enabled: true;
+  host: string;
+  port: number;
+  workerAuthSecret: string;
+  timestampToleranceMs: number;
+  nonceTtlMs: number;
+}
+
+export const DEFAULT_INTERNAL_API_HOST = '127.0.0.1';
+export const DEFAULT_INTERNAL_API_PORT = 4001;
+export const DEFAULT_INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS = 30_000;
+
+/**
+ * Validates that an internal API bind host is strictly restricted to loopback (`127.0.0.0/8`, `localhost`,
+ * `::1`) or non-link-local RFC1918 / IPv6 ULA private addresses. Rejects `0.0.0.0`, `::`, wildcards,
+ * link-local metadata ranges (`169.254.0.0/16`), URLs, and public hostnames.
+ */
+export function isValidInternalBindHost(rawHost: string): boolean {
+  if (typeof rawHost !== 'string') {
+    return false;
+  }
+  const trimmed = rawHost.trim();
+  if (trimmed.length === 0 || /\s/.test(trimmed) || trimmed.includes('*')) {
+    return false;
+  }
+
+  const normalized = trimmed.toLowerCase();
+  if (normalized === 'localhost') {
+    return true;
+  }
+
+  const ipVersion = isIP(normalized);
+  if (ipVersion === 4) {
+    const octets = normalized.split('.').map(Number);
+    if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet))) {
+      return false;
+    }
+    const [a, b] = octets as [number, number, number, number];
+    // Reject 0.0.0.0, 169.254.0.0/16 link-local, and all public IPv4 space
+    if (a === 127) {
+      return true;
+    }
+    if (a === 10) {
+      return true;
+    }
+    if (a === 172 && b >= 16 && b <= 31) {
+      return true;
+    }
+    if (a === 192 && b === 168) {
+      return true;
+    }
+    return false;
+  }
+
+  if (ipVersion === 6) {
+    if (normalized === '::1' || normalized === '0:0:0:0:0:0:0:1') {
+      return true;
+    }
+    // Allow RFC 4193 IPv6 Unique Local Addresses (fc00::/7), reject :: wildcard, fe80:: link-local, and global space
+    const firstHextet = normalized.split(':')[0] ?? '';
+    return /^(fc|fd)[0-9a-f]{2}$/.test(firstHextet);
+  }
+
+  return false;
 }
 
 export const REQUIRED_GITHUB_ENV_KEYS = [
@@ -359,6 +427,67 @@ const baseApiEnvSchema = baseEnvSchema.extend({
       message: 'Must be between 100 and 60000 milliseconds',
     })
     .optional(),
+
+  /**
+   * Explicitly enables the separate loopback/private internal worker listener.
+   * Disabled unless set to `'true'`.
+   */
+  INTERNAL_API_ENABLED: z
+    .enum(['true', 'false'])
+    .transform((value) => value === 'true')
+    .optional(),
+
+  /**
+   * Bind address for the internal API listener. Restricted strictly to loopback or RFC1918/ULA
+   * private addresses; defaults to `127.0.0.1`.
+   */
+  INTERNAL_API_HOST: z
+    .string()
+    .trim()
+    .min(1, 'INTERNAL_API_HOST must not be empty')
+    .refine(isValidInternalBindHost, {
+      message:
+        'INTERNAL_API_HOST must be localhost, loopback, or a private non-link-local IP address (never 0.0.0.0 or public hosts)',
+    })
+    .optional(),
+
+  /**
+   * TCP port for the separate internal worker listener (must differ from PORT; defaults to 4001).
+   */
+  INTERNAL_API_PORT: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'INTERNAL_API_PORT must be a positive integer port')
+    .transform(Number)
+    .refine((port) => port >= 1 && port <= 65535, {
+      message: 'INTERNAL_API_PORT must be between 1 and 65535',
+    })
+    .optional(),
+
+  /**
+   * Dedicated HMAC-SHA256 shared secret for internal worker-to-API authentication.
+   * Must be distinct from JWT_ACCESS_SECRET and all GitHub secrets.
+   */
+  INTERNAL_WORKER_AUTH_SECRET: z
+    .string()
+    .min(32, 'INTERNAL_WORKER_AUTH_SECRET must be at least 32 characters')
+    .refine((secret) => secret.trim().length >= 32, {
+      message: 'INTERNAL_WORKER_AUTH_SECRET must contain at least 32 non-whitespace characters',
+    })
+    .optional(),
+
+  /**
+   * Maximum allowed clock skew in milliseconds for signed internal worker requests (default 30000).
+   */
+  INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'Must be an integer clock-skew tolerance in milliseconds')
+    .transform(Number)
+    .refine((ms) => ms >= 1_000 && ms <= 300_000, {
+      message: 'INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS must be between 1000 and 300000 milliseconds',
+    })
+    .optional(),
 });
 
 export const apiEnvSchema = baseApiEnvSchema.superRefine((env, ctx) => {
@@ -376,6 +505,61 @@ export const apiEnvSchema = baseApiEnvSchema.superRefine((env, ctx) => {
       path: ['REDIS_URL'],
       message: 'REDIS_URL is required when QUEUE_ENABLED is true',
     });
+  }
+
+  if (env.INTERNAL_WORKER_AUTH_SECRET !== undefined) {
+    const forbiddenMatches = [
+      env.JWT_ACCESS_SECRET,
+      env.GITHUB_CLIENT_SECRET,
+      env.GITHUB_WEBHOOK_SECRET,
+      env.GITHUB_WEBHOOK_SECRET_PREVIOUS,
+    ].filter((secret): secret is string => typeof secret === 'string' && secret.length > 0);
+
+    if (forbiddenMatches.includes(env.INTERNAL_WORKER_AUTH_SECRET)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['INTERNAL_WORKER_AUTH_SECRET'],
+        message:
+          'INTERNAL_WORKER_AUTH_SECRET must be distinct from JWT_ACCESS_SECRET and GitHub secrets',
+      });
+    }
+  }
+
+  if (env.INTERNAL_API_ENABLED) {
+    if (env.INTERNAL_WORKER_AUTH_SECRET === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['INTERNAL_WORKER_AUTH_SECRET'],
+        message: 'INTERNAL_WORKER_AUTH_SECRET is required when INTERNAL_API_ENABLED is true',
+      });
+    }
+
+    const publicPort = env.PORT ?? 4000;
+    const internalPort = env.INTERNAL_API_PORT ?? DEFAULT_INTERNAL_API_PORT;
+    if (internalPort === publicPort) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['INTERNAL_API_PORT'],
+        message: 'INTERNAL_API_PORT must be distinct from the public API PORT',
+      });
+    }
+
+    if (!env.QUEUE_ENABLED) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['QUEUE_ENABLED'],
+        message:
+          'QUEUE_ENABLED must be true when INTERNAL_API_ENABLED is true (Redis replay protection is required)',
+      });
+    }
+
+    if (env.REDIS_URL === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['REDIS_URL'],
+        message: 'REDIS_URL is required when INTERNAL_API_ENABLED is true',
+      });
+    }
   }
 
   const hasAnyGitHubSetting =
@@ -491,6 +675,28 @@ export function toQueueConfig(env: ApiEnv): QueueRuntimeConfig | null {
 }
 
 /**
+ * Extracts validated internal worker listener runtime configuration, or returns `null` when
+ * `INTERNAL_API_ENABLED !== true`.
+ */
+export function toInternalApiConfig(env: ApiEnv): InternalApiRuntimeConfig | null {
+  if (!env.INTERNAL_API_ENABLED || !env.INTERNAL_WORKER_AUTH_SECRET) {
+    return null;
+  }
+
+  const timestampToleranceMs =
+    env.INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS ?? DEFAULT_INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS;
+
+  return {
+    enabled: true,
+    host: env.INTERNAL_API_HOST ?? DEFAULT_INTERNAL_API_HOST,
+    port: env.INTERNAL_API_PORT ?? DEFAULT_INTERNAL_API_PORT,
+    workerAuthSecret: env.INTERNAL_WORKER_AUTH_SECRET,
+    timestampToleranceMs,
+    nonceTtlMs: timestampToleranceMs * 2 + 5_000,
+  };
+}
+
+/**
  * Redacts GitHub tokens, PEM private keys, Authorization credentials, and configured
  * GitHub API secret values from arbitrary strings.
  */
@@ -510,6 +716,38 @@ export function redactGitHubEnvSecrets(
     input,
     env
       ? [
+          env.GITHUB_APP_PRIVATE_KEY,
+          env.GITHUB_CLIENT_SECRET,
+          env.GITHUB_WEBHOOK_SECRET,
+          env.GITHUB_WEBHOOK_SECRET_PREVIOUS,
+        ]
+      : []
+  );
+}
+
+/**
+ * Redacts internal worker shared auth secrets alongside GitHub and JWT secrets from arbitrary text.
+ */
+export function redactInternalEnvSecrets(
+  input: string,
+  env?: Partial<
+    Pick<
+      ApiEnv,
+      | 'INTERNAL_WORKER_AUTH_SECRET'
+      | 'JWT_ACCESS_SECRET'
+      | 'GITHUB_APP_PRIVATE_KEY'
+      | 'GITHUB_CLIENT_SECRET'
+      | 'GITHUB_WEBHOOK_SECRET'
+      | 'GITHUB_WEBHOOK_SECRET_PREVIOUS'
+    >
+  >
+): string {
+  return redactGitHubSecrets(
+    input,
+    env
+      ? [
+          env.INTERNAL_WORKER_AUTH_SECRET,
+          env.JWT_ACCESS_SECRET,
           env.GITHUB_APP_PRIVATE_KEY,
           env.GITHUB_CLIENT_SECRET,
           env.GITHUB_WEBHOOK_SECRET,
