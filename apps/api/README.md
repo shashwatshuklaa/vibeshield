@@ -43,6 +43,10 @@ The API extends the foundational environment schema from `@vibeshield/env`. Copy
   - `INTERNAL_API_PORT`: Separate TCP port (must differ from public `PORT`). Default: `4001`.
   - `INTERNAL_WORKER_AUTH_SECRET`: Dedicated >= 32-char HMAC-SHA256 signing secret distinct from `JWT_ACCESS_SECRET` and all GitHub secrets.
   - `INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS`: Clock-skew window (`1000`–`300000` ms, default `30000`).
+  - `INTERNAL_ARCHIVE_MAX_BYTES`: Maximum compressed repository archive size (`1048576`–`104857600` bytes; hard ceiling 100 MiB = `104857600`).
+  - `INTERNAL_GITHUB_REQUEST_TIMEOUT_MS`: Bounded timeout for GitHub REST commit resolution and tarball redirect calls (`1000`–`60000` ms, default `10000`).
+  - `INTERNAL_CODELOAD_TIMEOUT_MS`: Bounded timeout for codeload archive response/transfer (`1000`–`180000` ms, default `60000`).
+  - `INTERNAL_ACQUISITION_TOTAL_TIMEOUT_MS`: End-to-end acquisition proxy transfer timeout (`5000`–`300000` ms, default `120000`).
 
 #### Local MongoDB Example
 ```env
@@ -159,10 +163,12 @@ To keep GitHub App private keys and least-privilege installation tokens isolated
   - Every request must include `x-vibeshield-service` (`security-worker`), `x-vibeshield-timestamp`, `x-vibeshield-nonce`, and `x-vibeshield-signature` (`sha256=<hex>`).
   - Middleware captures exact raw request bytes first (`express.raw`) and verifies headers, timestamp skew, caller identity, and `crypto.timingSafeEqual` HMAC-SHA256 over `METHOD\nPATH\nSERVICE\nTIMESTAMP\nNONCE\nBODY_SHA256` **before** JSON deserialization and **before** touching Redis.
   - Nonce consumption uses atomic Redis `SET ... PX ... NX` via `consumeInternalAuthNonce` (`@vibeshield/queue`), rejecting replays (`401`) and failing closed (`503`) whenever Redis is unavailable.
-- **Authorization & Placeholder Route (`POST /internal/v1/scans/acquire`)**:
+- **Authorization & Archive Streaming Proxy (`POST /internal/v1/scans/acquire`)** ([internal-acquisition.service.ts](file:///home/krishna/Coding/Projects/Vibeshield/apps/api/src/modules/scans/internal-acquisition.service.ts)):
   - Accepts strictly `{ scanId, leaseToken }` (`.strict()`, rejecting caller-supplied organization, project, repository, installation, URL, permission, or token overrides).
-  - Derives caller identity solely from `req.internalAuth.serviceId` and calls `verifyScanAcquisitionAuthorization()` (`@vibeshield/database`) to validate scan lease fencing, cancellation state, non-archived project, active repository connection binding, and active GitHub installation.
-  - In Task 1.7.3.3.1, returns `501 ACQUISITION_NOT_IMPLEMENTED` after authorization passes; no GitHub installation token minting or repository tarball streaming is wired yet.
+  - Derives caller identity solely from `req.internalAuth.serviceId`, calls `verifyScanAcquisitionAuthorization()` (`@vibeshield/database`) before token minting, again before `/tarball/{sha}`, again before flushing headers, periodically during long transfers, and immediately before emitting final EOF (`res.end()`).
+  - Mints a least-privilege single-repository (`repository_ids: [githubRepositoryId]`, `permissions: { contents: 'read' }`) token exclusively in memory via `createRepositoryAcquisitionToken()`, verifies repository identity matches DB records, resolves the requested reference to an immutable commit SHA (`resolveCommitSha()`), persists `resolvedCommitSha` under fenced active lease (`setScanResolvedCommitWithLease()`), and always revokes the ephemeral token in `finally` via `revokeInstallationAccessToken()` without masking original errors or logging plaintext tokens.
+  - Fetches `GET /repos/{owner}/{repo}/tarball/{sha}` with `redirect: 'manual'`, strictly validates any redirect destination (`https://codeload.github.com` only, no custom ports, credentials, relative URLs, or chained redirects), strips `Authorization` before fetching codeload, and never logs signed URLs.
+  - Enforces a hard **100 MiB (`104857600` bytes)** compressed archive bound both pre-stream (`Content-Length`) and live while pumping chunks with backpressure (`drain`), aborting upstream & destroying the response mid-stream if exceeded, cancelled, lease-invalidated, disconnected, or timed out (never returning extracted code, tokens, or signed URLs).
 - **Deployment & Security Model Notes**:
   - **Networking**: Default `127.0.0.1` restricts the internal listener to co-located loopback traffic; when deploying `security-worker` in separate containers or pods, bind `INTERNAL_API_HOST` explicitly to a private VPC/pod IP (never `0.0.0.0`) enforced by ingress firewall / Kubernetes `NetworkPolicy`.
   - **Residual Risk & Upgrade Path**: Shared symmetric HMAC (`INTERNAL_WORKER_AUTH_SECRET`) prevents unauthorized unauthenticated callers from reaching internal handlers, but host compromise on the worker exposes the signing key; production deployments should layer **mTLS / workload identity** on top of or in place of static shared secrets, narrow worker MongoDB privileges away from broader collections, and isolate untrusted scanner execution in dedicated restricted sandboxes without DB/Redis/GitHub secrets.

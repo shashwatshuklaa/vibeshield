@@ -33,11 +33,19 @@ export interface InternalApiRuntimeConfig {
   workerAuthSecret: string;
   timestampToleranceMs: number;
   nonceTtlMs: number;
+  maxArchiveBytes: number;
+  githubRequestTimeoutMs: number;
+  codeloadTimeoutMs: number;
+  totalAcquisitionTimeoutMs: number;
 }
 
 export const DEFAULT_INTERNAL_API_HOST = '127.0.0.1';
 export const DEFAULT_INTERNAL_API_PORT = 4001;
 export const DEFAULT_INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS = 30_000;
+export const HARD_MAX_INTERNAL_ARCHIVE_BYTES = 100 * 1024 * 1024;
+export const DEFAULT_INTERNAL_GITHUB_REQUEST_TIMEOUT_MS = 10_000;
+export const DEFAULT_INTERNAL_CODELOAD_TIMEOUT_MS = 60_000;
+export const DEFAULT_INTERNAL_ACQUISITION_TOTAL_TIMEOUT_MS = 120_000;
 
 /**
  * Validates that an internal API bind host is strictly restricted to loopback (`127.0.0.0/8`, `localhost`,
@@ -488,6 +496,61 @@ const baseApiEnvSchema = baseEnvSchema.extend({
       message: 'INTERNAL_AUTH_TIMESTAMP_TOLERANCE_MS must be between 1000 and 300000 milliseconds',
     })
     .optional(),
+
+  /**
+   * Maximum compressed repository archive size in bytes (1 MiB to hard cap 100 MiB / 104857600).
+   */
+  INTERNAL_ARCHIVE_MAX_BYTES: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'INTERNAL_ARCHIVE_MAX_BYTES must be a positive integer byte limit')
+    .transform(Number)
+    .refine((bytes) => bytes >= 1_048_576 && bytes <= HARD_MAX_INTERNAL_ARCHIVE_BYTES, {
+      message: `INTERNAL_ARCHIVE_MAX_BYTES must be between 1048576 and ${HARD_MAX_INTERNAL_ARCHIVE_BYTES} bytes`,
+    })
+    .optional(),
+
+  /**
+   * Bounded timeout in milliseconds for GitHub REST metadata and tarball redirect calls (default 10000).
+   */
+  INTERNAL_GITHUB_REQUEST_TIMEOUT_MS: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'INTERNAL_GITHUB_REQUEST_TIMEOUT_MS must be an integer timeout in milliseconds')
+    .transform(Number)
+    .refine((ms) => ms >= 1_000 && ms <= 60_000, {
+      message: 'INTERNAL_GITHUB_REQUEST_TIMEOUT_MS must be between 1000 and 60000 milliseconds',
+    })
+    .optional(),
+
+  /**
+   * Bounded timeout in milliseconds for codeload archive response/transfer (default 60000).
+   */
+  INTERNAL_CODELOAD_TIMEOUT_MS: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, 'INTERNAL_CODELOAD_TIMEOUT_MS must be an integer timeout in milliseconds')
+    .transform(Number)
+    .refine((ms) => ms >= 1_000 && ms <= 180_000, {
+      message: 'INTERNAL_CODELOAD_TIMEOUT_MS must be between 1000 and 180000 milliseconds',
+    })
+    .optional(),
+
+  /**
+   * Bounded end-to-end acquisition proxy transfer timeout in milliseconds (default 120000).
+   */
+  INTERNAL_ACQUISITION_TOTAL_TIMEOUT_MS: z
+    .string()
+    .trim()
+    .regex(
+      /^\d+$/,
+      'INTERNAL_ACQUISITION_TOTAL_TIMEOUT_MS must be an integer timeout in milliseconds'
+    )
+    .transform(Number)
+    .refine((ms) => ms >= 5_000 && ms <= 300_000, {
+      message: 'INTERNAL_ACQUISITION_TOTAL_TIMEOUT_MS must be between 5000 and 300000 milliseconds',
+    })
+    .optional(),
 });
 
 export const apiEnvSchema = baseApiEnvSchema.superRefine((env, ctx) => {
@@ -693,6 +756,12 @@ export function toInternalApiConfig(env: ApiEnv): InternalApiRuntimeConfig | nul
     workerAuthSecret: env.INTERNAL_WORKER_AUTH_SECRET,
     timestampToleranceMs,
     nonceTtlMs: timestampToleranceMs * 2 + 5_000,
+    maxArchiveBytes: env.INTERNAL_ARCHIVE_MAX_BYTES ?? HARD_MAX_INTERNAL_ARCHIVE_BYTES,
+    githubRequestTimeoutMs:
+      env.INTERNAL_GITHUB_REQUEST_TIMEOUT_MS ?? DEFAULT_INTERNAL_GITHUB_REQUEST_TIMEOUT_MS,
+    codeloadTimeoutMs: env.INTERNAL_CODELOAD_TIMEOUT_MS ?? DEFAULT_INTERNAL_CODELOAD_TIMEOUT_MS,
+    totalAcquisitionTimeoutMs:
+      env.INTERNAL_ACQUISITION_TOTAL_TIMEOUT_MS ?? DEFAULT_INTERNAL_ACQUISITION_TOTAL_TIMEOUT_MS,
   };
 }
 

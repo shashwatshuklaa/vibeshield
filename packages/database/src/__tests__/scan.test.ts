@@ -15,6 +15,7 @@ import {
   renewScanWorkerLease,
   ScanLifecycleError,
   ScanModel,
+  setScanResolvedCommitWithLease,
   toPublicScanRecord,
   transitionScanToInProgress,
   verifyScanAcquisitionAuthorization,
@@ -340,6 +341,22 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
       ).rejects.toMatchObject({ code: 'INVALID_WORKER_ID' });
 
       expect(findByIdSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid commit SHAs in setScanResolvedCommitWithLease before mutating ScanModel', async () => {
+      const updateSpy = vi.spyOn(ScanModel, 'findOneAndUpdate');
+
+      await expect(
+        setScanResolvedCommitWithLease({
+          scanId: new mongoose.Types.ObjectId().toString(),
+          organizationId: new mongoose.Types.ObjectId().toString(),
+          projectId: new mongoose.Types.ObjectId().toString(),
+          leaseToken: 'valid_lease_token_123456',
+          resolvedCommitSha: 'not-a-sha',
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_COMMIT_SHA' });
+
+      expect(updateSpy).not.toHaveBeenCalled();
     });
   });
 });

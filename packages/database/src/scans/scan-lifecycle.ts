@@ -32,6 +32,7 @@ export const DEFAULT_SCAN_LEASE_DURATION_MS = 60_000;
 const MIN_LEASE_DURATION_MS = 1_000;
 const MAX_LEASE_DURATION_MS = 3_600_000;
 const FULL_COMMIT_SHA_REGEX = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
+const SAFE_GITHUB_REPO_SEGMENT_REGEX = /^[A-Za-z0-9._-]+$/;
 
 const ALLOWED_SCAN_TRANSITIONS: Readonly<
   Record<ScanLifecycleStatus, ReadonlySet<ScanLifecycleStatus>>
@@ -747,6 +748,69 @@ export async function renewScanWorkerLease(input: {
 }
 
 /**
+ * Atomically records the resolved immutable full commit SHA on an active leased `ACQUIRING` scan
+ * before downloading repository contents, respecting cancellation and lease fencing.
+ */
+export async function setScanResolvedCommitWithLease(input: {
+  scanId: string;
+  organizationId: string;
+  projectId: string;
+  leaseToken: string;
+  resolvedCommitSha: string;
+  now?: Date;
+}): Promise<FencedScanMutationResult> {
+  assertValidIds(input.organizationId, input.projectId, input.scanId);
+  const leaseToken = assertValidLeaseToken(input.leaseToken);
+  const normalizedSha = input.resolvedCommitSha.trim().toLowerCase();
+  if (!FULL_COMMIT_SHA_REGEX.test(normalizedSha)) {
+    throw new ScanLifecycleError(
+      'Resolved commit SHA must be a full 40- or 64-character hex Git SHA',
+      'INVALID_COMMIT_SHA'
+    );
+  }
+
+  const now = input.now ?? new Date();
+  const updated = await ScanModel.findOneAndUpdate(
+    {
+      _id: input.scanId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      status: ScanLifecycleStatusValue.ACQUIRING,
+      isActive: true,
+      'cancellation.requestedAt': null,
+      'lease.token': leaseToken,
+      'lease.expiresAt': { $gt: now },
+    },
+    {
+      $set: {
+        resolvedCommitSha: normalizedSha,
+        'lease.heartbeatAt': now,
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+    }
+  );
+
+  if (updated) {
+    return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
+  }
+
+  const rawExisting = await findRawScanForFencingCheck({
+    scanId: input.scanId,
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+  });
+  return classifyFencedUpdateMiss({
+    doc: rawExisting,
+    expectedStatuses: [ScanLifecycleStatusValue.ACQUIRING],
+    leaseToken,
+    now,
+  });
+}
+
+/**
  * Atomically records repository acquisition metrics and moves a scan from `ACQUIRING` to
  * `IN_PROGRESS` strictly under valid fencing token, unexpired lease, and no pending cancellation.
  */
@@ -1333,6 +1397,8 @@ export async function verifyScanAcquisitionAuthorization(
       installationRecordId: 1,
       githubInstallationId: 1,
       githubRepositoryId: 1,
+      ownerLogin: 1,
+      repoName: 1,
       repositoryAccessState: 1,
       installationAvailability: 1,
       isActive: 1,
@@ -1366,7 +1432,18 @@ export async function verifyScanAcquisitionAuthorization(
     };
   }
 
+  const ownerLogin = typeof connection.ownerLogin === 'string' ? connection.ownerLogin.trim() : '';
+  const repoName = typeof connection.repoName === 'string' ? connection.repoName.trim() : '';
+  const isSafeRepoBinding =
+    SAFE_GITHUB_REPO_SEGMENT_REGEX.test(ownerLogin) &&
+    SAFE_GITHUB_REPO_SEGMENT_REGEX.test(repoName) &&
+    ownerLogin !== '.' &&
+    ownerLogin !== '..' &&
+    repoName !== '.' &&
+    repoName !== '..';
+
   if (
+    !isSafeRepoBinding ||
     connection.githubRepositoryId !== scan.githubRepositoryId ||
     connection.githubInstallationId !== scan.githubInstallationId
   ) {
@@ -1436,6 +1513,8 @@ export async function verifyScanAcquisitionAuthorization(
       repositoryConnectionId: scan.repositoryConnectionId.toString(),
       githubInstallationId: installation.githubInstallationId,
       githubRepositoryId: connection.githubRepositoryId,
+      repositoryOwner: ownerLogin,
+      repositoryName: repoName,
       requestedRef: scan.requestedRef,
       requestedCommitHash: scan.requestedCommitHash ?? null,
       attemptCount: scan.attemptCount,

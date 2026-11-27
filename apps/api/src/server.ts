@@ -20,6 +20,8 @@ import {
   toQueueConfig,
 } from './config/env.js';
 import { createInternalApp, type CreateInternalAppOptions } from './internal-app.js';
+import { createGitHubClient, type GitHubClient } from './modules/github/github.client.js';
+import type { InternalScanAcquisitionService } from './modules/scans/internal-acquisition.service.js';
 import type { InternalWorkerAuthMiddlewareOptions } from './modules/scans/internal-auth.js';
 
 export interface ServerLogger {
@@ -38,6 +40,8 @@ export interface ServerDependencies {
   createAppFn?: (options?: CreateAppOptions) => Express;
   createInternalAppFn?: (options: CreateInternalAppOptions) => Express;
   consumeInternalAuthNonce?: InternalWorkerAuthMiddlewareOptions['consumeNonce'];
+  githubClient?: GitHubClient | null;
+  internalAcquisitionService?: InternalScanAcquisitionService;
   verifyScanAuthorization?: CreateInternalAppOptions['verifyAuthorization'];
   logger?: ServerLogger;
   shutdownTimeoutMs?: number;
@@ -95,6 +99,8 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
     createAppFn = createApp,
     createInternalAppFn = createInternalApp,
     consumeInternalAuthNonce: consumeInternalAuthNonceOverride,
+    githubClient: githubClientOverride,
+    internalAcquisitionService,
     verifyScanAuthorization,
     logger = DEFAULT_LOGGER,
     shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -233,6 +239,16 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
           nonceInput
         ));
 
+    const resolvedGitHubClient =
+      githubClientOverride !== undefined
+        ? githubClientOverride
+        : githubConfig
+          ? createGitHubClient({
+              config: githubConfig,
+              timeoutMs: internalConfig.githubRequestTimeoutMs,
+            })
+          : null;
+
     const internalApp = createInternalAppFn({
       auth: {
         workerAuthSecret: internalConfig.workerAuthSecret,
@@ -240,6 +256,12 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
         nonceTtlMs: internalConfig.nonceTtlMs,
         consumeNonce,
       },
+      githubClient: resolvedGitHubClient,
+      maxArchiveBytes: internalConfig.maxArchiveBytes,
+      githubRequestTimeoutMs: internalConfig.githubRequestTimeoutMs,
+      codeloadTimeoutMs: internalConfig.codeloadTimeoutMs,
+      totalAcquisitionTimeoutMs: internalConfig.totalAcquisitionTimeoutMs,
+      ...(internalAcquisitionService ? { acquisitionService: internalAcquisitionService } : {}),
       ...(verifyScanAuthorization ? { verifyAuthorization: verifyScanAuthorization } : {}),
     });
 

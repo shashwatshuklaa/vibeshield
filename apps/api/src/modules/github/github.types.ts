@@ -140,6 +140,30 @@ export interface RevokeInstallationTokenResult {
   alreadyInvalidOrExpired: boolean;
 }
 
+export interface ResolveGitHubCommitInput {
+  installationToken: string;
+  owner: string;
+  repo: string;
+  ref: string;
+  signal?: AbortSignal;
+}
+
+export interface OpenRepositoryTarballStreamInput {
+  installationToken: string;
+  owner: string;
+  repo: string;
+  commitSha: string;
+  maxArchiveBytes: number;
+  timeoutMs?: number;
+  codeloadTimeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface GitHubTarballStreamHandle {
+  body: ReadableStream<Uint8Array>;
+  declaredContentLength: number | null;
+}
+
 /**
  * Operational error thrown by GitHub integration operations.
  */

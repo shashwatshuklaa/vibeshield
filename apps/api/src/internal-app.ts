@@ -2,19 +2,25 @@ import express, { type Express } from 'express';
 import helmet from 'helmet';
 import { errorHandler } from './middlewares/error-handler.js';
 import { notFoundHandler } from './middlewares/not-found.js';
+import type {
+  CreateInternalScanAcquisitionServiceOptions,
+  InternalScanAcquisitionService,
+} from './modules/scans/internal-acquisition.service.js';
 import type { InternalWorkerAuthMiddlewareOptions } from './modules/scans/internal-auth.js';
 import { createInternalScanRouter } from './modules/scans/internal-scan.routes.js';
-import type {
-  VerifyScanAcquisitionAuthorizationInput,
-  VerifyScanAcquisitionAuthorizationResult,
-} from '@vibeshield/database';
 
 export interface CreateInternalAppOptions {
   auth: InternalWorkerAuthMiddlewareOptions;
   bodyLimit?: string;
-  verifyAuthorization?: (
-    input: VerifyScanAcquisitionAuthorizationInput
-  ) => Promise<VerifyScanAcquisitionAuthorizationResult>;
+  acquisitionService?: InternalScanAcquisitionService;
+  githubClient?: CreateInternalScanAcquisitionServiceOptions['githubClient'];
+  verifyAuthorization?: CreateInternalScanAcquisitionServiceOptions['verifyAuthorization'];
+  setResolvedCommitWithLease?: CreateInternalScanAcquisitionServiceOptions['setResolvedCommitWithLease'];
+  maxArchiveBytes?: number;
+  githubRequestTimeoutMs?: number;
+  codeloadTimeoutMs?: number;
+  totalAcquisitionTimeoutMs?: number;
+  revalidationIntervalMs?: number;
 }
 
 /**
@@ -28,7 +34,7 @@ export interface CreateInternalAppOptions {
  *   protection execute prior to any JSON deserialization or schema validation.
  */
 export function createInternalApp(options: CreateInternalAppOptions): Express {
-  const { auth, bodyLimit = '16kb', verifyAuthorization } = options;
+  const { auth, bodyLimit = '16kb', ...scanRouterOptions } = options;
 
   const app = express();
   app.disable('x-powered-by');
@@ -45,7 +51,7 @@ export function createInternalApp(options: CreateInternalAppOptions): Express {
     '/internal/v1/scans',
     createInternalScanRouter({
       auth,
-      verifyAuthorization,
+      ...scanRouterOptions,
     })
   );
 

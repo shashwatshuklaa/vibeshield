@@ -148,6 +148,8 @@ export interface AuthorizedScanAcquisitionContext {
   repositoryConnectionId: string;
   githubInstallationId: number;
   githubRepositoryId: number;
+  repositoryOwner: string;
+  repositoryName: string;
   requestedRef: string;
   requestedCommitHash: string | null;
   attemptCount: number;

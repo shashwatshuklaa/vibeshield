@@ -26,6 +26,7 @@ import {
   RepositoryAccessStateValue,
   requestScanCancellation,
   ScanModel,
+  setScanResolvedCommitWithLease,
   transitionScanToInProgress,
   verifyScanAcquisitionAuthorization,
 } from '../index.js';
@@ -1189,12 +1190,39 @@ describe.skipIf(!REPLICA_URI)(
         repositoryConnectionId: connectionDoc._id.toString(),
         githubInstallationId: 5001,
         githubRepositoryId: 8001,
+        repositoryOwner: 'acme-sec',
+        repositoryName: 'web-app',
         requestedRef: 'main',
         attemptCount: 1,
         maxAttempts: 3,
         workerId: 'security-worker',
       });
       expect(JSON.stringify(ok.context)).not.toContain(claimed.leaseToken);
+
+      // Fenced resolvedCommitSha persistence works only under active unexpired lease & no cancellation
+      const resolvedSha = 'f'.repeat(40);
+      const commitPersistOk = await setScanResolvedCommitWithLease({
+        scanId: queued.id,
+        organizationId: orgA,
+        projectId: projectDoc._id.toString(),
+        leaseToken: claimed.leaseToken,
+        resolvedCommitSha: resolvedSha,
+        now: new Date(t0.getTime() + 1_500),
+      });
+      expect(commitPersistOk.status).toBe('UPDATED');
+      expect(commitPersistOk.scan?.resolvedCommitSha).toBe(resolvedSha);
+      expect(commitPersistOk.scan?.status).toBe(ScanLifecycleStatusValue.ACQUIRING);
+
+      await expect(
+        setScanResolvedCommitWithLease({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectDoc._id.toString(),
+          leaseToken: 'stale_wrong_fencing_token_1234',
+          resolvedCommitSha: 'a'.repeat(40),
+          now: new Date(t0.getTime() + 1_500),
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
 
       // 2. Missing scan -> SCAN_NOT_FOUND
       await expect(
@@ -1257,6 +1285,24 @@ describe.skipIf(!REPLICA_URI)(
         })
       ).resolves.toMatchObject({ status: 'DENIED', reason: 'CONNECTION_METADATA_MISMATCH' });
       await ScanModel.updateOne({ _id: queued.id }, { $set: { githubRepositoryId: 8001 } });
+
+      // Unsafe repository owner/name path segments are rejected
+      await ProjectRepositoryConnectionModel.updateOne(
+        { _id: connectionDoc._id },
+        { $set: { ownerLogin: '../evil' } }
+      );
+      await expect(
+        verifyScanAcquisitionAuthorization({
+          scanId: queued.id,
+          leaseToken: claimed.leaseToken,
+          workerId: 'security-worker',
+          now: t0,
+        })
+      ).resolves.toMatchObject({ status: 'DENIED', reason: 'CONNECTION_METADATA_MISMATCH' });
+      await ProjectRepositoryConnectionModel.updateOne(
+        { _id: connectionDoc._id },
+        { $set: { ownerLogin: 'acme-sec' } }
+      );
 
       // 7. Disconnected/revoked connection -> CONNECTION_INACTIVE
       await ProjectRepositoryConnectionModel.updateOne(
