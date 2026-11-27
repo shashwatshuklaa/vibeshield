@@ -260,10 +260,62 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
           failureCode: ScanFailureCodeValue.ACQUISITION_FAILED,
           failureMessage: 'Failed',
         })
-      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+      ).resolves.toMatchObject({ status: 'CANCEL_REQUESTED' });
 
       await expect(
         cancelScanWithLease({ scanId, organizationId: orgId, projectId: projId, leaseToken })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      // Active IN_PROGRESS scan with matching valid lease + pending cancellation returns CANCEL_REQUESTED
+      const now = new Date();
+      const inProgressWithCancel = new ScanModel(
+        makeValidScanInput({
+          _id: scanId,
+          organizationId: orgId,
+          projectId: projId,
+          status: ScanLifecycleStatusValue.IN_PROGRESS,
+          isActive: true,
+          lease: {
+            workerId: 'worker-1',
+            token: leaseToken,
+            acquiredAt: now,
+            heartbeatAt: now,
+            expiresAt: new Date(now.getTime() + 60_000),
+          },
+          cancellation: {
+            requestedAt: now,
+            requestedByUserId: null,
+            reason: 'User requested cancel',
+          },
+        })
+      );
+      vi.spyOn(ScanModel, 'findOne').mockResolvedValue(inProgressWithCancel as never);
+
+      await expect(
+        completeScanWithLease({ scanId, organizationId: orgId, projectId: projId, leaseToken, now })
+      ).resolves.toMatchObject({ status: 'CANCEL_REQUESTED' });
+
+      await expect(
+        failScanWithLease({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken,
+          failureCode: ScanFailureCodeValue.SCANNER_EXECUTION_FAILED,
+          failureMessage: 'Tool error',
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'CANCEL_REQUESTED' });
+
+      // Stale token on same scan returns STALE_OR_CONFLICT instead of CANCEL_REQUESTED
+      await expect(
+        completeScanWithLease({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken: 'wrong_stale_fencing_token_123456',
+          now,
+        })
       ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
     });
   });

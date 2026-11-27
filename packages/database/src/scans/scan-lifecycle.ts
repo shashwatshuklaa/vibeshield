@@ -265,6 +265,63 @@ export async function createQueuedScan(
 }
 
 /**
+ * Reloads a tenant-scoped scan document (optionally including internal `lease.token` when running
+ * against a real Mongoose query) without breaking mocked unit-test queries.
+ */
+async function findRawScanForFencingCheck(input: {
+  scanId: string;
+  organizationId: string;
+  projectId: string;
+}): Promise<(ScanAttributes & { _id: { toString(): string } }) | null> {
+  const query = ScanModel.findOne({
+    _id: input.scanId,
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+  });
+
+  if (query && typeof (query as { select?: unknown }).select === 'function') {
+    return (await (
+      query as unknown as {
+        select(fields: string): Promise<(ScanAttributes & { _id: { toString(): string } }) | null>;
+      }
+    ).select('+lease.token')) as (ScanAttributes & { _id: { toString(): string } }) | null;
+  }
+
+  return (await query) as (ScanAttributes & { _id: { toString(): string } }) | null;
+}
+
+function classifyFencedUpdateMiss(input: {
+  doc: (ScanAttributes & { _id: { toString(): string } }) | null;
+  expectedStatuses: readonly ScanLifecycleStatus[];
+  leaseToken: string;
+  now: Date;
+}): FencedScanMutationResult {
+  const { doc, expectedStatuses, leaseToken, now } = input;
+  if (!doc) {
+    return { status: 'STALE_OR_CONFLICT', scan: null };
+  }
+
+  const publicRecord = toPublicScanRecord(doc);
+  if (!doc.isActive || !expectedStatuses.includes(doc.status)) {
+    return { status: 'STALE_OR_CONFLICT', scan: publicRecord };
+  }
+
+  // Reject stale or expired leases cleanly before considering pending cancellation signals.
+  if (doc.lease?.token !== undefined && doc.lease.token !== leaseToken) {
+    return { status: 'STALE_OR_CONFLICT', scan: publicRecord };
+  }
+  if (doc.lease && doc.lease.expiresAt.getTime() <= now.getTime()) {
+    return { status: 'STALE_OR_CONFLICT', scan: publicRecord };
+  }
+
+  if (doc.cancellation?.requestedAt !== null) {
+    return { status: 'CANCEL_REQUESTED', scan: publicRecord };
+  }
+
+  return { status: 'STALE_OR_CONFLICT', scan: publicRecord };
+}
+
+/**
  * Retrieves a single scan strictly scoped to `(organizationId, projectId)`.
  */
 export async function findScanByIdInOrganization(input: {
@@ -500,6 +557,9 @@ export async function reclaimExpiredScanLease(input: {
         status: ScanLifecycleStatusValue.ACQUIRING,
         isActive: true,
         acquiringAt: now,
+        resolvedCommitSha: null,
+        acquisition: null,
+        inProgressAt: null,
         lease: {
           workerId,
           token: leaseToken,
@@ -526,7 +586,7 @@ export async function reclaimExpiredScanLease(input: {
     };
   }
 
-  // Fail permanently if an expired active lease exhausted its bounded attempt budget.
+  // Fail permanently only if an expired active lease exhausted attempts AND has no pending cancellation.
   const exhausted = await ScanModel.findOneAndUpdate(
     {
       _id: input.scanId,
@@ -536,6 +596,7 @@ export async function reclaimExpiredScanLease(input: {
         $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
       },
       isActive: true,
+      'cancellation.requestedAt': null,
       'lease.expiresAt': { $lte: now },
       $expr: { $gte: ['$attemptCount', '$maxAttempts'] },
     },
@@ -562,11 +623,51 @@ export async function reclaimExpiredScanLease(input: {
     };
   }
 
+  // Handle narrow race where cancellation arrived between initial check and exhausted update.
+  const cancelledAfterRace = await ScanModel.findOneAndUpdate(
+    {
+      _id: input.scanId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      status: {
+        $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+      },
+      isActive: true,
+      'cancellation.requestedAt': { $ne: null },
+      'lease.expiresAt': { $lte: now },
+    },
+    {
+      $set: {
+        status: ScanLifecycleStatusValue.CANCELLED,
+        isActive: false,
+        cancelledAt: now,
+        lease: null,
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+    }
+  );
+
+  if (cancelledAfterRace) {
+    return {
+      status: 'CANCELLED',
+      scan: toPublicScanRecord(cancelledAfterRace),
+    };
+  }
+
   const existing = await findScanByIdInOrganization({
     scanId: input.scanId,
     organizationId: input.organizationId,
     projectId: input.projectId,
   });
+  if (existing && existing.status === ScanLifecycleStatusValue.CANCELLED) {
+    return {
+      status: 'CANCELLED',
+      scan: existing,
+    };
+  }
   return {
     status: 'NOT_RECLAIMABLE',
     scan: existing,
@@ -662,6 +763,7 @@ export async function transitionScanToInProgress(input: {
   const completedAt = input.acquisition.acquisitionCompletedAt ?? now;
   const setFields: Record<string, unknown> = {
     status: ScanLifecycleStatusValue.IN_PROGRESS,
+    isActive: true,
     resolvedCommitSha: normalizedSha,
     inProgressAt: now,
     'lease.heartbeatAt': now,
@@ -701,24 +803,22 @@ export async function transitionScanToInProgress(input: {
     return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
   }
 
-  const existing = await findScanByIdInOrganization({
+  const rawExisting = await findRawScanForFencingCheck({
     scanId: input.scanId,
     organizationId: input.organizationId,
     projectId: input.projectId,
   });
-  if (
-    existing &&
-    existing.status === ScanLifecycleStatusValue.ACQUIRING &&
-    existing.cancellation.requestedAt !== null
-  ) {
-    return { status: 'CANCEL_REQUESTED', scan: existing };
-  }
-
-  return { status: 'STALE_OR_CONFLICT', scan: existing };
+  return classifyFencedUpdateMiss({
+    doc: rawExisting,
+    expectedStatuses: [ScanLifecycleStatusValue.ACQUIRING],
+    leaseToken,
+    now,
+  });
 }
 
 /**
  * Atomically transitions an active leased `IN_PROGRESS` scan to `COMPLETED`, clearing the worker lease.
+ * Refuses completion if cancellation has been requested (`CANCEL_REQUESTED`) or the lease is invalid/stale.
  */
 export async function completeScanWithLease(input: {
   scanId: string;
@@ -738,6 +838,7 @@ export async function completeScanWithLease(input: {
       projectId: input.projectId,
       status: ScanLifecycleStatusValue.IN_PROGRESS,
       isActive: true,
+      'cancellation.requestedAt': null,
       'lease.token': leaseToken,
       'lease.expiresAt': { $gt: now },
     },
@@ -759,17 +860,23 @@ export async function completeScanWithLease(input: {
     return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
   }
 
-  const existing = await findScanByIdInOrganization({
+  const rawExisting = await findRawScanForFencingCheck({
     scanId: input.scanId,
     organizationId: input.organizationId,
     projectId: input.projectId,
   });
-  return { status: 'STALE_OR_CONFLICT', scan: existing };
+  return classifyFencedUpdateMiss({
+    doc: rawExisting,
+    expectedStatuses: [ScanLifecycleStatusValue.IN_PROGRESS],
+    leaseToken,
+    now,
+  });
 }
 
 /**
  * Atomically transitions an active leased scan (`ACQUIRING` or `IN_PROGRESS`) to `FAILED` with
- * redacted failure details while rejecting stale workers whose lease token no longer matches.
+ * redacted failure details while respecting pending cancellations (`CANCEL_REQUESTED`) and
+ * rejecting stale workers whose lease token no longer matches.
  */
 export async function failScanWithLease(input: {
   scanId: string;
@@ -794,6 +901,7 @@ export async function failScanWithLease(input: {
         $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
       },
       isActive: true,
+      'cancellation.requestedAt': null,
       'lease.token': leaseToken,
       'lease.expiresAt': { $gt: now },
     },
@@ -817,12 +925,17 @@ export async function failScanWithLease(input: {
     return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
   }
 
-  const existing = await findScanByIdInOrganization({
+  const rawExisting = await findRawScanForFencingCheck({
     scanId: input.scanId,
     organizationId: input.organizationId,
     projectId: input.projectId,
   });
-  return { status: 'STALE_OR_CONFLICT', scan: existing };
+  return classifyFencedUpdateMiss({
+    doc: rawExisting,
+    expectedStatuses: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+    leaseToken,
+    now,
+  });
 }
 
 /**
@@ -989,15 +1102,15 @@ export async function requestScanCancellation(input: {
     );
 
     if (!marked) {
-      const reloaded = await findScanByIdInOrganization({
-        scanId: input.scanId,
+      const reloaded = await ScanModel.findOne({
+        _id: input.scanId,
         organizationId: input.organizationId,
         projectId: input.projectId,
-      });
+      }).session(session);
       if (!reloaded) {
         return { status: 'NOT_FOUND' };
       }
-      return { status: 'ALREADY_TERMINAL', scan: reloaded };
+      return { status: 'ALREADY_TERMINAL', scan: toPublicScanRecord(reloaded) };
     }
 
     return {
