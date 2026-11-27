@@ -174,9 +174,10 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
   options: SecurityWorkerRuntimeOptions<TResult>
 ): SecurityWorkerRuntime {
   const { config } = options;
-  const secretValues = [extractRedisUrlPassword(config.redisUrl)].filter(
-    (secret): secret is string => Boolean(secret)
-  );
+  const secretValues = [
+    extractRedisUrlPassword(config.redisUrl),
+    config.internalWorkerAuthSecret,
+  ].filter((secret): secret is string => Boolean(secret));
   const logger = options.logger ?? createWorkerLogger(config.logLevel, secretValues);
   const workerFactory = options.workerFactory ?? createScanJobsWorker;
   const databaseManager: WorkerDatabaseManagerLike =

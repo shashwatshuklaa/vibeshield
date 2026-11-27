@@ -30,9 +30,10 @@ export async function startSecurityWorkerHost<TResult = unknown>(
   options: StartWorkerHostOptions<TResult> = {}
 ): Promise<RunningWorkerHost> {
   const config = options.config ?? loadWorkerConfig(options.rawEnv);
-  const secretValues = [extractRedisUrlPassword(config.redisUrl)].filter(
-    (secret): secret is string => Boolean(secret)
-  );
+  const secretValues = [
+    extractRedisUrlPassword(config.redisUrl),
+    config.internalWorkerAuthSecret,
+  ].filter((secret): secret is string => Boolean(secret));
   const logger = options.logger ?? createWorkerLogger(config.logLevel, secretValues);
 
   const runtime = createSecurityWorkerRuntime({

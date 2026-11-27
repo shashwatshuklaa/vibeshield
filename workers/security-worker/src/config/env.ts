@@ -8,6 +8,67 @@ import {
   QUEUE_KEY_PREFIX,
 } from '@vibeshield/queue';
 
+const MIN_INTERNAL_AUTH_SECRET_LENGTH = 32;
+
+/**
+ * Validates that a configured internal API base URL is a clean HTTP/HTTPS origin without
+ * embedded credentials, query strings, fragments, whitespace, wildcards, or custom path prefixes.
+ */
+export function isValidInternalApiBaseUrl(rawUrl: string): boolean {
+  if (
+    typeof rawUrl !== 'string' ||
+    rawUrl.length === 0 ||
+    /\s/.test(rawUrl) ||
+    rawUrl.includes('*')
+  ) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+    if (parsed.username || parsed.password) {
+      return false;
+    }
+    if (parsed.search || rawUrl.includes('?') || parsed.hash || rawUrl.includes('#')) {
+      return false;
+    }
+    if (!parsed.hostname) {
+      return false;
+    }
+    if (parsed.pathname !== '/' && parsed.pathname !== '') {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Normalizes a validated internal API base URL to its canonical `scheme://host[:port]` origin.
+ */
+export function normalizeInternalApiBaseUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!isValidInternalApiBaseUrl(trimmed)) {
+    throw new Error('Invalid INTERNAL_API_BASE_URL configuration.');
+  }
+  return new URL(trimmed).origin;
+}
+
+/**
+ * Validates that an internal HMAC secret meets minimum security length requirements.
+ */
+export function isValidInternalWorkerAuthSecret(secret: string): boolean {
+  return (
+    typeof secret === 'string' &&
+    secret.length >= MIN_INTERNAL_AUTH_SECRET_LENGTH &&
+    secret.trim().length >= MIN_INTERNAL_AUTH_SECRET_LENGTH
+  );
+}
+
 const workerEnvSchema = baseEnvSchema
   .pick({
     NODE_ENV: true,
@@ -87,6 +148,72 @@ const workerEnvSchema = baseEnvSchema
         message:
           'QUEUE_PREFIX must be lowercase alphanumeric/dot/hyphen/underscore and must not contain colons.',
       }),
+    INTERNAL_API_BASE_URL: z
+      .string()
+      .trim()
+      .refine(isValidInternalApiBaseUrl, {
+        message:
+          'INTERNAL_API_BASE_URL must be an HTTP/HTTPS origin without credentials, query strings, fragments, or path prefixes.',
+      })
+      .transform((value) => new URL(value).origin)
+      .optional(),
+    INTERNAL_WORKER_AUTH_SECRET: z
+      .string()
+      .min(
+        MIN_INTERNAL_AUTH_SECRET_LENGTH,
+        `INTERNAL_WORKER_AUTH_SECRET must be at least ${MIN_INTERNAL_AUTH_SECRET_LENGTH} characters.`
+      )
+      .refine((secret) => secret.trim().length >= MIN_INTERNAL_AUTH_SECRET_LENGTH, {
+        message: `INTERNAL_WORKER_AUTH_SECRET must contain at least ${MIN_INTERNAL_AUTH_SECRET_LENGTH} non-whitespace characters.`,
+      })
+      .optional(),
+    // Optional sibling env vars accepted strictly for cross-secret collision checks and never retained on WorkerConfig.
+    JWT_ACCESS_SECRET: z.string().optional(),
+    GITHUB_CLIENT_SECRET: z.string().optional(),
+    GITHUB_WEBHOOK_SECRET: z.string().optional(),
+    GITHUB_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+    GITHUB_APP_PRIVATE_KEY: z.string().optional(),
+  })
+  .superRefine((env, ctx) => {
+    const hasBaseUrl = env.INTERNAL_API_BASE_URL !== undefined;
+    const hasAuthSecret = env.INTERNAL_WORKER_AUTH_SECRET !== undefined;
+
+    if (hasBaseUrl && !hasAuthSecret) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['INTERNAL_WORKER_AUTH_SECRET'],
+        message:
+          'INTERNAL_WORKER_AUTH_SECRET is required when INTERNAL_API_BASE_URL is configured.',
+      });
+    }
+
+    if (hasAuthSecret && !hasBaseUrl) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['INTERNAL_API_BASE_URL'],
+        message:
+          'INTERNAL_API_BASE_URL is required when INTERNAL_WORKER_AUTH_SECRET is configured.',
+      });
+    }
+
+    if (env.INTERNAL_WORKER_AUTH_SECRET !== undefined) {
+      const forbiddenMatches = [
+        env.JWT_ACCESS_SECRET,
+        env.GITHUB_CLIENT_SECRET,
+        env.GITHUB_WEBHOOK_SECRET,
+        env.GITHUB_WEBHOOK_SECRET_PREVIOUS,
+        env.GITHUB_APP_PRIVATE_KEY,
+      ].filter((secret): secret is string => typeof secret === 'string' && secret.length > 0);
+
+      if (forbiddenMatches.includes(env.INTERNAL_WORKER_AUTH_SECRET)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['INTERNAL_WORKER_AUTH_SECRET'],
+          message:
+            'INTERNAL_WORKER_AUTH_SECRET must be distinct from JWT_ACCESS_SECRET and GitHub secrets.',
+        });
+      }
+    }
   });
 
 export type WorkerEnvInput = z.infer<typeof workerEnvSchema>;
@@ -111,18 +238,20 @@ export interface WorkerConfig {
   leaseDurationMs: number;
   shutdownGraceMs: number;
   queuePrefix: string;
+  internalApiBaseUrl?: string;
+  readonly internalWorkerAuthSecret?: string;
 }
 
 /**
  * Parses and validates environment configuration required to boot the security worker runtime.
- * Never embeds credentials in thrown validation errors.
+ * Never embeds credentials in thrown validation errors or exposes internal HMAC secrets during JSON serialization.
  */
 export function loadWorkerConfig(
   rawEnv: Record<string, string | undefined> = process.env
 ): WorkerConfig {
   const parsed = validateEnv(workerEnvSchema, rawEnv);
 
-  return {
+  const config: WorkerConfig = {
     nodeEnv: parsed.NODE_ENV,
     logLevel: parsed.LOG_LEVEL,
     mongodbUri: parsed.MONGODB_URI,
@@ -138,5 +267,19 @@ export function loadWorkerConfig(
     leaseDurationMs: parsed.WORKER_LEASE_DURATION_MS,
     shutdownGraceMs: parsed.WORKER_SHUTDOWN_GRACE_MS,
     queuePrefix: parsed.QUEUE_PREFIX,
+    ...(parsed.INTERNAL_API_BASE_URL !== undefined
+      ? { internalApiBaseUrl: parsed.INTERNAL_API_BASE_URL }
+      : {}),
   };
+
+  if (parsed.INTERNAL_WORKER_AUTH_SECRET !== undefined) {
+    Object.defineProperty(config, 'internalWorkerAuthSecret', {
+      value: parsed.INTERNAL_WORKER_AUTH_SECRET,
+      enumerable: false,
+      writable: false,
+      configurable: true,
+    });
+  }
+
+  return config;
 }

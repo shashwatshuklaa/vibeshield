@@ -21,15 +21,22 @@ const LOG_LEVEL_WEIGHT: Record<WorkerLogLevel, number> = {
   silent: 100,
 };
 
+const INTERNAL_SIGNATURE_PATTERN = /\bsha256=[a-f0-9]{64}\b/gi;
+
 /**
- * Redacts MongoDB URIs, Redis URLs, embedded credentials, GitHub tokens, and explicit runtime secrets.
+ * Redacts MongoDB URIs, Redis URLs, embedded credentials, GitHub tokens, internal HMAC signatures,
+ * and explicit runtime secrets.
  */
 export function formatSafeWorkerMessage(
   input: unknown,
   extraSecrets: readonly string[] = []
 ): string {
   const redisScrubbed = formatSafeRedisError(input, [...extraSecrets]);
-  return redactGitHubSecrets(redactMongoUri(redisScrubbed), extraSecrets);
+  const signatureScrubbed = redisScrubbed.replace(
+    INTERNAL_SIGNATURE_PATTERN,
+    'sha256=[REDACTED_SIGNATURE]'
+  );
+  return redactGitHubSecrets(redactMongoUri(signatureScrubbed), extraSecrets);
 }
 
 function sanitizeContextValue(value: unknown, extraSecrets: readonly string[]): unknown {
