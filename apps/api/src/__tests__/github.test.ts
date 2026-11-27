@@ -2,11 +2,14 @@ import { createHash, createVerify, generateKeyPairSync, randomBytes } from 'node
 import request from 'supertest';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  GitHubInstallationModel,
   GitHubInstallationStatusValue,
   MembershipStatusValue,
   normalizeEmail,
   normalizeSlug,
   OrganizationRoleValue,
+  ProjectRepositoryConnectionModel,
+  ScanModel,
   UserStatusValue,
   type GitHubInstallationStatus,
   type MembershipStatus,
@@ -797,6 +800,338 @@ describe('GitHub App Client, JWT Generation, Installation Flow & Repository Disc
       expect(flakyFetch).toHaveBeenCalledTimes(2); // Initial + 1 bounded retry
       expect(netErr).toMatchObject({ statusCode: 502, code: 'GITHUB_API_UNAVAILABLE' });
       expect((netErr as Error).message).not.toContain('ghs_secretTokenValue12345');
+    });
+
+    it('creates strictly single-repository contents:read acquisition tokens and validates scope & expiration', async () => {
+      const fixedNow = new Date('2026-11-28T00:00:00.000Z');
+      const futureIso = '2026-11-28T01:00:00.000Z';
+      const issuedToken = `ghs_scopedRepoToken_${randomBytes(8).toString('hex')}`;
+
+      // 1. Happy path with exact body { repository_ids: [4242], permissions: { contents: 'read' } }
+      // Accepts optional implicit metadata:read alongside contents:read.
+      const capturedBodies: string[] = [];
+      const fetchSuccess = vi.fn<typeof fetch>(async (url, init) => {
+        expect(String(url)).toBe('https://api.github.com/app/installations/7001/access_tokens');
+        expect(init?.method).toBe('POST');
+        expect(init?.redirect).toBe('error');
+        capturedBodies.push(String(init?.body ?? ''));
+
+        return jsonResponse(
+          {
+            token: issuedToken,
+            expires_at: futureIso,
+            repository_selection: 'selected',
+            permissions: {
+              contents: 'read',
+              metadata: 'read',
+            },
+            repositories: [{ id: 4242, name: 'target-repo' }],
+          },
+          201
+        );
+      });
+
+      const okClient = createGitHubClient({
+        config: TEST_GITHUB_CONFIG,
+        fetchImpl: fetchSuccess,
+        now: () => fixedNow,
+      });
+
+      const minted = await okClient.createRepositoryAcquisitionToken({
+        installationId: 7001,
+        githubRepositoryId: 4242,
+      });
+
+      expect(JSON.parse(capturedBodies[0]!)).toEqual({
+        repository_ids: [4242],
+        permissions: { contents: 'read' },
+      });
+      expect(minted).toEqual({
+        token: issuedToken,
+        expiresAt: new Date(futureIso),
+        installationId: 7001,
+        githubRepositoryId: 4242,
+        permissions: { contents: 'read', metadata: 'read' },
+      });
+
+      // Preserves existing broad discovery token method independently without altering payload
+      const discoveryFetch = vi.fn<typeof fetch>(async (_url, init) => {
+        expect(JSON.parse(String(init?.body ?? ''))).toEqual({});
+        return jsonResponse({ token: 'ghs_discovery_only_token', expires_at: futureIso }, 201);
+      });
+      const discoveryClient = createGitHubClient({
+        config: TEST_GITHUB_CONFIG,
+        fetchImpl: discoveryFetch,
+      });
+      await expect(discoveryClient.createInstallationAccessToken(7001)).resolves.toBe(
+        'ghs_discovery_only_token'
+      );
+
+      // 2. Rejects invalid installation and repository IDs before issuing network requests
+      const neverFetch = vi.fn<typeof fetch>();
+      const guardClient = createGitHubClient({
+        config: TEST_GITHUB_CONFIG,
+        fetchImpl: neverFetch,
+      });
+
+      for (const badInstall of [0, -1, 1.5, Number.NaN]) {
+        await expect(
+          guardClient.createRepositoryAcquisitionToken({
+            installationId: badInstall,
+            githubRepositoryId: 4242,
+          })
+        ).rejects.toMatchObject({ statusCode: 400, code: 'INVALID_INSTALLATION_ID' });
+      }
+      for (const badRepo of [0, -10, 2.75, Number.NaN]) {
+        await expect(
+          guardClient.createRepositoryAcquisitionToken({
+            installationId: 7001,
+            githubRepositoryId: badRepo,
+          })
+        ).rejects.toMatchObject({ statusCode: 400, code: 'INVALID_REPOSITORY_ID' });
+      }
+      expect(neverFetch).not.toHaveBeenCalled();
+
+      // 3-7. Rejects malformed payloads, bad expirations, missing/broad repo scope, write & unexpected perms without leaking token
+      const rejectedPayloads: Array<{
+        label: string;
+        payload: unknown;
+        expectedCode: string;
+      }> = [
+        {
+          label: 'empty token',
+          payload: {
+            token: '   ',
+            expires_at: futureIso,
+            permissions: { contents: 'read' },
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'INVALID_GITHUB_RESPONSE',
+        },
+        {
+          label: 'missing permissions map',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'INVALID_GITHUB_RESPONSE',
+        },
+        {
+          label: 'invalid expiration timestamp',
+          payload: {
+            token: issuedToken,
+            expires_at: 'not-a-timestamp',
+            permissions: { contents: 'read' },
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'INVALID_GITHUB_RESPONSE',
+        },
+        {
+          label: 'already-expired timestamp',
+          payload: {
+            token: issuedToken,
+            expires_at: fixedNow.toISOString(),
+            permissions: { contents: 'read' },
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'INVALID_GITHUB_RESPONSE',
+        },
+        {
+          label: 'empty repositories array',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            permissions: { contents: 'read' },
+            repositories: [],
+          },
+          expectedCode: 'GITHUB_TOKEN_SCOPE_MISMATCH',
+        },
+        {
+          label: 'broader multiple repositories scope',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            permissions: { contents: 'read' },
+            repositories: [{ id: 4242 }, { id: 9999 }],
+          },
+          expectedCode: 'GITHUB_TOKEN_SCOPE_MISMATCH',
+        },
+        {
+          label: 'mismatched repository ID',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            permissions: { contents: 'read' },
+            repositories: [{ id: 9999 }],
+          },
+          expectedCode: 'GITHUB_TOKEN_SCOPE_MISMATCH',
+        },
+        {
+          label: 'repository_selection all',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            repository_selection: 'all',
+            permissions: { contents: 'read' },
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'GITHUB_TOKEN_SCOPE_MISMATCH',
+        },
+        {
+          label: 'missing contents:read',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            permissions: { metadata: 'read' },
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'GITHUB_TOKEN_SCOPE_MISMATCH',
+        },
+        {
+          label: 'unexpected extra read permission',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            permissions: { contents: 'read', pull_requests: 'read' },
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'GITHUB_TOKEN_SCOPE_MISMATCH',
+        },
+        {
+          label: 'write contents permission',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            permissions: { contents: 'write' },
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'GITHUB_TOKEN_SCOPE_MISMATCH',
+        },
+        {
+          label: 'write issues permission alongside contents:read',
+          payload: {
+            token: issuedToken,
+            expires_at: futureIso,
+            permissions: { contents: 'read', issues: 'write' },
+            repositories: [{ id: 4242 }],
+          },
+          expectedCode: 'GITHUB_TOKEN_SCOPE_MISMATCH',
+        },
+      ];
+
+      for (const testCase of rejectedPayloads) {
+        const client = createGitHubClient({
+          config: TEST_GITHUB_CONFIG,
+          fetchImpl: async () => jsonResponse(testCase.payload, 201),
+          now: () => fixedNow,
+        });
+
+        let caught: unknown = null;
+        try {
+          await client.createRepositoryAcquisitionToken({
+            installationId: 7001,
+            githubRepositoryId: 4242,
+          });
+        } catch (err) {
+          caught = err;
+        }
+
+        expect(caught, testCase.label).toMatchObject({
+          statusCode: 502,
+          code: testCase.expectedCode,
+        });
+        expect((caught as Error).message, testCase.label).not.toContain(issuedToken);
+      }
+    });
+
+    it('revokes installation tokens safely, handles expired/invalid responses, and scrubs token from errors', async () => {
+      const secretOpaqueToken = `opaque_token_without_prefix_${randomBytes(8).toString('hex')}`;
+
+      // 8. 204 No Content -> revoked cleanly in single non-retried DELETE call
+      const okFetch = vi.fn<typeof fetch>(async (url, init) => {
+        expect(String(url)).toBe('https://api.github.com/installation/token');
+        expect(init?.method).toBe('DELETE');
+        expect(init?.redirect).toBe('error');
+        expect((init?.headers as Record<string, string>)?.Authorization).toBe(
+          `Bearer ${secretOpaqueToken}`
+        );
+        return new Response(null, { status: 204 });
+      });
+      const okClient = createGitHubClient({ config: TEST_GITHUB_CONFIG, fetchImpl: okFetch });
+      await expect(okClient.revokeInstallationAccessToken(secretOpaqueToken)).resolves.toEqual({
+        revoked: true,
+        alreadyInvalidOrExpired: false,
+      });
+      expect(okFetch).toHaveBeenCalledTimes(1);
+
+      // 9a. Already-invalid / expired token (401 or 404) handled safely as alreadyInvalidOrExpired
+      for (const status of [401, 404]) {
+        const staleClient = createGitHubClient({
+          config: TEST_GITHUB_CONFIG,
+          fetchImpl: async () => jsonResponse({ message: 'Bad credentials' }, status),
+        });
+        await expect(staleClient.revokeInstallationAccessToken(secretOpaqueToken)).resolves.toEqual(
+          {
+            revoked: true,
+            alreadyInvalidOrExpired: true,
+          }
+        );
+      }
+
+      // 9b. Empty token rejected without network call
+      await expect(okClient.revokeInstallationAccessToken('   ')).rejects.toMatchObject({
+        statusCode: 400,
+        code: 'INVALID_GITHUB_TOKEN',
+      });
+
+      // 9c. Rate-limit, 5xx (no DELETE retries), timeout, and secret scrubbing in network error
+      const serverErrFetch = vi.fn<typeof fetch>(async () =>
+        jsonResponse({ message: 'Internal failure' }, 503)
+      );
+      const serverErrClient = createGitHubClient({
+        config: TEST_GITHUB_CONFIG,
+        fetchImpl: serverErrFetch,
+      });
+      await expect(
+        serverErrClient.revokeInstallationAccessToken(secretOpaqueToken)
+      ).rejects.toMatchObject({ statusCode: 502, code: 'GITHUB_API_ERROR' });
+      expect(serverErrFetch).toHaveBeenCalledTimes(1);
+
+      const rateLimitClient = createGitHubClient({
+        config: TEST_GITHUB_CONFIG,
+        fetchImpl: async () =>
+          new Response(JSON.stringify({ message: 'API rate limit exceeded' }), {
+            status: 429,
+            headers: { 'content-type': 'application/json', 'retry-after': '15' },
+          }),
+      });
+      await expect(
+        rateLimitClient.revokeInstallationAccessToken(secretOpaqueToken)
+      ).rejects.toMatchObject({ statusCode: 429, code: 'GITHUB_RATE_LIMITED' });
+
+      const leakClient = createGitHubClient({
+        config: TEST_GITHUB_CONFIG,
+        fetchImpl: async () => {
+          throw new Error(`Socket dropped using ${secretOpaqueToken}`);
+        },
+      });
+      let leakErr: unknown = null;
+      try {
+        await leakClient.revokeInstallationAccessToken(secretOpaqueToken);
+      } catch (err) {
+        leakErr = err;
+      }
+      expect(leakErr).toMatchObject({ statusCode: 502, code: 'GITHUB_API_UNAVAILABLE' });
+      expect((leakErr as Error).message).not.toContain(secretOpaqueToken);
+
+      // 12. Verify persistence schemas contain no plaintext GitHub token fields
+      for (const model of [GitHubInstallationModel, ProjectRepositoryConnectionModel, ScanModel]) {
+        const pathKeys = Object.keys(model.schema.paths);
+        expect(pathKeys).not.toContain('token');
+        expect(pathKeys).not.toContain('accessToken');
+        expect(pathKeys).not.toContain('installationToken');
+      }
     });
   });
 

@@ -4,8 +4,11 @@ import type { GitHubRuntimeConfig } from '../../config/env.js';
 import { createGitHubAppJwt } from './github.jwt.js';
 import {
   GitHubError,
+  type CreateRepositoryAcquisitionTokenInput,
   type DiscoveredUserGitHubInstallation,
   type PublicGitHubRepository,
+  type RepositoryAcquisitionToken,
+  type RevokeInstallationTokenResult,
 } from './github.types.js';
 
 const OFFICIAL_GITHUB_API_ORIGIN = 'https://api.github.com';
@@ -77,8 +80,20 @@ const appInstallationResponseSchema = z.object({
 });
 
 const installationAccessTokenResponseSchema = z.object({
-  token: z.string().min(1),
-  expires_at: z.string().min(1),
+  token: z.string().trim().min(1),
+  expires_at: z.string().trim().min(1),
+});
+
+const scopedRepositoryRefSchema = z.object({
+  id: positiveIntSchema,
+});
+
+const repositoryAcquisitionTokenResponseSchema = z.object({
+  token: z.string().trim().min(1),
+  expires_at: z.string().trim().min(1),
+  repository_selection: z.enum(['all', 'selected']).optional(),
+  permissions: z.record(z.string(), z.string()),
+  repositories: z.array(scopedRepositoryRefSchema),
 });
 
 const gitHubRepositorySchema = z.object({
@@ -136,7 +151,22 @@ export interface GitHubClient {
   }): Promise<string>;
   listUserInstallations(userAccessToken: string): Promise<DiscoveredUserGitHubInstallation[]>;
   getAppInstallation(installationId: number): Promise<AuthoritativeGitHubInstallation>;
+  /**
+   * Mints an installation-scoped discovery token for enumerating accessible repositories and
+   * syncing project metadata. Must NEVER be used by future repository acquisition workflows.
+   */
   createInstallationAccessToken(installationId: number): Promise<string>;
+  /**
+   * Mints a strictly bounded, single-repository (`repository_ids: [githubRepositoryId]`),
+   * read-only (`permissions: { contents: 'read' }`) installation token in memory for acquisition.
+   */
+  createRepositoryAcquisitionToken(
+    input: CreateRepositoryAcquisitionTokenInput
+  ): Promise<RepositoryAcquisitionToken>;
+  /**
+   * Explicitly revokes an active installation access token via `DELETE /installation/token`.
+   */
+  revokeInstallationAccessToken(installationToken: string): Promise<RevokeInstallationTokenResult>;
   listInstallationRepositories(
     installationToken: string,
     options: { page: number; perPage: number }
@@ -647,6 +677,7 @@ export function createGitHubClient(options: CreateGitHubClientOptions): GitHubCl
         `${apiBaseUrl}/app/installations/${installationId}/access_tokens`,
         {
           method: 'POST',
+          redirect: 'error',
           headers: {
             'Content-Type': 'application/json',
           },
@@ -663,6 +694,186 @@ export function createGitHubClient(options: CreateGitHubClientOptions): GitHubCl
       );
 
       return data.token;
+    },
+
+    async createRepositoryAcquisitionToken(
+      input: CreateRepositoryAcquisitionTokenInput
+    ): Promise<RepositoryAcquisitionToken> {
+      if (!Number.isSafeInteger(input.installationId) || input.installationId < 1) {
+        throw new GitHubError(
+          400,
+          'INVALID_INSTALLATION_ID',
+          'GitHub installation ID must be a valid positive integer'
+        );
+      }
+
+      if (!Number.isSafeInteger(input.githubRepositoryId) || input.githubRepositoryId < 1) {
+        throw new GitHubError(
+          400,
+          'INVALID_REPOSITORY_ID',
+          'GitHub repository ID must be a valid positive integer'
+        );
+      }
+
+      const appJwt = createGitHubAppJwt({
+        appId: config.appId,
+        privateKeyPem: config.privateKeyPem,
+        now,
+      });
+
+      const { data } = await requestGitHubApi(
+        `${apiBaseUrl}/app/installations/${input.installationId}/access_tokens`,
+        {
+          method: 'POST',
+          redirect: 'error',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            repository_ids: [input.githubRepositoryId],
+            permissions: {
+              contents: 'read',
+            },
+          }),
+        },
+        repositoryAcquisitionTokenResponseSchema,
+        {
+          bearerToken: appJwt,
+          notFoundCode: 'GITHUB_INSTALLATION_NOT_FOUND',
+          notFoundMessage:
+            'GitHub App installation or repository was not found or access was revoked',
+          forbiddenCode: 'GITHUB_INSTALLATION_ACCESS_DENIED',
+          forbiddenMessage: 'GitHub denied creating a repository-scoped installation access token',
+        }
+      );
+
+      const expiresAt = new Date(data.expires_at);
+      if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= now().getTime()) {
+        throw new GitHubError(
+          502,
+          'INVALID_GITHUB_RESPONSE',
+          'GitHub returned an invalid or already-expired installation token timestamp'
+        );
+      }
+
+      if (data.repository_selection !== undefined && data.repository_selection !== 'selected') {
+        throw new GitHubError(
+          502,
+          'GITHUB_TOKEN_SCOPE_MISMATCH',
+          'GitHub returned an installation token with broader repository selection than requested'
+        );
+      }
+
+      if (data.repositories.length !== 1 || data.repositories[0]?.id !== input.githubRepositoryId) {
+        throw new GitHubError(
+          502,
+          'GITHUB_TOKEN_SCOPE_MISMATCH',
+          'GitHub returned an installation token with missing or unexpected repository scope'
+        );
+      }
+
+      if (data.permissions.contents !== 'read') {
+        throw new GitHubError(
+          502,
+          'GITHUB_TOKEN_SCOPE_MISMATCH',
+          'GitHub returned an installation token without read-only contents permission'
+        );
+      }
+
+      for (const [permissionKey, permissionLevel] of Object.entries(data.permissions)) {
+        if (permissionLevel !== 'read') {
+          throw new GitHubError(
+            502,
+            'GITHUB_TOKEN_SCOPE_MISMATCH',
+            'GitHub returned an installation token with elevated non-read permissions'
+          );
+        }
+        if (permissionKey !== 'contents' && permissionKey !== 'metadata') {
+          throw new GitHubError(
+            502,
+            'GITHUB_TOKEN_SCOPE_MISMATCH',
+            'GitHub returned an installation token with unexpected permission scope'
+          );
+        }
+      }
+
+      return {
+        token: data.token,
+        expiresAt,
+        installationId: input.installationId,
+        githubRepositoryId: input.githubRepositoryId,
+        permissions: {
+          contents: 'read',
+          ...(data.permissions.metadata === 'read' ? { metadata: 'read' as const } : {}),
+        },
+      };
+    },
+
+    async revokeInstallationAccessToken(
+      installationToken: string
+    ): Promise<RevokeInstallationTokenResult> {
+      const trimmedToken = typeof installationToken === 'string' ? installationToken.trim() : '';
+      if (trimmedToken.length === 0) {
+        throw new GitHubError(
+          400,
+          'INVALID_GITHUB_TOKEN',
+          'GitHub installation access token must be a non-empty string'
+        );
+      }
+
+      const response = await executeFetch(
+        `${apiBaseUrl}/installation/token`,
+        {
+          method: 'DELETE',
+          redirect: 'error',
+          headers: {
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': GITHUB_API_VERSION,
+            'User-Agent': GITHUB_USER_AGENT,
+            Authorization: `Bearer ${trimmedToken}`,
+          },
+        },
+        trimmedToken
+      );
+
+      if (response.status === 204 || response.ok) {
+        return {
+          revoked: true,
+          alreadyInvalidOrExpired: false,
+        };
+      }
+
+      if (response.status === 401 || response.status === 404) {
+        return {
+          revoked: true,
+          alreadyInvalidOrExpired: true,
+        };
+      }
+
+      const ghMessage = safeRedact(await readSafeErrorMessage(response), trimmedToken);
+      if (isRateLimitResponse(response.status, response.headers, ghMessage)) {
+        const retryAfterSeconds = parseRetryAfterSeconds(response.headers, now().getTime());
+        throw new GitHubError(
+          429,
+          'GITHUB_RATE_LIMITED',
+          'GitHub API rate limit exceeded; please retry shortly',
+          { retryAfterSeconds }
+        );
+      }
+
+      if (response.status === 403) {
+        throw new GitHubError(
+          403,
+          'GITHUB_ACCESS_DENIED',
+          'GitHub denied revoking the installation access token'
+        );
+      }
+
+      throw new GitHubError(
+        502,
+        'GITHUB_API_ERROR',
+        'Unexpected error response received from GitHub while revoking token'
+      );
     },
 
     async listInstallationRepositories(

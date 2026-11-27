@@ -110,6 +110,37 @@ export interface PaginatedGitHubRepositoriesResult {
 }
 
 /**
+ * Input required to mint a least-privilege installation token scoped to a single repository.
+ */
+export interface CreateRepositoryAcquisitionTokenInput {
+  installationId: number;
+  githubRepositoryId: number;
+}
+
+/**
+ * Ephemeral in-memory GitHub App installation access token locked to one repository and read-only contents.
+ * Must NEVER be persisted to MongoDB/Redis or returned in HTTP responses.
+ */
+export interface RepositoryAcquisitionToken {
+  token: string;
+  expiresAt: Date;
+  installationId: number;
+  githubRepositoryId: number;
+  permissions: {
+    contents: 'read';
+    metadata?: 'read';
+  };
+}
+
+/**
+ * Outcome of revoking a GitHub installation access token via `DELETE /installation/token`.
+ */
+export interface RevokeInstallationTokenResult {
+  revoked: true;
+  alreadyInvalidOrExpired: boolean;
+}
+
+/**
  * Operational error thrown by GitHub integration operations.
  */
 export class GitHubError extends HttpError {
