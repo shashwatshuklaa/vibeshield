@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto';
 import http from 'node:http';
 import net, { type AddressInfo } from 'node:net';
+import { PassThrough } from 'node:stream';
 import request from 'supertest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -22,6 +23,11 @@ import {
   createGitHubClient,
   validateCodeloadRedirectUrl,
 } from '../modules/github/github.client.js';
+import {
+  createInternalScanAcquisitionService,
+  sanitizeDiagnosticUrl,
+  toSafeDiagnostic,
+} from '../modules/scans/internal-acquisition.service.js';
 import {
   INTERNAL_NONCE_HEADER,
   INTERNAL_SERVICE_HEADER,
@@ -1528,6 +1534,752 @@ describe('Internal Scan Acquisition Authorization & Listener Boundary', () => {
         });
       } finally {
         await new Promise<void>((resolve) => leaseSrv.close(() => resolve()));
+      }
+    });
+  });
+
+  describe('Streaming finalization, redirect policy, diagnostic redaction, and timeout hardening regressions', () => {
+    function buildGitHubClientConfig() {
+      return {
+        appId: 9001,
+        appSlug: 'vibeshield-test',
+        privateKeyPem: TEST_RSA_PRIVATE_KEY_PEM,
+        clientId: 'Iv1.testclient',
+        clientSecret: 'test_github_client_secret_value',
+        webhookSecret: 'test_github_webhook_secret_32_chars_min',
+        callbackUrl: 'http://localhost:5173/integrations/github/callback',
+      };
+    }
+
+    function authorizedFixture(overrides: Record<string, unknown> = {}) {
+      return {
+        status: 'AUTHORIZED' as const,
+        context: {
+          scanId: VALID_SCAN_ID,
+          organizationId: VALID_ORG_ID,
+          projectId: VALID_PROJ_ID,
+          repositoryConnectionId: VALID_CONN_ID,
+          githubInstallationId: 1001,
+          githubRepositoryId: 2002,
+          repositoryOwner: 'acme-sec',
+          repositoryName: 'web-app',
+          requestedRef: 'main',
+          requestedCommitHash: null,
+          attemptCount: 1,
+          maxAttempts: 3,
+          workerId: 'security-worker',
+          leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+          ...overrides,
+        },
+      };
+    }
+
+    function buildSignedAcquireHeaders(rawBody: string) {
+      const signed = signInternalWorkerRequest({
+        secret: TEST_INTERNAL_SECRET,
+        method: 'POST',
+        path: '/internal/v1/scans/acquire',
+        serviceId: 'security-worker',
+        timestamp: String(Date.now()),
+        nonce: `hardening-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`,
+        rawBody,
+      });
+      return {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(rawBody)),
+        [INTERNAL_SERVICE_HEADER]: signed.serviceId,
+        [INTERNAL_TIMESTAMP_HEADER]: signed.timestamp,
+        [INTERNAL_NONCE_HEADER]: signed.nonce,
+        [INTERNAL_SIGNATURE_HEADER]: signed.signature,
+      };
+    }
+
+    function createHarnessResponseSpy(options: { deferEndCompletion?: boolean }): {
+      req: EventEmitter & { headers: Record<string, string> };
+      res: PassThrough & {
+        statusCode: number;
+        headersSent: boolean;
+        writableFinished: boolean;
+        status: (code: number) => unknown;
+        setHeader: (name: string, value: string) => void;
+        destroyCalls: number;
+        emitEndFlush: () => void;
+        emitPrematureCloseWithoutFinish: () => void;
+      };
+    } {
+      const req = new EventEmitter() as EventEmitter & { headers: Record<string, string> };
+      req.headers = {};
+
+      const res = new PassThrough() as unknown as PassThrough & {
+        statusCode: number;
+        headersSent: boolean;
+        writableFinished: boolean;
+        status: (code: number) => unknown;
+        setHeader: (name: string, value: string) => void;
+        destroyCalls: number;
+        emitEndFlush: () => void;
+        emitPrematureCloseWithoutFinish: () => void;
+      };
+      const rawEnd = res.end.bind(res);
+      const rawDestroy = res.destroy.bind(res);
+      let finishFlag = false;
+
+      res.statusCode = 200;
+      res.headersSent = false;
+      res.destroyCalls = 0;
+      Object.defineProperty(res, 'writableFinished', {
+        get: () => finishFlag,
+      });
+      res.status = (code: number) => {
+        res.statusCode = code;
+        return res;
+      };
+      res.setHeader = () => {
+        res.headersSent = true;
+      };
+      res.write = ((chunk: unknown, ...args: unknown[]) => {
+        res.headersSent = true;
+        return PassThrough.prototype.write.call(
+          res,
+          chunk as Uint8Array,
+          ...(args as [BufferEncoding?])
+        );
+      }) as typeof res.write;
+      res.end = ((...args: unknown[]) => {
+        res.headersSent = true;
+        if (options.deferEndCompletion) {
+          return res;
+        }
+        finishFlag = true;
+        res.emit('finish');
+        return rawEnd(...(args as []));
+      }) as typeof res.end;
+      res.destroy = ((err?: Error) => {
+        res.destroyCalls += 1;
+        return rawDestroy(err);
+      }) as typeof res.destroy;
+      res.emitEndFlush = () => {
+        finishFlag = true;
+        res.emit('finish');
+        res.emit('close');
+      };
+      res.emitPrematureCloseWithoutFinish = () => {
+        finishFlag = false;
+        res.emit('close');
+      };
+
+      return { req, res };
+    }
+
+    it('rejects response close without finish during final flush, handles AbortSignal during finalization, completes on normal finish->close, and cleans up all listeners', async () => {
+      const revokeMock = vi.fn(async () => ({
+        revoked: true as const,
+        alreadyInvalidOrExpired: false,
+      }));
+      const warnLogger = { warn: vi.fn(), error: vi.fn() };
+
+      const makeService = (overrides: Record<string, unknown> = {}) =>
+        createInternalScanAcquisitionService({
+          githubClient: {
+            createRepositoryAcquisitionToken: vi.fn(async () => ({
+              token: 'ghs_finalize_test_token',
+              expiresAt: new Date(Date.now() + 60_000),
+              installationId: 1001,
+              githubRepositoryId: 2002,
+              permissions: { contents: 'read' as const },
+            })),
+            revokeInstallationAccessToken: revokeMock,
+            probeRepositoryById: vi.fn(async () => ({
+              status: 'ACCESSIBLE' as const,
+              repository: {
+                githubRepositoryId: 2002,
+                name: 'web-app',
+                fullName: 'acme-sec/web-app',
+                ownerLogin: 'acme-sec',
+                defaultBranch: 'main',
+                isPrivate: true,
+                isArchived: false,
+                htmlUrl: 'https://github.com/acme-sec/web-app',
+              },
+            })),
+            resolveCommitSha: vi.fn(async () => TEST_COMMIT_SHA),
+            openRepositoryTarballStream: vi.fn(async () => ({
+              declaredContentLength: null,
+              body: new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+                  controller.close();
+                },
+              }),
+            })),
+          },
+          verifyAuthorization: async () => authorizedFixture(),
+          setResolvedCommitWithLease: async () => ({ status: 'UPDATED', scan: {} as never }),
+          logger: warnLogger,
+          ...overrides,
+        });
+
+      // 1. Worker disconnects (close without finish) during res.end() final flush
+      {
+        revokeMock.mockClear();
+        warnLogger.warn.mockClear();
+        const svc = makeService();
+        const { req, res } = createHarnessResponseSpy({ deferEndCompletion: true });
+
+        const runPromise = svc.acquireAndStreamArchive({
+          req: req as never,
+          res: res as never,
+          scanId: VALID_SCAN_ID,
+          leaseToken: VALID_LEASE_TOKEN,
+          workerId: 'security-worker',
+        });
+
+        await vi.waitFor(() => {
+          expect(res.listenerCount('finish')).toBeGreaterThan(0);
+        });
+        res.emitPrematureCloseWithoutFinish();
+        await runPromise;
+
+        expect(res.destroyCalls).toBe(1);
+        expect(revokeMock).toHaveBeenCalledWith('ghs_finalize_test_token');
+        expect(req.listenerCount('aborted')).toBe(0);
+        expect(res.listenerCount('close')).toBe(0);
+        expect(res.listenerCount('error')).toBe(0);
+        expect(res.listenerCount('finish')).toBe(0);
+        expect(warnLogger.warn).toHaveBeenCalled();
+      }
+
+      // 2. AbortSignal fires (total timeout) while awaiting res.end() final flush
+      {
+        revokeMock.mockClear();
+        const svc = makeService({ totalAcquisitionTimeoutMs: 120 });
+        const { req, res } = createHarnessResponseSpy({ deferEndCompletion: true });
+
+        const runPromise = svc.acquireAndStreamArchive({
+          req: req as never,
+          res: res as never,
+          scanId: VALID_SCAN_ID,
+          leaseToken: VALID_LEASE_TOKEN,
+          workerId: 'security-worker',
+        });
+
+        await vi.waitFor(
+          () => {
+            expect(res.listenerCount('finish')).toBeGreaterThan(0);
+          },
+          { interval: 5 }
+        );
+        await runPromise;
+
+        expect(res.destroyCalls).toBe(1);
+        expect(revokeMock).toHaveBeenCalledWith('ghs_finalize_test_token');
+        expect(req.listenerCount('aborted')).toBe(0);
+        expect(res.listenerCount('close')).toBe(0);
+        expect(res.listenerCount('error')).toBe(0);
+        expect(res.listenerCount('finish')).toBe(0);
+      }
+
+      // 3. Normal finish followed by close completes without error and cleans up all listeners
+      {
+        revokeMock.mockClear();
+        warnLogger.warn.mockClear();
+        const svc = makeService();
+        const { req, res } = createHarnessResponseSpy({ deferEndCompletion: true });
+
+        const runPromise = svc.acquireAndStreamArchive({
+          req: req as never,
+          res: res as never,
+          scanId: VALID_SCAN_ID,
+          leaseToken: VALID_LEASE_TOKEN,
+          workerId: 'security-worker',
+        });
+
+        await vi.waitFor(() => {
+          expect(res.listenerCount('finish')).toBeGreaterThan(0);
+        });
+        res.emitEndFlush();
+        await runPromise;
+
+        expect(res.destroyCalls).toBe(0);
+        expect(warnLogger.warn).not.toHaveBeenCalled();
+        expect(revokeMock).toHaveBeenCalledWith('ghs_finalize_test_token');
+        expect(req.listenerCount('aborted')).toBe(0);
+        expect(res.listenerCount('close')).toBe(0);
+        expect(res.listenerCount('error')).toBe(0);
+        expect(res.listenerCount('finish')).toBe(0);
+      }
+    });
+
+    it('handles response error event while awaiting idle upstream chunk without unhandled errors and cleans up listeners', async () => {
+      const revokeMock = vi.fn(async () => ({
+        revoked: true as const,
+        alreadyInvalidOrExpired: false,
+      }));
+      let streamAborted = false;
+      let markReadingStarted!: () => void;
+      const readingStartedPromise = new Promise<void>((resolve) => {
+        markReadingStarted = resolve;
+      });
+      const svc = createInternalScanAcquisitionService({
+        githubClient: {
+          createRepositoryAcquisitionToken: vi.fn(async () => ({
+            token: 'ghs_res_error_token',
+            expiresAt: new Date(Date.now() + 60_000),
+            installationId: 1001,
+            githubRepositoryId: 2002,
+            permissions: { contents: 'read' as const },
+          })),
+          revokeInstallationAccessToken: revokeMock,
+          probeRepositoryById: vi.fn(async () => ({
+            status: 'ACCESSIBLE' as const,
+            repository: {
+              githubRepositoryId: 2002,
+              name: 'web-app',
+              fullName: 'acme-sec/web-app',
+              ownerLogin: 'acme-sec',
+              defaultBranch: 'main',
+              isPrivate: true,
+              isArchived: false,
+              htmlUrl: 'https://github.com/acme-sec/web-app',
+            },
+          })),
+          resolveCommitSha: vi.fn(async () => TEST_COMMIT_SHA),
+          openRepositoryTarballStream: vi.fn(async ({ signal }) => ({
+            declaredContentLength: null,
+            body: new ReadableStream<Uint8Array>({
+              start() {
+                signal?.addEventListener('abort', () => {
+                  streamAborted = true;
+                });
+              },
+              pull() {
+                markReadingStarted();
+              },
+              cancel() {
+                streamAborted = true;
+              },
+            }),
+          })),
+        },
+        verifyAuthorization: async () => authorizedFixture(),
+        setResolvedCommitWithLease: async () => ({ status: 'UPDATED', scan: {} as never }),
+        logger: { warn: vi.fn(), error: vi.fn() },
+      });
+
+      const req = new EventEmitter() as EventEmitter & { headers: Record<string, string> };
+      req.headers = {};
+      const res = new EventEmitter() as EventEmitter & {
+        headersSent: boolean;
+        writableFinished: boolean;
+        destroy: () => void;
+      };
+      res.headersSent = false;
+      res.writableFinished = false;
+      res.destroy = vi.fn();
+
+      const runPromise = svc.acquireAndStreamArchive({
+        req: req as never,
+        res: res as never,
+        scanId: VALID_SCAN_ID,
+        leaseToken: VALID_LEASE_TOKEN,
+        workerId: 'security-worker',
+      });
+
+      await readingStartedPromise;
+      res.emit('error', new Error('Simulated downstream socket reset while awaiting chunk 1'));
+
+      await expect(runPromise).rejects.toMatchObject({
+        statusCode: 499,
+        code: 'WORKER_DISCONNECTED',
+      });
+      expect(streamAborted).toBe(true);
+      expect(revokeMock).toHaveBeenCalledWith('ghs_res_error_token');
+      expect(req.listenerCount('aborted')).toBe(0);
+      expect(res.listenerCount('close')).toBe(0);
+      expect(res.listenerCount('error')).toBe(0);
+    });
+
+    it('rejects 301/302 redirects on probeRepositoryById in both real HTTP server and mocked transports without following redirect targets', async () => {
+      let followedRedirectTarget = false;
+      const redirectTargetSrv = http.createServer((_req, res) => {
+        followedRedirectTarget = true;
+        res.statusCode = 200;
+        res.end('{}');
+      });
+      await new Promise<void>((resolve) => redirectTargetSrv.listen(0, '127.0.0.1', resolve));
+
+      const redirectSourceSrv = http.createServer((_req, res) => {
+        const targetPort = (redirectTargetSrv.address() as AddressInfo).port;
+        res.statusCode = 302;
+        res.setHeader('Location', `http://127.0.0.1:${targetPort}/repositories/9999`);
+        res.end();
+      });
+      await new Promise<void>((resolve) => redirectSourceSrv.listen(0, '127.0.0.1', resolve));
+
+      try {
+        const sourcePort = (redirectSourceSrv.address() as AddressInfo).port;
+        const realHttpClient = createGitHubClient({
+          config: buildGitHubClientConfig(),
+          apiBaseUrl: `http://127.0.0.1:${sourcePort}`,
+          allowCustomBaseUrlForTests: true,
+          retryDelayMs: 5,
+        });
+
+        await expect(
+          realHttpClient.probeRepositoryById('ghs_probe_redirect_secret', 2002)
+        ).rejects.toMatchObject({ statusCode: 502 });
+        expect(followedRedirectTarget).toBe(false);
+
+        const mockRedirectClient = createGitHubClient({
+          config: buildGitHubClientConfig(),
+          fetchImpl: vi.fn(async (_url, init) => {
+            expect(init?.redirect).toBe('error');
+            return new Response(null, {
+              status: 301,
+              headers: { location: 'https://evil.example/repositories/9999' },
+            });
+          }) as unknown as typeof fetch,
+        });
+
+        await expect(
+          mockRedirectClient.probeRepositoryById('ghs_probe_redirect_secret', 2002)
+        ).rejects.toMatchObject({ statusCode: 502, code: 'GITHUB_REDIRECT_REJECTED' });
+      } finally {
+        await new Promise<void>((resolve) => redirectSourceSrv.close(() => resolve()));
+        await new Promise<void>((resolve) => redirectTargetSrv.close(() => resolve()));
+      }
+    });
+
+    it('redacts signed URL query strings, fragments, and userinfo from diagnostic logs without recognizable token prefixes', () => {
+      const signedOpaqueUrl =
+        'https://deployuser:deploypass@codeload.github.com/acme-sec/web-app/legacy.tar.gz/deadbeef?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=supersecretsignature999#fragsecret';
+      const sanitizedUrl = sanitizeDiagnosticUrl(signedOpaqueUrl);
+      expect(sanitizedUrl).toBe(
+        'https://codeload.github.com/acme-sec/web-app/legacy.tar.gz/deadbeef?[REDACTED_QUERY]#[REDACTED_FRAGMENT]'
+      );
+
+      const diagnostic = toSafeDiagnostic(
+        new Error(`Upstream stream read failed for ${signedOpaqueUrl} (lease lease_tok_12345)`),
+        ['lease_tok_12345', undefined]
+      );
+      expect(diagnostic).toContain(
+        'https://codeload.github.com/acme-sec/web-app/legacy.tar.gz/deadbeef?[REDACTED_QUERY]#[REDACTED_FRAGMENT]'
+      );
+      expect(diagnostic).not.toContain('deployuser');
+      expect(diagnostic).not.toContain('deploypass');
+      expect(diagnostic).not.toContain('supersecretsignature999');
+      expect(diagnostic).not.toContain('fragsecret');
+      expect(diagnostic).not.toContain('lease_tok_12345');
+    });
+
+    it('maps codeload TimeoutError after 200 headers to 504 pre-chunk and terminates cleanly after chunk 1 without emitting trailing JSON', async () => {
+      const warnLogger = { warn: vi.fn(), error: vi.fn() };
+      const revokeMock = vi.fn(async () => ({
+        revoked: true as const,
+        alreadyInvalidOrExpired: false,
+      }));
+      const opaqueQueryUrl =
+        'https://codeload.github.com/acme-sec/web-app/legacy.tar.gz/abc?X-Amz-Signature=opaque_secret_sig_42';
+
+      // 1. TimeoutError before first chunk arrives -> 504 ARCHIVE_DOWNLOAD_TIMEOUT JSON
+      const preChunkTimeoutApp = createInternalApp({
+        auth: { workerAuthSecret: TEST_INTERNAL_SECRET, consumeNonce: async () => 'ACCEPTED' },
+        verifyAuthorization: async () => authorizedFixture(),
+        setResolvedCommitWithLease: async () => ({ status: 'UPDATED', scan: {} as never }),
+        githubClient: {
+          createRepositoryAcquisitionToken: vi.fn(async () => ({
+            token: 'ghs_codeload_prechunk_timeout',
+            expiresAt: new Date(Date.now() + 60_000),
+            installationId: 1001,
+            githubRepositoryId: 2002,
+            permissions: { contents: 'read' as const },
+          })),
+          revokeInstallationAccessToken: revokeMock,
+          probeRepositoryById: vi.fn(async () => ({
+            status: 'ACCESSIBLE' as const,
+            repository: {
+              githubRepositoryId: 2002,
+              name: 'web-app',
+              fullName: 'acme-sec/web-app',
+              ownerLogin: 'acme-sec',
+              defaultBranch: 'main',
+              isPrivate: true,
+              isArchived: false,
+              htmlUrl: 'https://github.com/acme-sec/web-app',
+            },
+          })),
+          resolveCommitSha: vi.fn(async () => TEST_COMMIT_SHA),
+          openRepositoryTarballStream: vi.fn(async () => ({
+            declaredContentLength: null,
+            body: new ReadableStream<Uint8Array>({
+              pull() {
+                const err = new Error(`Timeout reading ${opaqueQueryUrl}`);
+                err.name = 'TimeoutError';
+                return Promise.reject(err);
+              },
+            }),
+          })),
+        },
+      });
+
+      const body = JSON.stringify({ scanId: VALID_SCAN_ID, leaseToken: VALID_LEASE_TOKEN });
+      const preChunkRes = await request(preChunkTimeoutApp)
+        .post('/internal/v1/scans/acquire')
+        .set(buildSignedAcquireHeaders(body))
+        .send(body);
+      expect(preChunkRes.status).toBe(504);
+      expect(preChunkRes.body.error.code).toBe('ARCHIVE_DOWNLOAD_TIMEOUT');
+      expect(revokeMock).toHaveBeenCalledWith('ghs_codeload_prechunk_timeout');
+
+      // 2. TimeoutError AFTER chunk 1 -> terminates HTTP stream via res.destroy() without trailing JSON & strips query URL in logs
+      revokeMock.mockClear();
+      warnLogger.warn.mockClear();
+
+      const upstreamDropApp = createInternalApp({
+        auth: { workerAuthSecret: TEST_INTERNAL_SECRET, consumeNonce: async () => 'ACCEPTED' },
+        acquisitionService: createInternalScanAcquisitionService({
+          githubClient: {
+            createRepositoryAcquisitionToken: vi.fn(async () => ({
+              token: 'ghs_codeload_midstream_timeout',
+              expiresAt: new Date(Date.now() + 60_000),
+              installationId: 1001,
+              githubRepositoryId: 2002,
+              permissions: { contents: 'read' as const },
+            })),
+            revokeInstallationAccessToken: revokeMock,
+            probeRepositoryById: vi.fn(async () => ({
+              status: 'ACCESSIBLE' as const,
+              repository: {
+                githubRepositoryId: 2002,
+                name: 'web-app',
+                fullName: 'acme-sec/web-app',
+                ownerLogin: 'acme-sec',
+                defaultBranch: 'main',
+                isPrivate: true,
+                isArchived: false,
+                htmlUrl: 'https://github.com/acme-sec/web-app',
+              },
+            })),
+            resolveCommitSha: vi.fn(async () => TEST_COMMIT_SHA),
+            openRepositoryTarballStream: vi.fn(async () => ({
+              declaredContentLength: null,
+              body: new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(new Uint8Array(Buffer.from('PARTIAL_TAR_BYTES_')));
+                  setTimeout(() => {
+                    const err = new Error(`Timeout reading ${opaqueQueryUrl}`);
+                    err.name = 'TimeoutError';
+                    try {
+                      controller.error(err);
+                    } catch {
+                      // ignore
+                    }
+                  }, 30);
+                },
+              }),
+            })),
+          },
+          verifyAuthorization: async () => authorizedFixture(),
+          setResolvedCommitWithLease: async () => ({ status: 'UPDATED', scan: {} as never }),
+          logger: warnLogger,
+        }),
+      });
+
+      const srv = await new Promise<http.Server>((resolve) => {
+        const s = upstreamDropApp.listen(0, '127.0.0.1', () => resolve(s));
+      });
+      const downstreamPort = (srv.address() as AddressInfo).port;
+
+      try {
+        const receivedChunks: Buffer[] = [];
+        let completedNormally = false;
+        let erroredOrClosedEarly = false;
+
+        await new Promise<void>((resolve) => {
+          const clientReq = http.request(
+            {
+              host: '127.0.0.1',
+              port: downstreamPort,
+              method: 'POST',
+              path: '/internal/v1/scans/acquire',
+              headers: buildSignedAcquireHeaders(body),
+            },
+            (res) => {
+              res.on('data', (c: Buffer) => receivedChunks.push(c));
+              res.on('end', () => {
+                completedNormally = res.complete;
+                resolve();
+              });
+              res.on('error', () => {
+                erroredOrClosedEarly = true;
+                resolve();
+              });
+              res.on('close', () => {
+                if (!res.complete) {
+                  erroredOrClosedEarly = true;
+                }
+                resolve();
+              });
+            }
+          );
+          clientReq.on('error', () => {
+            erroredOrClosedEarly = true;
+            resolve();
+          });
+          clientReq.write(body);
+          clientReq.end();
+        });
+
+        expect(completedNormally).toBe(false);
+        expect(erroredOrClosedEarly).toBe(true);
+        const bodyReceived = Buffer.concat(receivedChunks).toString('utf8');
+        expect(bodyReceived).toBe('PARTIAL_TAR_BYTES_');
+        expect(bodyReceived).not.toContain('ARCHIVE_DOWNLOAD_TIMEOUT');
+        expect(bodyReceived).not.toContain('"error"');
+
+        await vi.waitFor(() => {
+          expect(revokeMock).toHaveBeenCalledWith('ghs_codeload_midstream_timeout');
+        });
+        const loggedText = warnLogger.warn.mock.calls.flat().join('\n');
+        expect(loggedText).toContain('?[REDACTED_QUERY]');
+        expect(loggedText).not.toContain('opaque_secret_sig_42');
+      } finally {
+        await new Promise<void>((resolve) => srv.close(() => resolve()));
+      }
+
+      // 3. Real local HTTP server upstream socket drop after chunk 1 -> downstream client sees incomplete close
+      const dropCodeloadSrv = http.createServer((_req, res) => {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/x-gzip');
+        res.write(Buffer.from('LIVE_HTTP_CHUNK_1_'));
+        setTimeout(() => {
+          res.socket?.destroy();
+        }, 30);
+      });
+      await new Promise<void>((resolve) => dropCodeloadSrv.listen(0, '127.0.0.1', resolve));
+
+      const dropGhSrv = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url?.endsWith('/access_tokens')) {
+          res.statusCode = 201;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              token: 'ghs_live_http_drop_token',
+              expires_at: new Date(Date.now() + 60_000).toISOString(),
+              repository_selection: 'selected',
+              permissions: { contents: 'read' },
+              repositories: [{ id: 2002 }],
+            })
+          );
+          return;
+        }
+        if (req.method === 'DELETE' && req.url === '/installation/token') {
+          void revokeMock();
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+        if (req.method === 'GET' && req.url === '/repositories/2002') {
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              id: 2002,
+              name: 'web-app',
+              full_name: 'acme-sec/web-app',
+              owner: { login: 'acme-sec' },
+              default_branch: 'main',
+              private: true,
+              archived: false,
+              html_url: 'https://github.com/acme-sec/web-app',
+            })
+          );
+          return;
+        }
+        if (req.method === 'GET' && req.url === '/repos/acme-sec/web-app/commits/main') {
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ sha: TEST_COMMIT_SHA }));
+          return;
+        }
+        if (
+          req.method === 'GET' &&
+          req.url === `/repos/acme-sec/web-app/tarball/${TEST_COMMIT_SHA}`
+        ) {
+          res.statusCode = 302;
+          res.setHeader(
+            'Location',
+            `http://127.0.0.1:${(dropCodeloadSrv.address() as AddressInfo).port}/archive?sig=drop_secret`
+          );
+          res.end();
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
+      });
+      await new Promise<void>((resolve) => dropGhSrv.listen(0, '127.0.0.1', resolve));
+
+      revokeMock.mockClear();
+      const liveDropApp = createInternalApp({
+        auth: { workerAuthSecret: TEST_INTERNAL_SECRET, consumeNonce: async () => 'ACCEPTED' },
+        githubClient: createGitHubClient({
+          config: buildGitHubClientConfig(),
+          apiBaseUrl: `http://127.0.0.1:${(dropGhSrv.address() as AddressInfo).port}`,
+          codeloadBaseUrl: `http://127.0.0.1:${(dropCodeloadSrv.address() as AddressInfo).port}`,
+          allowCustomBaseUrlForTests: true,
+        }),
+        verifyAuthorization: async () => authorizedFixture(),
+        setResolvedCommitWithLease: async () => ({ status: 'UPDATED', scan: {} as never }),
+      });
+
+      const liveDropSrv = await new Promise<http.Server>((resolve) => {
+        const s = liveDropApp.listen(0, '127.0.0.1', () => resolve(s));
+      });
+      try {
+        let liveComplete = false;
+        let liveClosedEarly = false;
+        const chunks: Buffer[] = [];
+        await new Promise<void>((resolve) => {
+          const req = http.request(
+            {
+              host: '127.0.0.1',
+              port: (liveDropSrv.address() as AddressInfo).port,
+              method: 'POST',
+              path: '/internal/v1/scans/acquire',
+              headers: buildSignedAcquireHeaders(body),
+            },
+            (res) => {
+              res.on('data', (c: Buffer) => chunks.push(c));
+              res.on('end', () => {
+                liveComplete = res.complete;
+                resolve();
+              });
+              res.on('close', () => {
+                if (!res.complete) {
+                  liveClosedEarly = true;
+                }
+                resolve();
+              });
+            }
+          );
+          req.on('error', () => {
+            liveClosedEarly = true;
+            resolve();
+          });
+          req.write(body);
+          req.end();
+        });
+
+        expect(liveComplete).toBe(false);
+        expect(liveClosedEarly).toBe(true);
+        expect(Buffer.concat(chunks).toString('utf8')).toBe('LIVE_HTTP_CHUNK_1_');
+        await vi.waitFor(() => {
+          expect(revokeMock).toHaveBeenCalledTimes(1);
+        });
+      } finally {
+        await new Promise<void>((resolve) => liveDropSrv.close(() => resolve()));
+        await new Promise<void>((resolve) => dropGhSrv.close(() => resolve()));
+        await new Promise<void>((resolve) => dropCodeloadSrv.close(() => resolve()));
       }
     });
   });

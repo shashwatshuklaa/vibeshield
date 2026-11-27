@@ -152,24 +152,118 @@ async function waitForDrainOrAbort(res: Response, signal: AbortSignal): Promise<
   });
 }
 
-function finalizeWritableResponse(res: Response): Promise<void> {
+function finalizeWritableResponse(res: Response, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(
+      signal.reason instanceof Error
+        ? signal.reason
+        : new HttpError(499, 'ACQUISITION_ABORTED', 'Archive acquisition was aborted.')
+    );
+  }
+
+  if (res.writableFinished) {
+    return Promise.resolve();
+  }
+
+  if (res.destroyed) {
+    return Promise.reject(
+      new HttpError(
+        499,
+        'WORKER_DISCONNECTED',
+        'Worker connection closed before final archive flush completed.'
+      )
+    );
+  }
+
   return new Promise<void>((resolve, reject) => {
-    const onError = (err: Error) => {
+    let settled = false;
+
+    const cleanup = () => {
       res.off('finish', onFinish);
-      reject(err);
-    };
-    const onFinish = () => {
+      res.off('close', onClose);
       res.off('error', onError);
+      signal.removeEventListener('abort', onAbort);
+    };
+
+    const settleResolve = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
       resolve();
     };
+
+    const settleReject = (err: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
+    const onFinish = () => {
+      settleResolve();
+    };
+
+    const onClose = () => {
+      if (res.writableFinished) {
+        settleResolve();
+        return;
+      }
+      settleReject(
+        new HttpError(
+          499,
+          'WORKER_DISCONNECTED',
+          'Worker connection closed before final archive flush completed.'
+        )
+      );
+    };
+
+    const onError = (err: Error) => {
+      settleReject(err);
+    };
+
+    const onAbort = () => {
+      settleReject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new HttpError(499, 'ACQUISITION_ABORTED', 'Archive acquisition was aborted.')
+      );
+    };
+
+    res.once('finish', onFinish);
+    res.once('close', onClose);
     res.once('error', onError);
-    res.end(onFinish);
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    res.end();
   });
 }
 
-function toSafeDiagnostic(error: unknown, extraSecrets: Array<string | undefined>): string {
+export function sanitizeDiagnosticUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '[REDACTED_URL]';
+    }
+    const hadQuery = parsed.search.length > 0 || rawUrl.includes('?');
+    const hadFragment = parsed.hash.length > 0 || rawUrl.includes('#');
+    const safeOrigin = `${parsed.protocol}//${parsed.host}`;
+    const safePath = parsed.pathname || '/';
+    return `${safeOrigin}${safePath}${hadQuery ? '?[REDACTED_QUERY]' : ''}${hadFragment ? '#[REDACTED_FRAGMENT]' : ''}`;
+  } catch {
+    return '[REDACTED_URL]';
+  }
+}
+
+export function toSafeDiagnostic(error: unknown, extraSecrets: Array<string | undefined>): string {
   const raw = error instanceof Error ? error.message : String(error);
-  return redactGitHubSecrets(redactMongoUri(raw), extraSecrets);
+  const urlSanitized = raw.replace(/https?:\/\/[^\s"'<>()]+/gi, (matchedUrl) =>
+    sanitizeDiagnosticUrl(matchedUrl)
+  );
+  return redactGitHubSecrets(redactMongoUri(urlSanitized), extraSecrets);
 }
 
 /**
@@ -255,8 +349,19 @@ export function createInternalScanAcquisitionService(
         }
       };
 
+      const onResError = () => {
+        if (!transferCompleted) {
+          abortTransfer(
+            499,
+            'WORKER_DISCONNECTED',
+            'Worker response stream encountered an error before transfer completed.'
+          );
+        }
+      };
+
       req.once('aborted', onReqAborted);
       res.once('close', onResClose);
+      res.once('error', onResError);
 
       const assertAuthorized = async () => {
         if (abortController.signal.aborted) {
@@ -471,8 +576,8 @@ export function createInternalScanAcquisitionService(
         // Final fence/cancellation verification before emitting normal EOF to worker
         await assertAuthorized();
 
+        await finalizeWritableResponse(res, abortController.signal);
         transferCompleted = true;
-        await finalizeWritableResponse(res);
       } catch (error) {
         if (revalidationTimer) {
           clearInterval(revalidationTimer);
@@ -500,6 +605,18 @@ export function createInternalScanAcquisitionService(
         if (error instanceof GitHubError) {
           throw new HttpError(error.statusCode, error.code, error.message);
         }
+        if (
+          error &&
+          typeof error === 'object' &&
+          'name' in error &&
+          (error as { name?: unknown }).name === 'TimeoutError'
+        ) {
+          throw new HttpError(
+            504,
+            'ARCHIVE_DOWNLOAD_TIMEOUT',
+            'Repository archive download timed out before receiving archive data.'
+          );
+        }
         throw new HttpError(
           502,
           'ARCHIVE_ACQUISITION_FAILED',
@@ -513,6 +630,7 @@ export function createInternalScanAcquisitionService(
         }
         req.off('aborted', onReqAborted);
         res.off('close', onResClose);
+        res.off('error', onResError);
 
         if (reader) {
           await reader.cancel().catch(() => undefined);

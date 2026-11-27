@@ -1143,6 +1143,7 @@ export function createGitHubClient(options: CreateGitHubClientOptions): GitHubCl
         `${apiBaseUrl}/repositories/${githubRepositoryId}`,
         {
           method: 'GET',
+          redirect: 'error',
           headers: {
             Accept: 'application/vnd.github+json',
             'X-GitHub-Api-Version': GITHUB_API_VERSION,
@@ -1155,6 +1156,15 @@ export function createGitHubClient(options: CreateGitHubClientOptions): GitHubCl
           signal: probeOptions?.signal,
         }
       );
+
+      if (REDIRECT_STATUS_CODES.has(response.status)) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new GitHubError(
+          502,
+          'GITHUB_REDIRECT_REJECTED',
+          'Unexpected redirect response received while verifying repository identity'
+        );
+      }
 
       if (response.ok) {
         const json = await parseJsonSafely(response);
