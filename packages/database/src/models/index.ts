@@ -117,3 +117,13 @@ export {
   type IntegrationAuditLogAttributes,
   type IntegrationAuditLogDocument,
 } from './integration-audit-log.model.js';
+
+export {
+  scanSchema,
+  ScanModel,
+  type ScanWorkerLeaseAttributes,
+  type ScanCancellationAttributes,
+  type ScanAcquisitionAttributes,
+  type ScanAttributes,
+  type ScanDocument,
+} from './scan.model.js';

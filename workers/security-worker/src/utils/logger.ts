@@ -1,3 +1,4 @@
+import { redactGitHubSecrets, redactMongoUri } from '@vibeshield/database';
 import type { BaseEnv } from '@vibeshield/env';
 import { formatSafeRedisError } from '@vibeshield/queue';
 
@@ -20,18 +21,29 @@ const LOG_LEVEL_WEIGHT: Record<WorkerLogLevel, number> = {
   silent: 100,
 };
 
+/**
+ * Redacts MongoDB URIs, Redis URLs, embedded credentials, GitHub tokens, and explicit runtime secrets.
+ */
+export function formatSafeWorkerMessage(
+  input: unknown,
+  extraSecrets: readonly string[] = []
+): string {
+  const redisScrubbed = formatSafeRedisError(input, [...extraSecrets]);
+  return redactGitHubSecrets(redactMongoUri(redisScrubbed), extraSecrets);
+}
+
 function sanitizeContextValue(value: unknown, extraSecrets: readonly string[]): unknown {
   if (value === null || value === undefined) {
     return value;
   }
   if (typeof value === 'string') {
-    return formatSafeRedisError(value, [...extraSecrets]);
+    return formatSafeWorkerMessage(value, extraSecrets);
   }
   if (typeof value === 'number' || typeof value === 'boolean') {
     return value;
   }
   if (value instanceof Error) {
-    return formatSafeRedisError(value, [...extraSecrets]);
+    return formatSafeWorkerMessage(value, extraSecrets);
   }
   return '[REDACTED_OBJECT]';
 }
@@ -42,7 +54,7 @@ function formatLine(
   context: Record<string, unknown> | undefined,
   extraSecrets: readonly string[]
 ): string {
-  const safeMessage = formatSafeRedisError(message, [...extraSecrets]);
+  const safeMessage = formatSafeWorkerMessage(message, extraSecrets);
   if (!context || Object.keys(context).length === 0) {
     return `[SecurityWorker][${level}] ${safeMessage}`;
   }

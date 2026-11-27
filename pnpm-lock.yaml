@@ -263,6 +263,9 @@ importers:
 
   packages/database:
     dependencies:
+      '@vibeshield/types':
+        specifier: workspace:*
+        version: link:../types
       mongoose:
         specifier: ^9.13.1
         version: 9.13.1
@@ -317,6 +320,9 @@ importers:
 
   workers/security-worker:
     dependencies:
+      '@vibeshield/database':
+        specifier: workspace:*
+        version: link:../../packages/database
       '@vibeshield/env':
         specifier: workspace:*
         version: link:../../packages/env

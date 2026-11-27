@@ -1,18 +1,20 @@
 import { pathToFileURL } from 'node:url';
-import { extractRedisUrlPassword, formatSafeRedisError } from '@vibeshield/queue';
+import { extractRedisUrlPassword } from '@vibeshield/queue';
 import { loadWorkerConfig, type WorkerConfig } from './config/env.js';
 import {
   createSecurityWorkerRuntime,
   type SecurityScanJobProcessor,
   type SecurityWorkerRuntime,
+  type WorkerDatabaseManagerLike,
 } from './runtime/security-worker.js';
-import { createWorkerLogger, type WorkerLogger } from './utils/logger.js';
+import { createWorkerLogger, formatSafeWorkerMessage, type WorkerLogger } from './utils/logger.js';
 
 export interface StartWorkerHostOptions<TResult = unknown> {
   rawEnv?: Record<string, string | undefined>;
   config?: WorkerConfig;
   processor?: SecurityScanJobProcessor<TResult>;
   logger?: WorkerLogger;
+  databaseManager?: WorkerDatabaseManagerLike;
 }
 
 export interface RunningWorkerHost {
@@ -21,7 +23,7 @@ export interface RunningWorkerHost {
 }
 
 /**
- * Validates worker configuration, starts the dedicated security worker runtime cleanly, and
+ * Validates worker configuration, connects MongoDB + BullMQ worker runtime cleanly, and
  * returns a deduplicated shutdown handle suitable for process signal handlers or programmatic hosts.
  */
 export async function startSecurityWorkerHost<TResult = unknown>(
@@ -37,6 +39,7 @@ export async function startSecurityWorkerHost<TResult = unknown>(
     config,
     processor: options.processor,
     logger,
+    databaseManager: options.databaseManager,
   });
 
   await runtime.start();
@@ -88,7 +91,7 @@ export async function main(): Promise<void> {
         process.exit(outcome.timedOut ? 1 : 0);
       })
       .catch((error) => {
-        console.error(`[SecurityWorker][ERROR] Shutdown failed: ${formatSafeRedisError(error)}`);
+        console.error(`[SecurityWorker][ERROR] Shutdown failed: ${formatSafeWorkerMessage(error)}`);
         process.exit(1);
       });
   };
@@ -101,7 +104,7 @@ export async function main(): Promise<void> {
   } catch (error) {
     process.removeListener('SIGINT', handleSignal);
     process.removeListener('SIGTERM', handleSignal);
-    console.error(`[SecurityWorker][ERROR] Startup aborted: ${formatSafeRedisError(error)}`);
+    console.error(`[SecurityWorker][ERROR] Startup aborted: ${formatSafeWorkerMessage(error)}`);
     process.exit(1);
   }
 }

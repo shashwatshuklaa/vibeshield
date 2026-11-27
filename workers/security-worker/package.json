@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@vibeshield/database": "workspace:*",
     "@vibeshield/env": "workspace:*",
     "@vibeshield/queue": "workspace:*",
     "@vibeshield/types": "workspace:*"

@@ -1,8 +1,13 @@
 import {
+  DatabaseConnectionManager,
+  type DatabaseConnectOptions,
+  type DatabaseConnectionState,
+  type DatabaseConnectionStatus,
+} from '@vibeshield/database';
+import {
   closeWorkerWithGrace,
   createScanJobsWorker,
   extractRedisUrlPassword,
-  formatSafeRedisError,
   QUEUE_NAMES,
   UnrecoverableError,
   validateScanQueueJobPayload,
@@ -15,7 +20,7 @@ import {
   type WorkerLifecycleState,
 } from '@vibeshield/queue';
 import type { WorkerConfig } from '../config/env.js';
-import { createWorkerLogger, type WorkerLogger } from '../utils/logger.js';
+import { createWorkerLogger, formatSafeWorkerMessage, type WorkerLogger } from '../utils/logger.js';
 
 export type SecurityScanJobProcessor<TResult = void> = (
   payload: ScanQueueJobPayload,
@@ -33,7 +38,7 @@ export class SecurityWorkerError extends Error {
   public readonly code: SecurityWorkerErrorCode;
 
   constructor(message: string, code: SecurityWorkerErrorCode, secretValues: string[] = []) {
-    super(formatSafeRedisError(message, secretValues));
+    super(formatSafeWorkerMessage(message, secretValues));
     this.name = 'SecurityWorkerError';
     this.code = code;
   }
@@ -46,18 +51,33 @@ export interface ScanJobsWorkerFactory {
   ): ManagedWorkerHandle<ScanQueueJobPayload, unknown, 'scan'>;
 }
 
+export interface WorkerDatabaseManagerLike {
+  connect(uri: string, options?: DatabaseConnectOptions): Promise<void>;
+  disconnect(): Promise<void>;
+  isConnected(): boolean;
+  getStatus(): DatabaseConnectionStatus;
+}
+
+export interface SecurityWorkerStatus extends WorkerHealthSummary {
+  database: {
+    state: DatabaseConnectionState;
+    isConnected: boolean;
+  };
+}
+
 export interface SecurityWorkerRuntimeOptions<TResult = unknown> {
   config: WorkerConfig;
   processor?: SecurityScanJobProcessor<TResult>;
   logger?: WorkerLogger;
   workerFactory?: ScanJobsWorkerFactory;
+  databaseManager?: WorkerDatabaseManagerLike;
 }
 
 export interface SecurityWorkerRuntime {
   readonly queueName: string;
   start(): Promise<void>;
   stop(): Promise<{ timedOut: boolean }>;
-  getStatus(): WorkerHealthSummary;
+  getStatus(): SecurityWorkerStatus;
   isReady(): boolean;
 }
 
@@ -138,7 +158,7 @@ export function buildValidatedScanProcessor<TResult = unknown>(
     try {
       validatedPayload = validateScanQueueJobPayload(job.data);
     } catch (validationError) {
-      const safeMessage = formatSafeRedisError(validationError, extraSecrets);
+      const safeMessage = formatSafeWorkerMessage(validationError, extraSecrets);
       throw new UnrecoverableError(`Invalid scan job payload: ${safeMessage}`);
     }
 
@@ -147,7 +167,8 @@ export function buildValidatedScanProcessor<TResult = unknown>(
 }
 
 /**
- * Creates a lifecycle-managed BullMQ worker runtime bound to `vibeshield-v1-scan-jobs`.
+ * Creates a lifecycle-managed worker runtime requiring BOTH MongoDB connectivity and a connected
+ * BullMQ Worker bound to `vibeshield-v1-scan-jobs` before reporting ready.
  */
 export function createSecurityWorkerRuntime<TResult = unknown>(
   options: SecurityWorkerRuntimeOptions<TResult>
@@ -158,6 +179,15 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
   );
   const logger = options.logger ?? createWorkerLogger(config.logLevel, secretValues);
   const workerFactory = options.workerFactory ?? createScanJobsWorker;
+  const databaseManager: WorkerDatabaseManagerLike =
+    options.databaseManager ??
+    new DatabaseConnectionManager({
+      logger: {
+        info: (msg: string) => logger.info(msg),
+        warn: (msg: string) => logger.warn(msg),
+        error: (msg: string) => logger.error(msg),
+      },
+    });
 
   let state: WorkerLifecycleState = 'not_initialized';
   let handle: ManagedWorkerHandle<ScanQueueJobPayload, unknown, 'scan'> | null = null;
@@ -205,8 +235,19 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
       );
 
       let createdHandle: ManagedWorkerHandle<ScanQueueJobPayload, unknown, 'scan'> | null = null;
+      let dbConnectedByStart = false;
 
       try {
+        await databaseManager.connect(config.mongodbUri, {
+          connectTimeoutMS: config.mongodbConnectTimeoutMs,
+          serverSelectionTimeoutMS: Math.min(config.mongodbConnectTimeoutMs, 10_000),
+        });
+        dbConnectedByStart = true;
+
+        if (!databaseManager.isConnected()) {
+          throw new Error('MongoDB connection did not reach connected readyState.');
+        }
+
         createdHandle = workerFactory(wrappedProcessor, {
           redis: {
             url: config.redisUrl,
@@ -232,11 +273,12 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
         const { worker } = createdHandle;
 
         worker.on('ready', () => {
-          if (state !== 'stopping' && state !== 'stopped') {
+          if (state !== 'stopping' && state !== 'stopped' && databaseManager.isConnected()) {
             state = 'ready';
             logger.info('Worker ready and listening for jobs.', {
               queueName: QUEUE_NAMES.SCAN_JOBS,
               concurrency: config.concurrency,
+              databaseConnected: true,
             });
           }
         });
@@ -253,7 +295,7 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
           logger.error('Job failed.', {
             ...extractSafeJobContext(job),
             unrecoverable: error instanceof UnrecoverableError,
-            error: formatSafeRedisError(error, secretValues),
+            error: formatSafeWorkerMessage(error, secretValues),
           });
         });
 
@@ -264,13 +306,17 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
         });
 
         worker.on('closed', () => {
-          if (state !== 'failed') {
+          if (state !== 'failed' && state !== 'stopping') {
             state = 'stopped';
           }
           logger.info('Worker connection closed.', { queueName: QUEUE_NAMES.SCAN_JOBS });
         });
 
         await worker.waitUntilReady();
+
+        if (!databaseManager.isConnected()) {
+          throw new Error('MongoDB connection dropped before worker became ready.');
+        }
 
         if (state === 'starting') {
           state = 'ready';
@@ -281,13 +327,16 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
         if (createdHandle) {
           await createdHandle.close(true).catch(() => undefined);
         }
+        if (dbConnectedByStart || databaseManager.isConnected()) {
+          await databaseManager.disconnect().catch(() => undefined);
+        }
 
         if (error instanceof SecurityWorkerError) {
           throw error;
         }
 
         throw new SecurityWorkerError(
-          `Failed to initialize security worker: ${formatSafeRedisError(error, secretValues)}`,
+          `Failed to initialize security worker: ${formatSafeWorkerMessage(error, secretValues)}`,
           'WORKER_STARTUP_FAILED',
           secretValues
         );
@@ -299,7 +348,7 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
         return await stopPromise;
       }
 
-      if (!handle) {
+      if (!handle && !databaseManager.isConnected()) {
         if (state !== 'failed') {
           state = 'stopped';
         }
@@ -313,35 +362,65 @@ export function createSecurityWorkerRuntime<TResult = unknown>(
       });
 
       stopPromise = (async () => {
+        let outcome = { timedOut: false };
+        let closeError: unknown = null;
+
         try {
-          const outcome = await closeWorkerWithGrace(activeHandle, config.shutdownGraceMs);
-          if (outcome.timedOut) {
-            logger.warn('Worker shutdown grace period elapsed; forced active worker closure.');
-          } else {
-            logger.info('Worker shut down cleanly.');
+          if (activeHandle) {
+            outcome = await closeWorkerWithGrace(activeHandle, config.shutdownGraceMs);
+            if (outcome.timedOut) {
+              logger.warn('Worker shutdown grace period elapsed; forced active worker closure.');
+            }
           }
-          state = 'stopped';
-          return outcome;
+        } catch (err) {
+          closeError = err;
         } finally {
           handle = null;
-          stopPromise = null;
         }
+
+        try {
+          await databaseManager.disconnect();
+        } catch (dbErr) {
+          if (!closeError) {
+            closeError = dbErr;
+          }
+        }
+
+        if (closeError) {
+          state = 'failed';
+          stopPromise = null;
+          throw new SecurityWorkerError(
+            `Worker shutdown encountered an error: ${formatSafeWorkerMessage(closeError, secretValues)}`,
+            'WORKER_STARTUP_FAILED',
+            secretValues
+          );
+        }
+
+        state = 'stopped';
+        stopPromise = null;
+        logger.info('Worker and MongoDB connections closed cleanly.');
+        return outcome;
       })();
 
       return await stopPromise;
     },
 
     isReady(): boolean {
-      return state === 'ready' && handle !== null;
+      return state === 'ready' && handle !== null && databaseManager.isConnected();
     },
 
-    getStatus(): WorkerHealthSummary {
+    getStatus(): SecurityWorkerStatus {
+      const dbStatus = databaseManager.getStatus();
       return {
         queueName: QUEUE_NAMES.SCAN_JOBS,
         state,
-        isReady: state === 'ready' && handle !== null,
+        isReady: this.isReady(),
         isRunning: handle ? handle.worker.isRunning() : false,
         concurrency: config.concurrency,
+        database: {
+          state: dbStatus.state,
+          isConnected: dbStatus.isConnected,
+        },
       };
     },
   };

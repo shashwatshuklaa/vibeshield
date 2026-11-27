@@ -15,9 +15,32 @@ import {
   loadWorkerConfig,
   SecurityWorkerError,
   type SecurityWorkerRuntime,
+  type WorkerDatabaseManagerLike,
 } from '../index.js';
 
 const REDIS_URI = process.env.REDIS_INTEGRATION_URI;
+
+function createStubDbManager(): WorkerDatabaseManagerLike {
+  let connected = false;
+  return {
+    async connect(): Promise<void> {
+      connected = true;
+    },
+    async disconnect(): Promise<void> {
+      connected = false;
+    },
+    isConnected(): boolean {
+      return connected;
+    },
+    getStatus() {
+      return {
+        state: connected ? ('connected' as const) : ('disconnected' as const),
+        readyState: connected ? 1 : 0,
+        isConnected: connected,
+      };
+    },
+  };
+}
 
 function makePayload(scanId: string, branch = 'main'): ScanQueueJobPayload {
   return validateScanQueueJobPayload({
@@ -110,6 +133,7 @@ describe.skipIf(!REDIS_URI)(
       const config = loadWorkerConfig({
         NODE_ENV: 'test',
         LOG_LEVEL: 'silent',
+        MONGODB_URI: 'mongodb://127.0.0.1:27017/vibeshield_redis_test',
         REDIS_URL: REDIS_URI!,
         WORKER_CONCURRENCY: '2',
         WORKER_LOCK_DURATION: '10000',
@@ -120,6 +144,7 @@ describe.skipIf(!REDIS_URI)(
 
       const runtime = createSecurityWorkerRuntime({
         config,
+        databaseManager: createStubDbManager(),
         processor: async (payload) => {
           processed.push(payload.scanId);
           markProcessed();
@@ -168,12 +193,14 @@ describe.skipIf(!REDIS_URI)(
       const config = loadWorkerConfig({
         NODE_ENV: 'test',
         LOG_LEVEL: 'silent',
+        MONGODB_URI: 'mongodb://127.0.0.1:27017/vibeshield_redis_test',
         REDIS_URL: REDIS_URI!,
         WORKER_CONCURRENCY: '1',
       });
 
       const runtime = createSecurityWorkerRuntime({
         config,
+        databaseManager: createStubDbManager(),
         processor: async (payload, job) => {
           attemptLog.push({ scanId: payload.scanId, attempt: job.attemptsMade + 1 });
           if (job.attemptsMade === 0) {
@@ -238,6 +265,7 @@ describe.skipIf(!REDIS_URI)(
       const config = loadWorkerConfig({
         NODE_ENV: 'test',
         LOG_LEVEL: 'silent',
+        MONGODB_URI: 'mongodb://127.0.0.1:27017/vibeshield_redis_test',
         REDIS_URL: REDIS_URI!,
         WORKER_CONCURRENCY: '1',
         WORKER_SHUTDOWN_GRACE_MS: '5000',
@@ -245,6 +273,7 @@ describe.skipIf(!REDIS_URI)(
 
       const runtime = createSecurityWorkerRuntime({
         config,
+        databaseManager: createStubDbManager(),
         processor: async () => {
           jobStarted();
           await new Promise((resolve) => setTimeout(resolve, 250));
@@ -276,6 +305,7 @@ describe.skipIf(!REDIS_URI)(
       const config = loadWorkerConfig({
         NODE_ENV: 'test',
         LOG_LEVEL: 'silent',
+        MONGODB_URI: 'mongodb://127.0.0.1:27017/vibeshield_redis_test',
         REDIS_URL: 'redis://default:TopSecretRedisPass999!@127.0.0.1:6399/0',
         REDIS_CONNECT_TIMEOUT_MS: '500',
         REDIS_MAX_RECONNECT_ATTEMPTS: '1',
@@ -283,6 +313,7 @@ describe.skipIf(!REDIS_URI)(
 
       const runtime = createSecurityWorkerRuntime({
         config,
+        databaseManager: createStubDbManager(),
         processor: async () => undefined,
       });
       runtimes.push(runtime);

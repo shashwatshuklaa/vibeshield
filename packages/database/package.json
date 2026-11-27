@@ -19,6 +19,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@vibeshield/types": "workspace:*",
     "mongoose": "^9.13.1"
   },
   "devDependencies": {
