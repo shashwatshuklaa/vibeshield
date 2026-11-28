@@ -7,6 +7,7 @@ import {
   type GitHubRepositoryConnectionService,
 } from '../github/github-connection.service.js';
 import { OrganizationPermission } from '../organizations/organization.permissions.js';
+import { createScanRouter, type ScanRouterDependencies } from '../scans/scan.routes.js';
 import { createProjectController } from './project.controller.js';
 import { createProjectService, type ProjectService } from './project.service.js';
 
@@ -15,6 +16,8 @@ export interface ProjectRouterDependencies {
   repositoryConnectionService?: GitHubRepositoryConnectionService;
   githubConfig?: GitHubRuntimeConfig | null;
   requireOrgMembership: RequestHandler;
+  scanService?: ScanRouterDependencies['scanService'];
+  scanCreateRateLimiter?: RequestHandler;
 }
 
 /**
@@ -91,6 +94,17 @@ export function createProjectRouter(dependencies: ProjectRouterDependencies): Ro
     requireOrgMembership,
     requireOrganizationPermission(OrganizationPermission.GITHUB_INTEGRATION_MANAGE),
     connectionController.disconnect
+  );
+
+  // Mount the public scan router under /:projectId/scans
+  // mergeParams: true on the scan router ensures organizationId and projectId are both available
+  router.use(
+    '/:projectId/scans',
+    createScanRouter({
+      requireOrgMembership,
+      scanService: dependencies.scanService,
+      scanCreateRateLimiter: dependencies.scanCreateRateLimiter,
+    })
   );
 
   return router;

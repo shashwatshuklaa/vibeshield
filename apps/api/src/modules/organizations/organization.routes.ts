@@ -12,6 +12,7 @@ import type { GitHubService } from '../github/github.service.js';
 import type { GitHubRepositoryConnectionService } from '../github/github-connection.service.js';
 import { createProjectRouter } from '../projects/project.routes.js';
 import type { ProjectService } from '../projects/project.service.js';
+import type { ScanService } from '../scans/scan.service.js';
 import type { GitHubRuntimeConfig } from '../../config/env.js';
 import { createOrganizationController } from './organization.controller.js';
 import { OrganizationPermission } from './organization.permissions.js';
@@ -25,6 +26,8 @@ export interface OrganizationRouterDependencies {
   githubConfig?: GitHubRuntimeConfig | null;
   authService?: Pick<AuthService, 'authenticateAccessToken'>;
   authConfig?: AuthRuntimeConfig;
+  scanService?: ScanService;
+  scanCreateRateLimiter?: import('express').RequestHandler;
 }
 
 /**
@@ -104,6 +107,8 @@ export function createOrganizationRouter(
       repositoryConnectionService: dependencies.repositoryConnectionService,
       githubConfig: dependencies.githubConfig,
       requireOrgMembership,
+      scanService: dependencies.scanService,
+      scanCreateRateLimiter: dependencies.scanCreateRateLimiter,
     })
   );
 

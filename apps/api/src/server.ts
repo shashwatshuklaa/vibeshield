@@ -20,6 +20,7 @@ import {
   toQueueConfig,
 } from './config/env.js';
 import { createInternalApp, type CreateInternalAppOptions } from './internal-app.js';
+import { createRedisScanCreationRateLimiter } from './middlewares/scan-rate-limit.js';
 import { createGitHubClient, type GitHubClient } from './modules/github/github.client.js';
 import type { InternalScanAcquisitionService } from './modules/scans/internal-acquisition.service.js';
 import type { InternalWorkerAuthMiddlewareOptions } from './modules/scans/internal-auth.js';
@@ -189,6 +190,9 @@ export async function startServer(dependencies: ServerDependencies = {}): Promis
     apiPrefix: config.API_PREFIX,
     authConfig,
     githubConfig,
+    scanCreateRateLimiter: createRedisScanCreationRateLimiter(
+      ownedRedisManager ?? fallbackDisconnectedRedisManager
+    ),
     health: {
       getQueueStatus: resolvedGetQueueStatus,
     },

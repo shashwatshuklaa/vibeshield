@@ -2447,3 +2447,56 @@ export async function recoverExpiredScanLeaseCandidate(
   }
   return await runInTransaction(execute);
 }
+
+export interface ListScansPagedInput {
+  organizationId: string;
+  projectId: string;
+  status?: ScanLifecycleStatus;
+  triggerSource?: ScanTriggerSource;
+  page: number;
+  limit: number;
+}
+
+export interface ListScansPagedResult {
+  scans: PublicScanRecord[];
+  total: number;
+}
+
+/**
+ * Returns a paginated, tenant-scoped slice of scans for a project, ordered newest-first.
+ * Uses `{ createdAt: -1, _id: -1 }` for deterministic ordering when timestamps collide.
+ * Both `status` and `triggerSource` filters are optional and independently composable.
+ * Returns an empty result (never throws) for invalid ObjectIds.
+ */
+export async function listScansPagedByProjectInOrganization(
+  input: ListScansPagedInput
+): Promise<ListScansPagedResult> {
+  if (!isValidObjectId(input.organizationId) || !isValidObjectId(input.projectId)) {
+    return { scans: [], total: 0 };
+  }
+
+  const page = Math.max(Math.trunc(input.page), 1);
+  const limit = Math.min(Math.max(Math.trunc(input.limit), 1), 100);
+  const skip = (page - 1) * limit;
+
+  const filter: Record<string, unknown> = {
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+  };
+  if (input.status) {
+    filter.status = input.status;
+  }
+  if (input.triggerSource) {
+    filter.triggerSource = input.triggerSource;
+  }
+
+  const [docs, total] = await Promise.all([
+    ScanModel.find(filter).sort({ createdAt: -1, _id: -1 }).skip(skip).limit(limit),
+    ScanModel.countDocuments(filter),
+  ]);
+
+  return {
+    scans: docs.map(toPublicScanRecord),
+    total,
+  };
+}

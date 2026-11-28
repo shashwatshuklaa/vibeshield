@@ -22,6 +22,15 @@ export const OrganizationPermission = {
   PROJECT_RESTORE: 'PROJECT_RESTORE',
   GITHUB_INTEGRATION_READ: 'GITHUB_INTEGRATION_READ',
   GITHUB_INTEGRATION_MANAGE: 'GITHUB_INTEGRATION_MANAGE',
+  /**
+   * Scan permissions — least-privilege, organization-scoped.
+   * SCAN_READ:   read scan list and details (all roles including VIEWER)
+   * SCAN_CREATE: trigger a new scan manually (OWNER, ADMIN, MEMBER only)
+   * SCAN_CANCEL: request scan cancellation (OWNER, ADMIN, MEMBER only)
+   */
+  SCAN_READ: 'SCAN_READ',
+  SCAN_CREATE: 'SCAN_CREATE',
+  SCAN_CANCEL: 'SCAN_CANCEL',
 } as const;
 
 export type OrganizationPermissionType =
@@ -96,6 +105,23 @@ export const ORGANIZATION_PERMISSION_MATRIX: Readonly<
   [OrganizationPermission.GITHUB_INTEGRATION_MANAGE]: new Set<OrganizationRole>([
     OrganizationRoleValue.OWNER,
     OrganizationRoleValue.ADMIN,
+  ]),
+  // Scan permissions — least privilege
+  [OrganizationPermission.SCAN_READ]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+    OrganizationRoleValue.MEMBER,
+    OrganizationRoleValue.VIEWER,
+  ]),
+  [OrganizationPermission.SCAN_CREATE]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+    OrganizationRoleValue.MEMBER,
+  ]),
+  [OrganizationPermission.SCAN_CANCEL]: new Set<OrganizationRole>([
+    OrganizationRoleValue.OWNER,
+    OrganizationRoleValue.ADMIN,
+    OrganizationRoleValue.MEMBER,
   ]),
 });
 

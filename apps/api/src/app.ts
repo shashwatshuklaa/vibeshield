@@ -1,4 +1,4 @@
-import express, { type Express } from 'express';
+import express, { type Express, type RequestHandler } from 'express';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import type { GitHubRuntimeConfig } from './config/env.js';
@@ -11,6 +11,7 @@ import type { GitHubWebhookService } from './modules/github/github-webhook.servi
 import type { HealthDependencies } from './modules/health/health.controller.js';
 import type { OrganizationRouterDependencies } from './modules/organizations/organization.routes.js';
 import type { ProjectService } from './modules/projects/project.service.js';
+import type { ScanService } from './modules/scans/scan.service.js';
 import { createApiRouter } from './routes/index.js';
 import { notFoundHandler } from './middlewares/not-found.js';
 import { errorHandler } from './middlewares/error-handler.js';
@@ -28,6 +29,10 @@ export interface CreateAppOptions {
   repositoryConnectionService?: GitHubRepositoryConnectionService;
   webhookService?: GitHubWebhookService;
   githubConfig?: GitHubRuntimeConfig | null;
+  /** Optional scan service override — primarily for testing. */
+  scanService?: ScanService;
+  /** Optional scan creation rate limiter middleware override. */
+  scanCreateRateLimiter?: RequestHandler;
 }
 
 /**
@@ -48,6 +53,8 @@ export function createApp(options: CreateAppOptions = {}): Express {
     repositoryConnectionService,
     webhookService,
     githubConfig,
+    scanService,
+    scanCreateRateLimiter,
   } = options;
   const app = express();
 
@@ -92,12 +99,18 @@ export function createApp(options: CreateAppOptions = {}): Express {
         ...(githubConfig !== undefined && organizations.githubConfig === undefined
           ? { githubConfig }
           : {}),
+        ...(scanService && !organizations.scanService ? { scanService } : {}),
+        ...(scanCreateRateLimiter && !organizations.scanCreateRateLimiter
+          ? { scanCreateRateLimiter }
+          : {}),
       }
     : resolvedAuthDeps ||
         projectService ||
         githubService ||
         repositoryConnectionService ||
-        githubConfig !== undefined
+        githubConfig !== undefined ||
+        scanService ||
+        scanCreateRateLimiter
       ? {
           authService: resolvedAuthDeps?.authService,
           authConfig: resolvedAuthDeps?.config,
@@ -105,6 +118,8 @@ export function createApp(options: CreateAppOptions = {}): Express {
           githubService,
           repositoryConnectionService,
           githubConfig,
+          scanService,
+          scanCreateRateLimiter,
         }
       : undefined;
 

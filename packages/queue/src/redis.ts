@@ -39,6 +39,7 @@ export interface RedisClientLike {
     ttlMs: number,
     condition: 'NX'
   ): Promise<'OK' | null>;
+  eval?(script: string, numkeys: number, ...args: (string | number)[]): Promise<unknown>;
   quit(): Promise<unknown>;
   disconnect(reconnect?: boolean): void;
   duplicate?(override?: Partial<RedisOptions>): RedisClientLike;
@@ -471,6 +472,164 @@ export async function consumeInternalAuthNonce(
     throw new InternalAuthReplayProtectionError(
       `Redis replay protection check failed: ${formatSafeRedisError(error)}`,
       'REDIS_REPLAY_STORE_ERROR'
+    );
+  }
+}
+
+const RATE_LIMIT_IDENTIFIER_REGEX = /^[A-Za-z0-9._-]{1,128}$/;
+const MAX_RATE_LIMIT_WINDOW_MS = 3_600_000;
+
+const SCAN_CREATE_RATE_LIMIT_LUA = `
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return { current, ttl }
+`;
+
+export interface ScanRateLimitDecision {
+  allowed: boolean;
+  limit: number;
+  remaining: number;
+  resetAtMs: number;
+  retryAfterSeconds: number;
+}
+
+export class ScanRateLimitBackendError extends Error {
+  public readonly code: string;
+
+  constructor(
+    message: string,
+    code = 'SCAN_RATE_LIMIT_BACKEND_UNAVAILABLE',
+    rawSecrets: string[] = []
+  ) {
+    super(formatSafeRedisError(message, rawSecrets));
+    this.name = 'ScanRateLimitBackendError';
+    this.code = code;
+  }
+}
+
+/**
+ * Constructs a canonical, fixed-namespace Redis key for per-(organization, user) scan creation rate limits.
+ */
+export function buildScanCreationRateLimitKey(organizationId: string, userId: string): string {
+  if (!RATE_LIMIT_IDENTIFIER_REGEX.test(organizationId)) {
+    throw new ScanRateLimitBackendError(
+      'Rate-limit organization identifier format is invalid.',
+      'INVALID_RATE_LIMIT_IDENTIFIER'
+    );
+  }
+  if (!RATE_LIMIT_IDENTIFIER_REGEX.test(userId)) {
+    throw new ScanRateLimitBackendError(
+      'Rate-limit user identifier format is invalid.',
+      'INVALID_RATE_LIMIT_IDENTIFIER'
+    );
+  }
+  return `${QUEUE_KEY_PREFIX}:rate-limit:scan-create:${organizationId}:${userId}`;
+}
+
+/**
+ * Atomically increments and evaluates a fixed-window scan-creation rate limit in Redis.
+ * Fails closed whenever Redis is disconnected, unavailable, lacks `EVAL`, or errors so
+ * rate limiting can never silently degrade to fail-open.
+ */
+export async function consumeScanCreationRateLimit(
+  manager: Pick<RedisConnectionManager, 'isConnected' | 'getQueueClient'>,
+  input: {
+    organizationId: string;
+    userId: string;
+    maxRequests: number;
+    windowMs: number;
+    nowMs?: number;
+  }
+): Promise<ScanRateLimitDecision> {
+  const key = buildScanCreationRateLimitKey(input.organizationId, input.userId);
+
+  if (!Number.isInteger(input.maxRequests) || input.maxRequests < 1 || input.maxRequests > 10_000) {
+    throw new ScanRateLimitBackendError(
+      'Rate-limit maxRequests must be an integer between 1 and 10000.',
+      'INVALID_RATE_LIMIT_CONFIG'
+    );
+  }
+
+  if (
+    !Number.isInteger(input.windowMs) ||
+    input.windowMs < 1_000 ||
+    input.windowMs > MAX_RATE_LIMIT_WINDOW_MS
+  ) {
+    throw new ScanRateLimitBackendError(
+      `Rate-limit windowMs must be an integer between 1000 and ${MAX_RATE_LIMIT_WINDOW_MS} ms.`,
+      'INVALID_RATE_LIMIT_CONFIG'
+    );
+  }
+
+  if (!manager.isConnected()) {
+    throw new ScanRateLimitBackendError(
+      'Redis rate-limit store is not connected.',
+      'REDIS_RATE_LIMIT_STORE_UNAVAILABLE'
+    );
+  }
+
+  let client: RedisClientLike;
+  try {
+    client = manager.getQueueClient();
+  } catch (error) {
+    throw new ScanRateLimitBackendError(
+      `Redis rate-limit store is unavailable: ${formatSafeRedisError(error)}`,
+      'REDIS_RATE_LIMIT_STORE_UNAVAILABLE'
+    );
+  }
+
+  if (typeof client.eval !== 'function') {
+    throw new ScanRateLimitBackendError(
+      'Redis client does not support atomic Lua rate-limit evaluation.',
+      'REDIS_RATE_LIMIT_STORE_UNSUPPORTED'
+    );
+  }
+
+  try {
+    const rawReply = await client.eval(SCAN_CREATE_RATE_LIMIT_LUA, 1, key, input.windowMs);
+    if (!Array.isArray(rawReply) || rawReply.length < 2) {
+      throw new ScanRateLimitBackendError(
+        'Redis rate-limit evaluation returned an invalid response.',
+        'REDIS_RATE_LIMIT_STORE_ERROR'
+      );
+    }
+
+    const current = Number(rawReply[0]);
+    const ttlMs = Number(rawReply[1]);
+    if (!Number.isFinite(current) || current < 1 || !Number.isFinite(ttlMs) || ttlMs < 0) {
+      throw new ScanRateLimitBackendError(
+        'Redis rate-limit evaluation returned non-numeric counters.',
+        'REDIS_RATE_LIMIT_STORE_ERROR'
+      );
+    }
+
+    const effectiveTtlMs = ttlMs > 0 ? ttlMs : input.windowMs;
+    const nowMs = input.nowMs ?? Date.now();
+    const allowed = current <= input.maxRequests;
+    const remaining = Math.max(0, input.maxRequests - current);
+    const retryAfterSeconds = Math.max(1, Math.ceil(effectiveTtlMs / 1000));
+
+    return {
+      allowed,
+      limit: input.maxRequests,
+      remaining,
+      resetAtMs: nowMs + effectiveTtlMs,
+      retryAfterSeconds,
+    };
+  } catch (error) {
+    if (error instanceof ScanRateLimitBackendError) {
+      throw error;
+    }
+    throw new ScanRateLimitBackendError(
+      `Redis rate-limit check failed: ${formatSafeRedisError(error)}`,
+      'REDIS_RATE_LIMIT_STORE_ERROR'
     );
   }
 }
