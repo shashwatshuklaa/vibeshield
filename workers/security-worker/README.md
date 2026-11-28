@@ -57,11 +57,18 @@ This workspace runs separately from `apps/api`, imports no Express/HTTP server c
 - Rejects redirects (`3xx`) fail-closed, validates `Content-Type` (`application/gzip` / `application/x-gzip`) and `Content-Length`, caps compressed transfers at `100 MiB` (`104857600` bytes), propagates socket/stream backpressure via `Readable`, and rejects truncated/incomplete HTTP responses or premature closes.
 - Separates timeouts (`ACQUISITION_TIMEOUT`), explicit cancellation (`ACQUISITION_CANCELLED`), and worker shutdown (`WORKER_SHUTDOWN`) cleanly without leaking lease tokens, HMAC secrets, signatures, or upstream response bodies.
 
-`extractRepositoryArchive()` consumes `AcquiredRepositoryArchive` using streaming gzip decompression (`zlib.createGunzip()`) and `tar-stream` (`allowUnknownFormat: false`) into an isolated `0700` temporary workspace:
+`extractRepositoryArchive()` consumes `AcquiredRepositoryArchive` using streaming gzip decompression (`zlib.createGunzip()`), a pre-parser 512-byte tar metadata guard (`createTarMetadataGuardTransform`), and `tar-stream` (`allowUnknownFormat: false`) into an isolated `0700` temporary workspace:
 
-- Enforces hard limits: compressed stream `<= 100 MiB`, decompressed stream `<= 512 MiB`, regular files `<= 25 MiB`, total entries `<= 25,000`, entry path length `<= 240`, entry depth `<= 24`, and PAX metadata `<= 64 KiB`.
+- Enforces hard limits: compressed stream `<= 100 MiB`, decompressed stream `<= 512 MiB`, regular files `<= 25 MiB`, total entries `<= 25,000`, entry path length `<= 240` (characters and UTF-8 bytes) and component UTF-8 bytes `<= 255`, entry depth `<= 24`, per-entry metadata `<= 64 KiB`, total extended metadata `<= 4 MiB`, extended headers `<= 25,000` (with at most 8 consecutive extended headers and 4 global PAX headers).
+- Rejects ill-formed Unicode surrogates, empty PAX `path` overrides, malformed/signed base-256 sizes (`0x81`), GNU long link paths (`K`), unsupported PAX keys, and Unicode NFD/NFC or case-insensitive path collisions after NFC canonicalization.
+- Validates workspace parent directory trust (`workerUid`-owned or `uid === 0` with sticky bit such as `/tmp`, rejecting group/world-writable non-sticky directories on both initialization and cleanup) and removes partial `mkdtemp` directories if post-creation checks fail.
 - Accepts strictly regular files and directories under a single consistent top-level root directory (stripped deterministically), extracting files exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW`, `0600`) and directories (`0700`) without preserving executable bits, ownership, ACLs, links, devices, FIFOs, or sparse files.
 - Guarantees idempotent containment-validated `cleanup()` on explicit release as well as on parser, limit, truncation, cancellation, or shutdown failure.
+
+### Extraction Threat Model & Residual Risks
+
+- Extraction executes sequentially on the worker host under the worker OS UID and does not execute repository contents.
+- Standard Node.js `fs/promises` path-based operations (`lstat`, `realpath`, `mkdir`, `open`, `rm`) cannot achieve kernel `openat2`/`RESOLVE_BENEATH` atomicity, leaving narrow TOCTOU windows if an untrusted local process shares write access to the workspace hierarchy. Production deployments must isolate workspaces on dedicated worker-owned (`0700`) non-shared storage (or OS sticky `/tmp` only in trusted single-tenant sandboxes) ahead of dedicated scanner sandboxes.
 
 ## Commands
 

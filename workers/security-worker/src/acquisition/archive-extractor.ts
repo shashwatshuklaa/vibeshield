@@ -30,12 +30,18 @@ export const DEFAULT_MAX_ARCHIVE_ENTRIES = 25_000;
 export const DEFAULT_MAX_ARCHIVE_PATH_LENGTH = 240;
 export const DEFAULT_MAX_ARCHIVE_PATH_DEPTH = 24;
 export const DEFAULT_MAX_ENTRY_METADATA_BYTES = 64 * 1024; // 64 KiB
+export const DEFAULT_MAX_TOTAL_METADATA_BYTES = 4 * 1024 * 1024; // 4 MiB across archive
+export const DEFAULT_MAX_EXTENDED_HEADERS = 25_000;
 export const DEFAULT_WORKSPACE_ROOT_DIRNAME = 'vibeshield-workspaces';
 export const WORKSPACE_DIR_PREFIX = 'vs-ws-';
 
 const WORKSPACE_DIR_MODE = 0o700;
 const WORKSPACE_FILE_MODE = 0o600;
 const ARCHIVE_STREAM_HIGH_WATER_MARK = 64 * 1024;
+const MAX_COMPONENT_UTF8_BYTES = 255;
+const MAX_CONSECUTIVE_EXTENDED_HEADERS = 8;
+const MAX_GLOBAL_PAX_HEADERS = 4;
+const TAR_BLOCK_BYTES = 512;
 
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHAR_REGEX = /[\u0000-\u001f\u007f]/;
@@ -44,6 +50,19 @@ const WINDOWS_DRIVE_REGEX = /^[A-Za-z]:/;
 const ALLOWED_PAX_KEYS = new Set([
   'path',
   'size',
+  'mtime',
+  'atime',
+  'ctime',
+  'comment',
+  'uid',
+  'gid',
+  'uname',
+  'gname',
+  'hdrcharset',
+  'charset',
+]);
+
+const ALLOWED_GLOBAL_PAX_KEYS = new Set([
   'mtime',
   'atime',
   'ctime',
@@ -77,6 +96,22 @@ export type ArchiveExtractionErrorCode =
   | 'WORKSPACE_CLEANUP_FAILED'
   | 'EXTRACTION_CANCELLED'
   | 'WORKER_SHUTDOWN';
+
+function isWellFormedUnicode(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = i + 1 < value.length ? value.charCodeAt(i + 1) : 0;
+      if (next < 0xdc00 || next > 0xdfff) {
+        return false;
+      }
+      i += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function redactHostPaths(
   message: string,
@@ -127,6 +162,8 @@ export interface ArchiveExtractionLimits {
   readonly maxPathLength: number;
   readonly maxPathDepth: number;
   readonly maxEntryMetadataBytes: number;
+  readonly maxTotalMetadataBytes: number;
+  readonly maxExtendedHeaders: number;
 }
 
 export interface ExtractionMetadata {
@@ -154,6 +191,14 @@ export interface ExtractedWorkspaceHandle {
   cleanup(): Promise<WorkspaceCleanupResult>;
 }
 
+export interface WorkspaceFsOps {
+  mkdtemp?: typeof mkdtemp;
+  chmod?: typeof chmod;
+  lstat?: typeof lstat;
+  realpath?: typeof realpath;
+  rm?: typeof rm;
+}
+
 export interface ExtractRepositoryArchiveInput {
   archive: Pick<AcquiredRepositoryArchive, 'scanId' | 'stream' | 'maxArchiveBytes' | 'abort'>;
   workspaceParentDir?: string;
@@ -161,6 +206,7 @@ export interface ExtractRepositoryArchiveInput {
   shutdownSignal?: AbortSignal;
   limits?: Partial<ArchiveExtractionLimits>;
   logger?: WorkerLogger;
+  workspaceFsOps?: WorkspaceFsOps;
 }
 
 function validateLimitBound(value: number, maxHardBound: number, name: string): number {
@@ -222,6 +268,16 @@ export function resolveArchiveExtractionLimits(
     DEFAULT_MAX_ENTRY_METADATA_BYTES,
     'maxEntryMetadataBytes'
   );
+  const maxTotalMetadataBytes = validateLimitBound(
+    overrides.maxTotalMetadataBytes ?? DEFAULT_MAX_TOTAL_METADATA_BYTES,
+    DEFAULT_MAX_TOTAL_METADATA_BYTES,
+    'maxTotalMetadataBytes'
+  );
+  const maxExtendedHeaders = validateLimitBound(
+    overrides.maxExtendedHeaders ?? DEFAULT_MAX_EXTENDED_HEADERS,
+    DEFAULT_MAX_EXTENDED_HEADERS,
+    'maxExtendedHeaders'
+  );
 
   return Object.freeze({
     maxCompressedBytes,
@@ -231,6 +287,8 @@ export function resolveArchiveExtractionLimits(
     maxPathLength,
     maxPathDepth,
     maxEntryMetadataBytes,
+    maxTotalMetadataBytes,
+    maxExtendedHeaders,
   });
 }
 
@@ -263,8 +321,54 @@ function validateWorkspaceParentPathInput(rawParentDir?: string): string {
   return resolved;
 }
 
-async function ensureTrustedWorkspaceParentDir(rawParentDir?: string): Promise<string> {
+function validateTrustedWorkspaceParentStat(
+  parentStat: Awaited<ReturnType<typeof lstat>>,
+  resolvedPath: string
+): void {
+  if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    throw new ArchiveExtractionError(
+      'WORKSPACE_CONTAINMENT_ERROR',
+      'Configured workspace parent path must be a non-symlink directory.',
+      [resolvedPath]
+    );
+  }
+
+  if (typeof process.getuid === 'function') {
+    const workerUid = process.getuid();
+    const modeBits = Number(parentStat.mode) & 0o7777;
+    const parentUid = Number(parentStat.uid);
+    const hasGroupWrite = (modeBits & 0o020) !== 0;
+    const hasOtherWrite = (modeBits & 0o002) !== 0;
+    const hasStickyBit = (modeBits & 0o1000) !== 0;
+
+    const isOwnedByWorker = parentUid === workerUid;
+    const isRootOwnedSticky = parentUid === 0 && hasStickyBit;
+
+    if (!isOwnedByWorker && !isRootOwnedSticky) {
+      throw new ArchiveExtractionError(
+        'WORKSPACE_CONTAINMENT_ERROR',
+        'Configured workspace parent directory ownership check failed.',
+        [resolvedPath]
+      );
+    }
+
+    if ((hasGroupWrite || hasOtherWrite) && !hasStickyBit) {
+      throw new ArchiveExtractionError(
+        'WORKSPACE_CONTAINMENT_ERROR',
+        'Configured workspace parent directory has unsafe group or world writable permissions.',
+        [resolvedPath]
+      );
+    }
+  }
+}
+
+async function ensureTrustedWorkspaceParentDir(
+  rawParentDir?: string,
+  fsOps?: WorkspaceFsOps
+): Promise<string> {
   const resolved = validateWorkspaceParentPathInput(rawParentDir);
+  const lstatFn = fsOps?.lstat ?? lstat;
+  const realpathFn = fsOps?.realpath ?? realpath;
 
   try {
     await mkdir(resolved, { recursive: true, mode: WORKSPACE_DIR_MODE });
@@ -278,7 +382,7 @@ async function ensureTrustedWorkspaceParentDir(rawParentDir?: string): Promise<s
 
   let parentStat;
   try {
-    parentStat = await lstat(resolved);
+    parentStat = await lstatFn(resolved);
   } catch {
     throw new ArchiveExtractionError(
       'WORKSPACE_ERROR',
@@ -287,24 +391,10 @@ async function ensureTrustedWorkspaceParentDir(rawParentDir?: string): Promise<s
     );
   }
 
-  if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
-    throw new ArchiveExtractionError(
-      'WORKSPACE_CONTAINMENT_ERROR',
-      'Configured workspace parent path must be a non-symlink directory.',
-      [resolved]
-    );
-  }
-
-  if (typeof process.getuid === 'function' && parentStat.uid !== process.getuid()) {
-    throw new ArchiveExtractionError(
-      'WORKSPACE_CONTAINMENT_ERROR',
-      'Configured workspace parent directory ownership check failed.',
-      [resolved]
-    );
-  }
+  validateTrustedWorkspaceParentStat(parentStat, resolved);
 
   try {
-    return await realpath(resolved);
+    return await realpathFn(resolved);
   } catch {
     throw new ArchiveExtractionError(
       'WORKSPACE_ERROR',
@@ -361,21 +451,19 @@ function assertWorkspaceContainment(
  */
 export async function cleanupWorkspaceDirectory(
   workspacePath: string,
-  workspaceParentDir: string
+  workspaceParentDir: string,
+  fsOps: Pick<WorkspaceFsOps, 'lstat' | 'realpath' | 'rm'> = {}
 ): Promise<WorkspaceCleanupResult> {
+  const lstatFn = fsOps.lstat ?? lstat;
+  const realpathFn = fsOps.realpath ?? realpath;
+  const rmFn = fsOps.rm ?? rm;
   const resolvedParentInput = validateWorkspaceParentPathInput(workspaceParentDir);
 
   let parentRealpath: string;
   try {
-    const parentStat = await lstat(resolvedParentInput);
-    if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
-      throw new ArchiveExtractionError(
-        'WORKSPACE_CONTAINMENT_ERROR',
-        'Workspace parent path is no longer a valid directory.',
-        [resolvedParentInput, workspacePath]
-      );
-    }
-    parentRealpath = await realpath(resolvedParentInput);
+    const parentStat = await lstatFn(resolvedParentInput);
+    validateTrustedWorkspaceParentStat(parentStat, resolvedParentInput);
+    parentRealpath = await realpathFn(resolvedParentInput);
   } catch (err) {
     if (err instanceof ArchiveExtractionError) {
       throw err;
@@ -392,7 +480,7 @@ export async function cleanupWorkspaceDirectory(
 
   let wsStat;
   try {
-    wsStat = await lstat(workspacePath);
+    wsStat = await lstatFn(workspacePath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
       return { cleaned: true, alreadyCleaned: true };
@@ -422,7 +510,7 @@ export async function cleanupWorkspaceDirectory(
 
   let workspaceRealpath: string;
   try {
-    workspaceRealpath = await realpath(workspacePath);
+    workspaceRealpath = await realpathFn(workspacePath);
   } catch {
     throw new ArchiveExtractionError(
       'WORKSPACE_CLEANUP_FAILED',
@@ -434,7 +522,7 @@ export async function cleanupWorkspaceDirectory(
   assertWorkspaceContainment(parentRealpath, workspaceRealpath, path.basename(workspaceRealpath));
 
   try {
-    await rm(workspaceRealpath, { recursive: true, force: false });
+    await rmFn(workspaceRealpath, { recursive: true, force: false });
     return { cleaned: true, alreadyCleaned: false };
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
@@ -534,6 +622,13 @@ function validateEntryHeaderMetadata(
       }
     }
 
+    if (typeof paxRecord.path === 'string' && paxRecord.path.length === 0) {
+      throw new ArchiveExtractionError(
+        'INVALID_ARCHIVE_PATH',
+        'Archive PAX path override must not be empty.'
+      );
+    }
+
     if (paxRecord.size !== undefined) {
       if (typeof paxRecord.size !== 'string' || !/^\d+$/.test(paxRecord.size)) {
         throw new ArchiveExtractionError(
@@ -566,6 +661,13 @@ function validateLexicalArchivePath(
 ): ParsedArchivePath {
   if (typeof rawName !== 'string' || rawName.length === 0) {
     throw new ArchiveExtractionError('INVALID_ARCHIVE_PATH', 'Archive entry path is empty.');
+  }
+
+  if (!isWellFormedUnicode(rawName)) {
+    throw new ArchiveExtractionError(
+      'INVALID_ARCHIVE_PATH',
+      'Archive entry path contains ill-formed Unicode surrogates.'
+    );
   }
 
   if (CONTROL_CHAR_REGEX.test(rawName)) {
@@ -617,23 +719,25 @@ function validateLexicalArchivePath(
     throw new ArchiveExtractionError('INVALID_ARCHIVE_PATH', 'Archive entry path is empty.');
   }
 
-  if (trimmed.length > limits.maxPathLength) {
-    throw new ArchiveExtractionError(
-      'INVALID_ARCHIVE_PATH',
-      'Archive entry path exceeds maximum allowed path length.'
-    );
-  }
-
-  const segments = trimmed.split('/');
-  if (segments.length > limits.maxPathDepth) {
+  const rawSegments = trimmed.split('/');
+  if (rawSegments.length > limits.maxPathDepth) {
     throw new ArchiveExtractionError(
       'INVALID_ARCHIVE_PATH',
       'Archive entry path exceeds maximum allowed directory depth.'
     );
   }
 
-  for (const segment of segments) {
-    if (segment.length === 0 || segment === '.' || segment === '..') {
+  const canonicalSegments: string[] = [];
+  for (const rawSegment of rawSegments) {
+    const segment = rawSegment.normalize('NFC');
+    if (
+      segment.length === 0 ||
+      segment === '.' ||
+      segment === '..' ||
+      segment.includes('/') ||
+      segment.includes('\\') ||
+      CONTROL_CHAR_REGEX.test(segment)
+    ) {
       throw new ArchiveExtractionError(
         'INVALID_ARCHIVE_PATH',
         'Archive entry path contains invalid dot or traversal segments.'
@@ -645,11 +749,29 @@ function validateLexicalArchivePath(
         'Archive entry path contains invalid drive-like segment.'
       );
     }
+    if (Buffer.byteLength(segment, 'utf8') > MAX_COMPONENT_UTF8_BYTES) {
+      throw new ArchiveExtractionError(
+        'INVALID_ARCHIVE_PATH',
+        'Archive entry path segment exceeds maximum allowed UTF-8 byte length.'
+      );
+    }
+    canonicalSegments.push(segment);
+  }
+
+  const canonicalNormalized = canonicalSegments.join('/');
+  if (
+    canonicalNormalized.length > limits.maxPathLength ||
+    Buffer.byteLength(canonicalNormalized, 'utf8') > limits.maxPathLength
+  ) {
+    throw new ArchiveExtractionError(
+      'INVALID_ARCHIVE_PATH',
+      'Archive entry path exceeds maximum allowed path length.'
+    );
   }
 
   return {
-    rawNormalized: trimmed,
-    segments,
+    rawNormalized: canonicalNormalized,
+    segments: canonicalSegments,
   };
 }
 
@@ -877,10 +999,507 @@ function classifyStreamError(
   );
 }
 
+function isAllZeroTarBlock(block: Buffer): boolean {
+  for (let i = 0; i < block.length; i += 1) {
+    if (block[i] !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function computeTarChecksum(block: Buffer): number {
+  let sum = 8 * 32;
+  for (let i = 0; i < 148; i += 1) {
+    sum += block[i] ?? 0;
+  }
+  for (let j = 156; j < TAR_BLOCK_BYTES; j += 1) {
+    sum += block[j] ?? 0;
+  }
+  return sum;
+}
+
+function decodeStrictTarOctal(
+  block: Buffer,
+  offset: number,
+  length: number,
+  pathsToRedact: readonly string[],
+  errorCode: ArchiveExtractionErrorCode = 'MALFORMED_ARCHIVE'
+): number {
+  const slice = block.subarray(offset, offset + length);
+  let start = 0;
+  while (start < slice.length && (slice[start] === 0 || slice[start] === 0x20)) {
+    start += 1;
+  }
+  let end = slice.length;
+  while (end > start && (slice[end - 1] === 0 || slice[end - 1] === 0x20)) {
+    end -= 1;
+  }
+  if (start === end) {
+    return 0;
+  }
+  const str = slice.subarray(start, end).toString('ascii');
+  if (!/^[0-7]+$/.test(str)) {
+    throw new ArchiveExtractionError(
+      errorCode,
+      'Archive tar header contains invalid octal numeric field.',
+      pathsToRedact
+    );
+  }
+  const value = Number.parseInt(str, 8);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new ArchiveExtractionError(
+      errorCode,
+      'Archive tar header numeric field overflowed.',
+      pathsToRedact
+    );
+  }
+  return value;
+}
+
+function decodeStrictTarSize(block: Buffer, pathsToRedact: readonly string[]): number {
+  const firstByte = block[124] ?? 0;
+  if ((firstByte & 0x80) !== 0) {
+    // GNU/PAX base-256 size must have MSB=1 and bit6=0 (positive); signed/negative encodings like 0x81 are malformed.
+    if (firstByte !== 0x80) {
+      throw new ArchiveExtractionError(
+        'MALFORMED_ARCHIVE',
+        'Archive tar header contains invalid base-256 size encoding.',
+        pathsToRedact
+      );
+    }
+    let size = 0n;
+    for (let i = 125; i < 136; i += 1) {
+      size = (size << 8n) | BigInt(block[i] ?? 0);
+    }
+    if (size > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new ArchiveExtractionError(
+        'MALFORMED_ARCHIVE',
+        'Archive tar entry size exceeds safe integer range.',
+        pathsToRedact
+      );
+    }
+    return Number(size);
+  }
+  return decodeStrictTarOctal(block, 124, 12, pathsToRedact);
+}
+
+function isValidUstarOrGnuMagic(block: Buffer): boolean {
+  const magic = block.subarray(257, 263).toString('latin1');
+  if (magic === 'ustar\0') {
+    return true;
+  }
+  if (magic === 'ustar ') {
+    return block[263] === 0x20 && block[264] === 0x00;
+  }
+  return false;
+}
+
+function roundUpToTarBlock(byteLength: number): number {
+  const remainder = byteLength % TAR_BLOCK_BYTES;
+  return remainder === 0 ? byteLength : byteLength + (TAR_BLOCK_BYTES - remainder);
+}
+
+function validateAndParsePaxPayload(
+  payload: Buffer,
+  isGlobalHeader: boolean,
+  pathsToRedact: readonly string[]
+): { pendingPaxSize: number | null } {
+  let offset = 0;
+  let pendingPaxSize: number | null = null;
+  const allowedKeys = isGlobalHeader ? ALLOWED_GLOBAL_PAX_KEYS : ALLOWED_PAX_KEYS;
+
+  while (offset < payload.length) {
+    const spaceIndex = payload.indexOf(0x20, offset);
+    if (spaceIndex <= offset) {
+      throw new ArchiveExtractionError(
+        'MALFORMED_ARCHIVE',
+        'Archive PAX extended header contains malformed record length.',
+        pathsToRedact
+      );
+    }
+    const lengthToken = payload.subarray(offset, spaceIndex).toString('ascii');
+    if (!/^\d+$/.test(lengthToken)) {
+      throw new ArchiveExtractionError(
+        'MALFORMED_ARCHIVE',
+        'Archive PAX extended header record length must be decimal.',
+        pathsToRedact
+      );
+    }
+    const recordLength = Number.parseInt(lengthToken, 10);
+    if (
+      !Number.isSafeInteger(recordLength) ||
+      recordLength < 5 ||
+      offset + recordLength > payload.length
+    ) {
+      throw new ArchiveExtractionError(
+        'MALFORMED_ARCHIVE',
+        'Archive PAX extended header record length is out of bounds.',
+        pathsToRedact
+      );
+    }
+    const recordEnd = offset + recordLength;
+    if (payload[recordEnd - 1] !== 0x0a) {
+      throw new ArchiveExtractionError(
+        'MALFORMED_ARCHIVE',
+        'Archive PAX extended header record is missing newline terminator.',
+        pathsToRedact
+      );
+    }
+
+    const eqIndex = payload.indexOf(0x3d, spaceIndex + 1);
+    if (eqIndex <= spaceIndex + 1 || eqIndex >= recordEnd) {
+      throw new ArchiveExtractionError(
+        'MALFORMED_ARCHIVE',
+        'Archive PAX extended header record is missing key-value separator.',
+        pathsToRedact
+      );
+    }
+
+    const key = payload.subarray(spaceIndex + 1, eqIndex).toString('utf8');
+    const value = payload.subarray(eqIndex + 1, recordEnd - 1).toString('utf8');
+    if (!isWellFormedUnicode(key) || !isWellFormedUnicode(value)) {
+      throw new ArchiveExtractionError(
+        'MALFORMED_ARCHIVE',
+        'Archive PAX extended header contains ill-formed UTF-8 metadata.',
+        pathsToRedact
+      );
+    }
+
+    if (!isGlobalHeader && key === 'linkpath') {
+      throw new ArchiveExtractionError(
+        'UNSUPPORTED_ENTRY_TYPE',
+        'Archive PAX linkpath metadata is forbidden.',
+        pathsToRedact
+      );
+    }
+
+    if (!allowedKeys.has(key)) {
+      throw new ArchiveExtractionError(
+        'UNSUPPORTED_ARCHIVE_METADATA',
+        'Archive contains unsupported PAX extension metadata.',
+        pathsToRedact
+      );
+    }
+
+    if (!isGlobalHeader && key === 'path' && value.length === 0) {
+      throw new ArchiveExtractionError(
+        'INVALID_ARCHIVE_PATH',
+        'Archive PAX path override must not be empty.',
+        pathsToRedact
+      );
+    }
+
+    if (!isGlobalHeader && key === 'size') {
+      if (!/^\d+$/.test(value)) {
+        throw new ArchiveExtractionError(
+          'MALFORMED_ARCHIVE',
+          'Archive PAX size metadata is malformed.',
+          pathsToRedact
+        );
+      }
+      const parsedSize = Number(value);
+      if (!Number.isSafeInteger(parsedSize)) {
+        throw new ArchiveExtractionError(
+          'MALFORMED_ARCHIVE',
+          'Archive PAX size metadata is out of range.',
+          pathsToRedact
+        );
+      }
+      pendingPaxSize = parsedSize;
+    }
+
+    offset = recordEnd;
+  }
+
+  return { pendingPaxSize };
+}
+
+/**
+ * Pre-parser streaming tar guard positioned immediately before `tar-stream`.
+ *
+ * Enforces bounded extended metadata memory and header counts (`x`, `g`, `L`, `N`, `K`) before
+ * `tar-stream` allocates internal extended-header buffers (`4 MiB` per header in tar-stream 3.3.0),
+ * and validates malformed base-256 sizes (`0x81`), PAX records, and empty PAX path overrides cleanly.
+ */
+function createTarMetadataGuardTransform(
+  limits: ArchiveExtractionLimits,
+  pathsToRedact: readonly string[],
+  recordFailure: (err: unknown) => Error
+): Transform {
+  type GuardState = 'HEADER' | 'EXTENDED_DATA' | 'PAYLOAD_SKIP';
+
+  let state: GuardState = 'HEADER';
+  let headerRemainder: Buffer = Buffer.alloc(0);
+
+  let extendedHeaderBuffer: Buffer = Buffer.alloc(0);
+  let extendedHeaderChunks: Buffer[] = [];
+  let extendedDataBytesReceived = 0;
+  let extendedDataTotalBytes = 0;
+  let extendedDataPayloadBytes = 0;
+  let extendedTypeflag = 0;
+
+  let payloadBytesRemaining = 0;
+  let pendingPaxSize: number | null = null;
+  let totalMetadataBytes = 0;
+  let extendedHeaderCount = 0;
+  let consecutiveExtendedHeaders = 0;
+  let globalPaxHeaderCount = 0;
+
+  const processHeaderBlock = (block: Buffer, outChunks: Buffer[]) => {
+    if (isAllZeroTarBlock(block)) {
+      outChunks.push(block);
+      return;
+    }
+
+    const expectedChecksum = computeTarChecksum(block);
+    const actualChecksum = decodeStrictTarOctal(
+      block,
+      148,
+      8,
+      pathsToRedact,
+      'INVALID_ARCHIVE_FORMAT'
+    );
+    if (expectedChecksum !== actualChecksum) {
+      throw new ArchiveExtractionError(
+        'INVALID_ARCHIVE_FORMAT',
+        'Archive tar header checksum validation failed.',
+        pathsToRedact
+      );
+    }
+
+    if (!isValidUstarOrGnuMagic(block)) {
+      throw new ArchiveExtractionError(
+        'INVALID_ARCHIVE_FORMAT',
+        'Archive tar header uses an unsupported or unknown format.',
+        pathsToRedact
+      );
+    }
+
+    const rawTypeByte = block[156] ?? 0;
+    const typeflag = rawTypeByte === 0 ? 0 : rawTypeByte - 48;
+    const ustarSize = decodeStrictTarSize(block, pathsToRedact);
+
+    // Reject GNU long link path (`'K'`) before tar-stream parses it.
+    if (typeflag === 27) {
+      throw new ArchiveExtractionError(
+        'UNSUPPORTED_ENTRY_TYPE',
+        'Archive contains unsupported GNU long link path entry.',
+        pathsToRedact
+      );
+    }
+
+    if (typeflag === 72 || typeflag === 55 || typeflag === 28 || typeflag === 30) {
+      consecutiveExtendedHeaders += 1;
+      if (consecutiveExtendedHeaders > MAX_CONSECUTIVE_EXTENDED_HEADERS) {
+        throw new ArchiveExtractionError(
+          'EXCESSIVE_ARCHIVE_METADATA',
+          'Archive contains too many consecutive extended metadata headers.',
+          pathsToRedact
+        );
+      }
+
+      extendedHeaderCount += 1;
+      if (extendedHeaderCount > limits.maxExtendedHeaders) {
+        throw new ArchiveExtractionError(
+          'EXCESSIVE_ARCHIVE_METADATA',
+          'Archive extended header count exceeds maximum allowed limit.',
+          pathsToRedact
+        );
+      }
+
+      if (typeflag === 55) {
+        globalPaxHeaderCount += 1;
+        if (globalPaxHeaderCount > MAX_GLOBAL_PAX_HEADERS) {
+          throw new ArchiveExtractionError(
+            'EXCESSIVE_ARCHIVE_METADATA',
+            'Archive contains too many global PAX metadata headers.',
+            pathsToRedact
+          );
+        }
+      }
+
+      if (ustarSize > limits.maxEntryMetadataBytes) {
+        throw new ArchiveExtractionError(
+          'EXCESSIVE_ARCHIVE_METADATA',
+          'Archive extended metadata header exceeds maximum per-entry metadata size.',
+          pathsToRedact
+        );
+      }
+
+      totalMetadataBytes += ustarSize;
+      if (totalMetadataBytes > limits.maxTotalMetadataBytes) {
+        throw new ArchiveExtractionError(
+          'EXCESSIVE_ARCHIVE_METADATA',
+          'Archive total extended metadata exceeds maximum allowed metadata budget.',
+          pathsToRedact
+        );
+      }
+
+      extendedTypeflag = typeflag;
+      extendedHeaderBuffer = block;
+      extendedHeaderChunks = [];
+      extendedDataPayloadBytes = ustarSize;
+      extendedDataTotalBytes = roundUpToTarBlock(ustarSize);
+      extendedDataBytesReceived = 0;
+
+      if (extendedDataTotalBytes === 0) {
+        if (typeflag === 28 || typeflag === 30) {
+          throw new ArchiveExtractionError(
+            'MALFORMED_ARCHIVE',
+            'Archive GNU long path header has zero payload bytes.',
+            pathsToRedact
+          );
+        }
+        outChunks.push(extendedHeaderBuffer);
+        state = 'HEADER';
+      } else {
+        state = 'EXTENDED_DATA';
+      }
+      return;
+    }
+
+    consecutiveExtendedHeaders = 0;
+    const effectiveSize = pendingPaxSize ?? ustarSize;
+    pendingPaxSize = null;
+    if (effectiveSize > limits.maxDecompressedBytes) {
+      throw new ArchiveExtractionError(
+        'DECOMPRESSED_SIZE_EXCEEDED',
+        'Archive entry size exceeds maximum allowed decompressed archive size.',
+        pathsToRedact
+      );
+    }
+
+    outChunks.push(block);
+    const alignedPayloadBytes = roundUpToTarBlock(effectiveSize);
+    if (alignedPayloadBytes > 0) {
+      payloadBytesRemaining = alignedPayloadBytes;
+      state = 'PAYLOAD_SKIP';
+    }
+  };
+
+  const finalizeExtendedData = (outChunks: Buffer[]) => {
+    const combined =
+      extendedHeaderChunks.length === 1
+        ? (extendedHeaderChunks[0] ?? Buffer.alloc(0))
+        : Buffer.concat(extendedHeaderChunks, extendedDataTotalBytes);
+    const payload = combined.subarray(0, extendedDataPayloadBytes);
+
+    if (extendedTypeflag === 72 || extendedTypeflag === 55) {
+      const { pendingPaxSize: parsedPaxSize } = validateAndParsePaxPayload(
+        payload,
+        extendedTypeflag === 55,
+        pathsToRedact
+      );
+      if (extendedTypeflag === 72 && parsedPaxSize !== null) {
+        pendingPaxSize = parsedPaxSize;
+      }
+    } else if (extendedTypeflag === 28 || extendedTypeflag === 30) {
+      let end = payload.length;
+      while (end > 0 && payload[end - 1] === 0) {
+        end -= 1;
+      }
+      const longPath = payload.subarray(0, end).toString('utf8');
+      if (longPath.length === 0 || !isWellFormedUnicode(longPath)) {
+        throw new ArchiveExtractionError(
+          'INVALID_ARCHIVE_PATH',
+          'Archive GNU long path metadata is empty or ill-formed.',
+          pathsToRedact
+        );
+      }
+    }
+
+    outChunks.push(extendedHeaderBuffer, combined);
+    extendedHeaderBuffer = Buffer.alloc(0);
+    extendedHeaderChunks = [];
+    extendedDataBytesReceived = 0;
+    extendedDataTotalBytes = 0;
+    extendedDataPayloadBytes = 0;
+    state = 'HEADER';
+  };
+
+  return new Transform({
+    highWaterMark: ARCHIVE_STREAM_HIGH_WATER_MARK,
+    transform(chunk, _encoding, callback) {
+      try {
+        const input = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const combined =
+          headerRemainder.length > 0 ? Buffer.concat([headerRemainder, input]) : input;
+        headerRemainder = Buffer.alloc(0);
+
+        let offset = 0;
+        const outChunks: Buffer[] = [];
+
+        while (offset < combined.length) {
+          if (state === 'PAYLOAD_SKIP') {
+            const take = Math.min(payloadBytesRemaining, combined.length - offset);
+            outChunks.push(combined.subarray(offset, offset + take));
+            offset += take;
+            payloadBytesRemaining -= take;
+            if (payloadBytesRemaining === 0) {
+              state = 'HEADER';
+            }
+            continue;
+          }
+
+          if (state === 'EXTENDED_DATA') {
+            const needed = extendedDataTotalBytes - extendedDataBytesReceived;
+            const take = Math.min(needed, combined.length - offset);
+            const slice = Buffer.from(combined.subarray(offset, offset + take));
+            extendedHeaderChunks.push(slice);
+            extendedDataBytesReceived += take;
+            offset += take;
+            if (extendedDataBytesReceived === extendedDataTotalBytes) {
+              finalizeExtendedData(outChunks);
+            }
+            continue;
+          }
+
+          const available = combined.length - offset;
+          if (available < TAR_BLOCK_BYTES) {
+            headerRemainder = Buffer.from(combined.subarray(offset));
+            break;
+          }
+
+          const headerBlock = Buffer.from(combined.subarray(offset, offset + TAR_BLOCK_BYTES));
+          offset += TAR_BLOCK_BYTES;
+          processHeaderBlock(headerBlock, outChunks);
+        }
+
+        if (outChunks.length > 0) {
+          this.push(outChunks.length === 1 ? outChunks[0] : Buffer.concat(outChunks));
+        }
+        callback();
+      } catch (err) {
+        callback(recordFailure(err));
+      }
+    },
+    flush(callback) {
+      if (state !== 'HEADER' || headerRemainder.length > 0) {
+        callback(
+          recordFailure(
+            new ArchiveExtractionError(
+              'MALFORMED_ARCHIVE',
+              'Archive tar stream ended unexpectedly mid-header or mid-entry.',
+              pathsToRedact
+            )
+          )
+        );
+        return;
+      }
+      callback();
+    },
+  });
+}
+
 /**
  * Consumes a bounded repository `.tar.gz` acquisition stream, enforces streaming size/path/entry/type
  * defenses, extracts validated files sequentially into a newly created `0700` isolated workspace with
  * `0600` non-executable regular files, and guarantees workspace cleanup on any error or cancellation.
+ *
+ * Security boundary: assumes the host OS kernel, worker UID, and dedicated workspace parent
+ * directory are not shared with untrusted local actors (Node.js `fs/promises` path operations carry
+ * inherent TOCTOU windows between symlink/containment verification and subsequent filesystem calls).
  */
 export async function extractRepositoryArchive(
   input: ExtractRepositoryArchiveInput
@@ -902,18 +1521,29 @@ export async function extractRepositoryArchive(
     );
   }
 
-  const trustedParentRealpath = await ensureTrustedWorkspaceParentDir(input.workspaceParentDir);
+  const mkdtempFn = input.workspaceFsOps?.mkdtemp ?? mkdtemp;
+  const chmodFn = input.workspaceFsOps?.chmod ?? chmod;
+  const lstatFn = input.workspaceFsOps?.lstat ?? lstat;
+  const realpathFn = input.workspaceFsOps?.realpath ?? realpath;
+  const rmFn = input.workspaceFsOps?.rm ?? rm;
+
+  const trustedParentRealpath = await ensureTrustedWorkspaceParentDir(
+    input.workspaceParentDir,
+    input.workspaceFsOps
+  );
   const scanPrefix = sanitizeScanIdForPrefix(input.archive.scanId);
   const randomSuffix = randomUUID().slice(0, 12);
 
+  let createdWorkspacePath: string | null = null;
   let workspacePath: string;
   let workspaceRealpath: string;
   try {
-    workspacePath = await mkdtemp(
+    workspacePath = await mkdtempFn(
       path.join(trustedParentRealpath, `${WORKSPACE_DIR_PREFIX}${scanPrefix}-${randomSuffix}-`)
     );
-    await chmod(workspacePath, WORKSPACE_DIR_MODE);
-    const createdStat = await lstat(workspacePath);
+    createdWorkspacePath = workspacePath;
+    await chmodFn(workspacePath, WORKSPACE_DIR_MODE);
+    const createdStat = await lstatFn(workspacePath);
     if (createdStat.isSymbolicLink() || !createdStat.isDirectory()) {
       throw new ArchiveExtractionError(
         'WORKSPACE_CONTAINMENT_ERROR',
@@ -921,13 +1551,27 @@ export async function extractRepositoryArchive(
         [trustedParentRealpath, workspacePath]
       );
     }
-    workspaceRealpath = await realpath(workspacePath);
+    workspaceRealpath = await realpathFn(workspacePath);
     assertWorkspaceContainment(
       trustedParentRealpath,
       workspaceRealpath,
       path.basename(workspaceRealpath)
     );
   } catch (err) {
+    if (createdWorkspacePath !== null) {
+      try {
+        await rmFn(createdWorkspacePath, { recursive: true, force: true });
+      } catch (cleanupErr) {
+        logger.warn(
+          formatSafeWorkerMessage(
+            `Failed to remove partially initialized workspace directory: ${redactHostPaths(
+              cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+              [trustedParentRealpath, createdWorkspacePath]
+            )}`
+          )
+        );
+      }
+    }
     if (err instanceof ArchiveExtractionError) {
       throw err;
     }
@@ -1043,6 +1687,8 @@ export async function extractRepositoryArchive(
     },
   });
 
+  const tarMetadataGuard = createTarMetadataGuardTransform(limits, pathsToRedact, recordFailure);
+
   // `allowUnknownFormat` defaults to false in tar-stream so only USTAR/GNU tar headers are accepted.
   const tarExtract = createTarExtract();
 
@@ -1059,6 +1705,9 @@ export async function extractRepositoryArchive(
     if (!decompressedLimiter.destroyed) {
       decompressedLimiter.destroy(err);
     }
+    if (!tarMetadataGuard.destroyed) {
+      tarMetadataGuard.destroy(err);
+    }
     if (!tarExtract.destroyed) {
       tarExtract.destroy(err);
     }
@@ -1068,6 +1717,9 @@ export async function extractRepositoryArchive(
     recordFailure(err);
   };
   const onGunzipError = (err: unknown) => {
+    recordFailure(err);
+  };
+  const onGuardError = (err: unknown) => {
     recordFailure(err);
   };
   const onTarError = (err: unknown) => {
@@ -1101,6 +1753,7 @@ export async function extractRepositoryArchive(
 
   sourceStream.on('error', onSourceError);
   gunzipStream.on('error', onGunzipError);
+  tarMetadataGuard.on('error', onGuardError);
   tarExtract.on('error', onTarError);
   input.signal?.addEventListener('abort', onCancelled, { once: true });
   input.shutdownSignal?.addEventListener('abort', onShutdown, { once: true });
@@ -1357,7 +2010,14 @@ export async function extractRepositoryArchive(
   });
 
   try {
-    await pipeline(sourceStream, compressedLimiter, gunzipStream, decompressedLimiter, tarExtract);
+    await pipeline(
+      sourceStream,
+      compressedLimiter,
+      gunzipStream,
+      decompressedLimiter,
+      tarMetadataGuard,
+      tarExtract
+    );
     await activeEntryPromise;
 
     if (firstFailure) {
@@ -1411,6 +2071,7 @@ export async function extractRepositoryArchive(
     input.shutdownSignal?.removeEventListener('abort', onShutdown);
     sourceStream.off('error', onSourceError);
     gunzipStream.off('error', onGunzipError);
+    tarMetadataGuard.off('error', onGuardError);
     tarExtract.off('error', onTarError);
   }
 }

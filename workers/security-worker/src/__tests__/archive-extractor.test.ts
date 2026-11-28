@@ -1,6 +1,16 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
@@ -16,7 +26,10 @@ import {
   DEFAULT_MAX_ARCHIVE_PATH_LENGTH,
   DEFAULT_MAX_COMPRESSED_ARCHIVE_BYTES,
   DEFAULT_MAX_DECOMPRESSED_ARCHIVE_BYTES,
+  DEFAULT_MAX_ENTRY_METADATA_BYTES,
+  DEFAULT_MAX_EXTENDED_HEADERS,
   DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_MAX_TOTAL_METADATA_BYTES,
   extractRepositoryArchive,
   loadWorkerConfig,
   resolveArchiveExtractionLimits,
@@ -219,7 +232,9 @@ describe('Defensive Repository Archive Extraction & Workspace Isolation', () => 
         maxEntries: DEFAULT_MAX_ARCHIVE_ENTRIES,
         maxPathLength: DEFAULT_MAX_ARCHIVE_PATH_LENGTH,
         maxPathDepth: DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
-        maxEntryMetadataBytes: 64 * 1024,
+        maxEntryMetadataBytes: DEFAULT_MAX_ENTRY_METADATA_BYTES,
+        maxTotalMetadataBytes: DEFAULT_MAX_TOTAL_METADATA_BYTES,
+        maxExtendedHeaders: DEFAULT_MAX_EXTENDED_HEADERS,
       });
 
       expect(() =>
@@ -231,6 +246,14 @@ describe('Defensive Repository Archive Extraction & Workspace Isolation', () => 
       expect(() => resolveArchiveExtractionLimits({ maxPathDepth: 25 })).toThrowError(
         ArchiveExtractionError
       );
+      expect(() =>
+        resolveArchiveExtractionLimits({
+          maxTotalMetadataBytes: DEFAULT_MAX_TOTAL_METADATA_BYTES + 1,
+        })
+      ).toThrowError(ArchiveExtractionError);
+      expect(() =>
+        resolveArchiveExtractionLimits({ maxExtendedHeaders: DEFAULT_MAX_EXTENDED_HEADERS + 1 })
+      ).toThrowError(ArchiveExtractionError);
 
       const cfg = loadWorkerConfig({
         NODE_ENV: 'test',
@@ -945,6 +968,363 @@ describe('Defensive Repository Archive Extraction & Workspace Isolation', () => 
       ).rejects.toMatchObject({
         code: expect.stringMatching(/^(EXTRACTION_CANCELLED|ACQUISITION_CANCELLED)$/),
       });
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+  });
+
+  describe('Audit hardening regression tests (Task 1.7.3.4.2)', () => {
+    function buildPaxRecord(key: string, value: string): Buffer {
+      const suffix = Buffer.from(` ${key}=${value}\n`, 'utf8');
+      let totalLength = suffix.byteLength + 1;
+      while (Buffer.byteLength(String(totalLength), 'ascii') + suffix.byteLength !== totalLength) {
+        totalLength = Buffer.byteLength(String(totalLength), 'ascii') + suffix.byteLength;
+      }
+      return Buffer.concat([Buffer.from(String(totalLength), 'ascii'), suffix]);
+    }
+
+    it('M1: rejects oversized PAX extended headers (> 64 KiB) before tar-stream buffering', async () => {
+      const parentDir = await createIsolatedTestParent();
+      // Exceeds 64 KiB cap (70 KiB) while staying well below tar-stream internal 4 MiB cap
+      const hugePaxPayload = buildPaxRecord('comment', 'a'.repeat(70 * 1024));
+      const archiveBytes = buildRawUstarTarGz([
+        {
+          name: 'PaxHeader/repo/file.txt',
+          typeflag: 0x78, // 'x'
+          payload: hugePaxPayload,
+        },
+        {
+          name: 'repo/file.txt',
+          typeflag: 0x30,
+          payload: Buffer.from('ok\n', 'utf8'),
+        },
+      ]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(archiveBytes),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'EXCESSIVE_ARCHIVE_METADATA' });
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+
+    it('M1: rejects oversized GNU long paths (L > 64 KiB) and GNU long link paths (K)', async () => {
+      const parentDir = await createIsolatedTestParent();
+      const hugeLongPathPayload = Buffer.from(`repo/${'a'.repeat(70 * 1024)}\0`, 'utf8');
+      const longPathTgz = buildRawUstarTarGz([
+        {
+          name: '././@LongLink',
+          typeflag: 0x4c, // 'L'
+          payload: hugeLongPathPayload,
+        },
+        {
+          name: 'repo/ignored',
+          typeflag: 0x30,
+          payload: Buffer.from('x', 'utf8'),
+        },
+      ]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(longPathTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'EXCESSIVE_ARCHIVE_METADATA' });
+
+      const gnuLongLinkTgz = buildRawUstarTarGz([
+        {
+          name: '././@LongLink',
+          typeflag: 0x4b, // 'K'
+          payload: Buffer.from('target\0', 'utf8'),
+        },
+        {
+          name: 'repo/ignored',
+          typeflag: 0x32,
+        },
+      ]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(gnuLongLinkTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'UNSUPPORTED_ENTRY_TYPE' });
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+
+    it('M1: enforces total extended metadata budget, consecutive header cap, and global PAX cap while accepting legitimate GitHub PAX metadata', async () => {
+      const parentDir = await createIsolatedTestParent();
+
+      // Exceeding maxTotalMetadataBytes across multiple entries
+      const paxComment = 'x'.repeat(350);
+      const multiMetaTgz = await packTarGz([
+        { name: 'repo-sha/a.ts', content: '1', pax: { comment: paxComment } },
+        { name: 'repo-sha/b.ts', content: '2', pax: { comment: paxComment } },
+        { name: 'repo-sha/c.ts', content: '3', pax: { comment: paxComment } },
+        { name: 'repo-sha/d.ts', content: '4', pax: { comment: paxComment } },
+      ]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(multiMetaTgz),
+          workspaceParentDir: parentDir,
+          limits: {
+            maxTotalMetadataBytes: 1024,
+            maxEntryMetadataBytes: 512,
+          },
+        })
+      ).rejects.toMatchObject({ code: 'EXCESSIVE_ARCHIVE_METADATA' });
+
+      // Exceeding maxExtendedHeaders count
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(multiMetaTgz),
+          workspaceParentDir: parentDir,
+          limits: {
+            maxExtendedHeaders: 2,
+          },
+        })
+      ).rejects.toMatchObject({ code: 'EXCESSIVE_ARCHIVE_METADATA' });
+
+      // Exceeding MAX_CONSECUTIVE_EXTENDED_HEADERS (9 consecutive 'x' blocks)
+      const nineConsecutive = Array.from({ length: 9 }, (_, i) => ({
+        name: `PaxHeader/${i}`,
+        typeflag: 0x78,
+        payload: buildPaxRecord('comment', 'step'),
+      }));
+      const consecutiveTgz = buildRawUstarTarGz([
+        ...nineConsecutive,
+        { name: 'repo/ok.txt', typeflag: 0x30, payload: Buffer.from('hi', 'utf8') },
+      ]);
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(consecutiveTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'EXCESSIVE_ARCHIVE_METADATA' });
+
+      // Exceeding MAX_GLOBAL_PAX_HEADERS (5 global 'g' blocks)
+      const fiveGlobal = Array.from({ length: 5 }, (_, i) => ({
+        name: `PaxGlobal/${i}`,
+        typeflag: 0x67, // 'g'
+        payload: buildPaxRecord('comment', 'deadbeef'),
+      }));
+      const globalSpamTgz = buildRawUstarTarGz([
+        ...fiveGlobal,
+        { name: 'repo/ok.txt', typeflag: 0x30, payload: Buffer.from('hi', 'utf8') },
+      ]);
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(globalSpamTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'EXCESSIVE_ARCHIVE_METADATA' });
+
+      // Legitimate GitHub archive with pax-global-header comment=<sha> and per-entry pax path succeeds
+      const githubStyleTgz = buildRawUstarTarGz([
+        {
+          name: 'pax_global_header',
+          typeflag: 0x67,
+          payload: buildPaxRecord('comment', '0123456789abcdef0123456789abcdef01234567'),
+        },
+        {
+          name: 'PaxHeader/repo-0123456/src/app.ts',
+          typeflag: 0x78,
+          payload: buildPaxRecord('path', 'repo-0123456/src/app.ts'),
+        },
+        {
+          name: 'repo-0123456/src/app.ts',
+          typeflag: 0x30,
+          payload: Buffer.from('export const ok = true;\n', 'utf8'),
+        },
+      ]);
+      const validHandle = await extractRepositoryArchive({
+        archive: makeFakeAcquiredArchive(githubStyleTgz),
+        workspaceParentDir: parentDir,
+      });
+      expect(await readFile(path.join(validHandle.workspacePath, 'src', 'app.ts'), 'utf8')).toBe(
+        'export const ok = true;\n'
+      );
+      await validHandle.cleanup();
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+
+    it('M1: rejects malformed 0x81 negative base-256 sizes cleanly', async () => {
+      const parentDir = await createIsolatedTestParent();
+      const badSizeBytes = Buffer.alloc(12, 0);
+      badSizeBytes[0] = 0x81;
+      const tgz = buildRawUstarTarGz([
+        {
+          name: 'repo/file.txt',
+          typeflag: 0x30,
+          rawSizeBytes: badSizeBytes,
+        },
+      ]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(tgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'MALFORMED_ARCHIVE' });
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+
+    it('M2 & L1: canonicalizes NFD/NFC paths for collision detection and extraction, and enforces UTF-8 byte path length limits', async () => {
+      const parentDir = await createIsolatedTestParent();
+
+      // NFD vs NFC collision must be rejected regardless of Unicode normalization form
+      const collisionTgz = await packTarGz([
+        { name: 'repo/caf\u0065\u0301.txt', content: 'nfd' },
+        { name: 'repo/caf\u00e9.txt', content: 'nfc' },
+      ]);
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(collisionTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'ARCHIVE_PATH_COLLISION' });
+
+      // Single NFD entry extracts using NFC canonical path
+      const nfdOnlyTgz = await packTarGz([
+        { name: 'repo/caf\u0065\u0301.txt', content: 'normalized' },
+      ]);
+      const ws = await extractRepositoryArchive({
+        archive: makeFakeAcquiredArchive(nfdOnlyTgz),
+        workspaceParentDir: parentDir,
+      });
+      expect(await readFile(path.join(ws.workspacePath, 'caf\u00e9.txt'), 'utf8')).toBe(
+        'normalized'
+      );
+      await ws.cleanup();
+
+      // UTF-8 byte length check (> 240 UTF-8 bytes even when UTF-16 length is <= 90)
+      const multiByteLongTgz = await packTarGz([
+        { name: `repo/${'€'.repeat(85)}.txt`, content: 'utf8' },
+      ]);
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(multiByteLongTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_ARCHIVE_PATH' });
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+
+    it('L2: rejects empty PAX path overrides instead of falling back to USTAR header name', async () => {
+      const parentDir = await createIsolatedTestParent();
+      const emptyPaxPathTgz = buildRawUstarTarGz([
+        {
+          name: 'PaxHeader/repo/fallback.txt',
+          typeflag: 0x78,
+          payload: buildPaxRecord('path', ''),
+        },
+        {
+          name: 'repo/fallback.txt',
+          typeflag: 0x30,
+          payload: Buffer.from('should-not-extract', 'utf8'),
+        },
+      ]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(emptyPaxPathTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_ARCHIVE_PATH' });
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+
+    it('M3: rejects unsafe group/world-writable non-sticky and untrusted-owner parent directories during both extraction and cleanup', async () => {
+      const parentDir = await createIsolatedTestParent();
+      const worldWritableNonSticky = path.join(parentDir, 'world-writable');
+      await mkdir(worldWritableNonSticky, { mode: 0o777 });
+      await chmod(worldWritableNonSticky, 0o777);
+
+      const validTgz = await packTarGz([{ name: 'repo/a.txt', content: 'ok' }]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(validTgz),
+          workspaceParentDir: worldWritableNonSticky,
+        })
+      ).rejects.toMatchObject({ code: 'WORKSPACE_CONTAINMENT_ERROR' });
+
+      const dummyChild = path.join(worldWritableNonSticky, 'vs-ws-scan-123');
+      await mkdir(dummyChild, { mode: 0o700 });
+      await expect(
+        cleanupWorkspaceDirectory(dummyChild, worldWritableNonSticky)
+      ).rejects.toMatchObject({ code: 'WORKSPACE_CONTAINMENT_ERROR' });
+
+      // Restore safe permissions so afterEach cleanup removes it cleanly
+      await chmod(worldWritableNonSticky, 0o700);
+
+      // Simulate untrusted non-worker/non-root UID and non-sticky root via workspaceFsOps
+      const trustedDir = await createIsolatedTestParent();
+      const currentUid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+      const untrustedOwnerStat = Object.assign(await lstat(trustedDir), {
+        uid: currentUid + 1,
+        mode: 0o040700,
+      });
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(validTgz),
+          workspaceParentDir: trustedDir,
+          workspaceFsOps: {
+            lstat: async () => untrustedOwnerStat,
+          },
+        })
+      ).rejects.toMatchObject({ code: 'WORKSPACE_CONTAINMENT_ERROR' });
+
+      const nonStickyRootStat = Object.assign(await lstat(trustedDir), {
+        uid: 0,
+        mode: 0o040755,
+      });
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(validTgz),
+          workspaceParentDir: trustedDir,
+          workspaceFsOps: {
+            lstat: async () => nonStickyRootStat,
+          },
+        })
+      ).rejects.toMatchObject({ code: 'WORKSPACE_CONTAINMENT_ERROR' });
+
+      // Root-owned sticky dir (uid=0, 01777 like /tmp) is trusted
+      const stickyRootStat = Object.assign(await lstat(trustedDir), {
+        uid: 0,
+        mode: 0o041777,
+      });
+      const wsRootParent = await extractRepositoryArchive({
+        archive: makeFakeAcquiredArchive(validTgz),
+        workspaceParentDir: trustedDir,
+        workspaceFsOps: {
+          lstat: async (targetPath) =>
+            path.resolve(targetPath) === path.resolve(trustedDir)
+              ? stickyRootStat
+              : await lstat(targetPath),
+        },
+      });
+      await wsRootParent.cleanup();
+    });
+
+    it('L3: removes partially initialized mkdtemp workspace directory when post-creation checks fail', async () => {
+      const parentDir = await createIsolatedTestParent();
+      const validTgz = await packTarGz([{ name: 'repo/a.txt', content: 'ok' }]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(validTgz),
+          workspaceParentDir: parentDir,
+          workspaceFsOps: {
+            chmod: async () => {
+              throw new Error('simulated chmod failure');
+            },
+          },
+        })
+      ).rejects.toMatchObject({ code: 'WORKSPACE_ERROR' });
+
       expect(await readdir(parentDir)).toEqual([]);
     });
   });
