@@ -1328,4 +1328,396 @@ describe('Defensive Repository Archive Extraction & Workspace Isolation', () => 
       expect(await readdir(parentDir)).toEqual([]);
     });
   });
+
+  describe('Audit hardening regression tests (Task 1.7.3.4.4)', () => {
+    function makeTarHeaderBlock(name: string, typeflag: number, size: number): Buffer {
+      const hdr = Buffer.alloc(512, 0);
+      hdr.write(name, 0, Math.min(Buffer.byteLength(name), 100), 'utf8');
+      hdr.write('0000644 ', 100, 8, 'ascii');
+      hdr.write('0000000 ', 108, 8, 'ascii');
+      hdr.write('0000000 ', 116, 8, 'ascii');
+      hdr.write(`${size.toString(8).padStart(11, '0')} `, 124, 12, 'ascii');
+      hdr.write('00000000000 ', 136, 12, 'ascii');
+      hdr.fill(0x20, 148, 156);
+      hdr[156] = typeflag;
+      hdr.write('ustar\0', 257, 6, 'ascii');
+      hdr.write('00', 263, 2, 'ascii');
+      let sum = 0;
+      for (let i = 0; i < 512; i += 1) {
+        sum += hdr[i]!;
+      }
+      hdr.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'ascii');
+      return hdr;
+    }
+
+    function padTarBlock(buf: Buffer): Buffer {
+      const rem = buf.byteLength % 512;
+      return rem === 0 ? buf : Buffer.concat([buf, Buffer.alloc(512 - rem, 0)]);
+    }
+
+    function buildPaxLine(key: string, value: string): Buffer {
+      const suffix = Buffer.from(` ${key}=${value}\n`, 'utf8');
+      let len = suffix.byteLength + 1;
+      while (Buffer.byteLength(String(len), 'ascii') + suffix.byteLength !== len) {
+        len = Buffer.byteLength(String(len), 'ascii') + suffix.byteLength;
+      }
+      return Buffer.concat([Buffer.from(String(len), 'ascii'), suffix]);
+    }
+
+    it('H1: prevents consecutive PAX x header desynchronization attack from blinding the metadata guard', async () => {
+      const parentDir = await createIsolatedTestParent();
+
+      // Exact audit bypass sequence:
+      // 1) x #1 sets size=4815872
+      // 2) x #2 sets harmless comment without size (tar-stream replaces _pax cleanly)
+      // 3) regular file repo/trigger.txt has ustarSize=0
+      // 4) smuggled 10 global PAX 'g' headers + 10 'x' headers + 90 entries (~4.5 MiB PAX)
+      const p1 = buildPaxLine('size', '4815872');
+      const p2 = buildPaxLine('comment', 'wipe');
+      const gRec = buildPaxLine('comment', 'deadbeef');
+      const bigComment = buildPaxLine('comment', 'Z'.repeat(50 * 1024));
+
+      const smuggledParts: Buffer[] = [];
+      for (let i = 0; i < 10; i += 1) {
+        smuggledParts.push(
+          makeTarHeaderBlock(`PaxGlobal/${i}`, 0x67, gRec.byteLength),
+          padTarBlock(gRec)
+        );
+      }
+      for (let i = 0; i < 10; i += 1) {
+        smuggledParts.push(makeTarHeaderBlock(`Pax/${i}`, 0x78, p2.byteLength), padTarBlock(p2));
+      }
+      for (let i = 0; i < 90; i += 1) {
+        smuggledParts.push(
+          makeTarHeaderBlock(`PaxHeader/repo/f${i}.txt`, 0x78, bigComment.byteLength),
+          padTarBlock(bigComment),
+          makeTarHeaderBlock(`repo/f${i}.txt`, 0x30, 1),
+          padTarBlock(Buffer.from('x', 'utf8'))
+        );
+      }
+
+      const attackTar = Buffer.concat([
+        makeTarHeaderBlock('PaxHeader/repo/trigger.txt', 0x78, p1.byteLength),
+        padTarBlock(p1),
+        makeTarHeaderBlock('PaxHeader/repo/trigger.txt', 0x78, p2.byteLength),
+        padTarBlock(p2),
+        makeTarHeaderBlock('repo/trigger.txt', 0x30, 0),
+        ...smuggledParts,
+        Buffer.alloc(1024, 0),
+      ]);
+
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(zlib.gzipSync(attackTar)),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'EXCESSIVE_ARCHIVE_METADATA' });
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+
+    it('H1: enforces PAX x state transitions (zero-length x, overriding valid size, malformed second size, valid override alignment, and L/N interleaving)', async () => {
+      const parentDir = await createIsolatedTestParent();
+
+      // 1. x #1 sets size -> x #2 has zero-length payload -> fails closed cleanly
+      const p512 = buildPaxLine('size', '512');
+      const zeroLengthSecondXTgz = zlib.gzipSync(
+        Buffer.concat([
+          makeTarHeaderBlock('PaxHeader/repo/a.txt', 0x78, p512.byteLength),
+          padTarBlock(p512),
+          makeTarHeaderBlock('PaxHeader/repo/a.txt', 0x78, 0),
+          makeTarBlock('repo/a.txt', 0),
+          Buffer.alloc(1024, 0),
+        ])
+      );
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(zeroLengthSecondXTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'MALFORMED_ARCHIVE' });
+      expect(await readdir(parentDir)).toEqual([]);
+
+      // 2. x #1 sets size=512 -> x #2 sets different valid size=12 -> second entry aligns cleanly
+      const p12 = buildPaxLine('size', '12');
+      const overrideSizeTgz = zlib.gzipSync(
+        Buffer.concat([
+          makeTarHeaderBlock('PaxHeader/repo/first.txt', 0x78, p512.byteLength),
+          padTarBlock(p512),
+          makeTarHeaderBlock('PaxHeader/repo/first.txt', 0x78, p12.byteLength),
+          padTarBlock(p12),
+          makeTarHeaderBlock('repo/first.txt', 0x30, 0),
+          padTarBlock(Buffer.from('hello-world!', 'utf8')),
+          makeTarHeaderBlock('repo/second.txt', 0x30, 4),
+          padTarBlock(Buffer.from('next', 'utf8')),
+          Buffer.alloc(1024, 0),
+        ])
+      );
+      const wsOverride = await extractRepositoryArchive({
+        archive: makeFakeAcquiredArchive(overrideSizeTgz),
+        workspaceParentDir: parentDir,
+      });
+      expect(await readFile(path.join(wsOverride.workspacePath, 'first.txt'), 'utf8')).toBe(
+        'hello-world!'
+      );
+      expect(await readFile(path.join(wsOverride.workspacePath, 'second.txt'), 'utf8')).toBe(
+        'next'
+      );
+      await wsOverride.cleanup();
+
+      // 3. x #1 sets size=512 -> x #2 sets malformed size=5bad -> fails closed
+      const pBad = buildPaxLine('size', '5bad');
+      const malformedSecondSizeTgz = zlib.gzipSync(
+        Buffer.concat([
+          makeTarHeaderBlock('PaxHeader/repo/a.txt', 0x78, p512.byteLength),
+          padTarBlock(p512),
+          makeTarHeaderBlock('PaxHeader/repo/a.txt', 0x78, pBad.byteLength),
+          padTarBlock(pBad),
+          makeTarHeaderBlock('repo/a.txt', 0x30, 0),
+          Buffer.alloc(1024, 0),
+        ])
+      );
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(malformedSecondSizeTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'MALFORMED_ARCHIVE' });
+
+      // 4. GNU 'L'/'N' preserves pending PAX size in tar-stream; interleaved x -> L -> entry & x1 -> L -> x2 -> entry align cleanly
+      const longNameBuf = Buffer.from('repo/interleaved-long-entry-name.txt\0', 'utf8');
+      const p7 = buildPaxLine('size', '7');
+      const interleavedValidTgz = zlib.gzipSync(
+        Buffer.concat([
+          makeTarHeaderBlock('PaxHeader/repo/placeholder', 0x78, p7.byteLength),
+          padTarBlock(p7),
+          makeTarHeaderBlock('././@LongLink', 0x4c, longNameBuf.byteLength),
+          padTarBlock(longNameBuf),
+          makeTarHeaderBlock('repo/placeholder', 0x30, 0),
+          padTarBlock(Buffer.from('payload', 'utf8')),
+          makeTarHeaderBlock('repo/after-interleave.txt', 0x30, 2),
+          padTarBlock(Buffer.from('ok', 'utf8')),
+          Buffer.alloc(1024, 0),
+        ])
+      );
+      const wsInterleaved = await extractRepositoryArchive({
+        archive: makeFakeAcquiredArchive(interleavedValidTgz),
+        workspaceParentDir: parentDir,
+      });
+      expect(
+        await readFile(
+          path.join(wsInterleaved.workspacePath, 'interleaved-long-entry-name.txt'),
+          'utf8'
+        )
+      ).toBe('payload');
+      expect(
+        await readFile(path.join(wsInterleaved.workspacePath, 'after-interleave.txt'), 'utf8')
+      ).toBe('ok');
+      await wsInterleaved.cleanup();
+
+      // x1(size=655360) -> L -> x2(comment) must reset pendingPaxSize and catch smuggled global PAX spam
+      const wipeComment = buildPaxLine('comment', 'wipe');
+      const gRec = buildPaxLine('comment', 'spam');
+      const interleavedBypassTgz = zlib.gzipSync(
+        Buffer.concat([
+          makeTarHeaderBlock('PaxHeader/repo/t.txt', 0x78, p512.byteLength),
+          padTarBlock(p512),
+          makeTarHeaderBlock('././@LongLink', 0x4c, longNameBuf.byteLength),
+          padTarBlock(longNameBuf),
+          makeTarHeaderBlock('PaxHeader/repo/t.txt', 0x78, wipeComment.byteLength),
+          padTarBlock(wipeComment),
+          makeTarHeaderBlock('repo/t.txt', 0x30, 0),
+          ...Array.from({ length: 6 }, (_, i) =>
+            Buffer.concat([
+              makeTarHeaderBlock(`PaxGlobal/${i}`, 0x67, gRec.byteLength),
+              padTarBlock(gRec),
+            ])
+          ),
+          makeTarHeaderBlock('repo/end.txt', 0x30, 1),
+          padTarBlock(Buffer.from('a', 'utf8')),
+          Buffer.alloc(1024, 0),
+        ])
+      );
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(interleavedBypassTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'EXCESSIVE_ARCHIVE_METADATA' });
+      expect(await readdir(parentDir)).toEqual([]);
+
+      function makeTarBlock(name: string, size: number): Buffer {
+        return makeTarHeaderBlock(name, 0x30, size);
+      }
+    });
+
+    it('L-new-1: rejects leading-NUL GNU L and N payloads while preserving valid GNU long paths', async () => {
+      const parentDir = await createIsolatedTestParent();
+
+      for (const typeflag of [0x4c, 0x4e]) {
+        const leadingNulTgz = buildRawUstarTarGz([
+          {
+            name: '././@LongLink',
+            typeflag,
+            payload: Buffer.from('\0ignored\0', 'utf8'),
+          },
+          {
+            name: 'repo/fallback.txt',
+            typeflag: 0x30,
+            payload: Buffer.from('should-not-extract', 'utf8'),
+          },
+        ]);
+
+        await expect(
+          extractRepositoryArchive({
+            archive: makeFakeAcquiredArchive(leadingNulTgz),
+            workspaceParentDir: parentDir,
+          })
+        ).rejects.toMatchObject({ code: 'INVALID_ARCHIVE_PATH' });
+      }
+
+      // Valid GNU L without trailing NUL inside declared payload length + with trailing NUL both work
+      const validNoNul = Buffer.from(`repo/${'d'.repeat(110)}/a.txt`, 'utf8');
+      const validWithNul = Buffer.from(`repo/${'e'.repeat(110)}/b.txt\0`, 'utf8');
+      const validGnuLTgz = buildRawUstarTarGz([
+        { name: '././@LongLink', typeflag: 0x4c, payload: validNoNul },
+        { name: 'repo/truncated', typeflag: 0x30, payload: Buffer.from('one', 'utf8') },
+        { name: '././@LongLink', typeflag: 0x4c, payload: validWithNul },
+        { name: 'repo/truncated', typeflag: 0x30, payload: Buffer.from('two', 'utf8') },
+      ]);
+      const ws = await extractRepositoryArchive({
+        archive: makeFakeAcquiredArchive(validGnuLTgz),
+        workspaceParentDir: parentDir,
+      });
+      expect(await readFile(path.join(ws.workspacePath, 'd'.repeat(110), 'a.txt'), 'utf8')).toBe(
+        'one'
+      );
+      expect(await readFile(path.join(ws.workspacePath, 'e'.repeat(110), 'b.txt'), 'utf8')).toBe(
+        'two'
+      );
+      await ws.cleanup();
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+
+    it('rejects truncated extended headers, malformed PAX records, invalid tar checksums, nested NFD/NFC collisions, and enforces limits across concatenated gzip members', async () => {
+      const parentDir = await createIsolatedTestParent();
+
+      // 1. Truncated extended-header payload (declares 600 bytes, only 512 bytes provided)
+      const truncExtPayloadTgz = zlib.gzipSync(
+        Buffer.concat([
+          makeTarHeaderBlock('PaxHeader/repo/a.txt', 0x78, 600),
+          Buffer.alloc(512, 0x20),
+        ])
+      );
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(truncExtPayloadTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'MALFORMED_ARCHIVE' });
+
+      // 2. Truncated extended-header 512-byte padding (declares 10 valid bytes, provides only 200 total bytes)
+      const tenBytePax = buildPaxLine('size', '5');
+      expect(tenBytePax.byteLength).toBeLessThan(20);
+      const truncPaddingTgz = zlib.gzipSync(
+        Buffer.concat([
+          makeTarHeaderBlock('PaxHeader/repo/a.txt', 0x78, tenBytePax.byteLength),
+          tenBytePax,
+          Buffer.alloc(200 - tenBytePax.byteLength, 0),
+        ])
+      );
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(truncPaddingTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'MALFORMED_ARCHIVE' });
+
+      // 3. Malformed PAX record lengths and syntax
+      const badPaxPayloads = [
+        Buffer.from('0 a=b\n', 'utf8'),
+        Buffer.from('3 x\n', 'utf8'),
+        Buffer.from('99999999999999999999 a=b\n', 'utf8'),
+        Buffer.from('99 comment=abc\n', 'utf8'),
+        Buffer.from('7 abcd\n', 'utf8'),
+        Buffer.from('14 comment=abc', 'utf8'), // missing newline / truncated
+        Buffer.from('14 comment=abX', 'utf8'), // missing trailing newline
+      ];
+      for (const badPayload of badPaxPayloads) {
+        const badPaxTgz = buildRawUstarTarGz([
+          { name: 'PaxHeader/repo/a.txt', typeflag: 0x78, payload: badPayload },
+          { name: 'repo/a.txt', typeflag: 0x30, payload: Buffer.from('ok', 'utf8') },
+        ]);
+        await expect(
+          extractRepositoryArchive({
+            archive: makeFakeAcquiredArchive(badPaxTgz),
+            workspaceParentDir: parentDir,
+          })
+        ).rejects.toMatchObject({ code: 'MALFORMED_ARCHIVE' });
+      }
+
+      // 4. Invalid tar header checksum (valid USTAR header with single flipped byte)
+      const corruptedHdr = makeTarHeaderBlock('repo/a.txt', 0x30, 0);
+      corruptedHdr[0] = 'X'.charCodeAt(0); // breaks checksum while keeping valid USTAR magic
+      const badChecksumTgz = zlib.gzipSync(Buffer.concat([corruptedHdr, Buffer.alloc(1024, 0)]));
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(badChecksumTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_ARCHIVE_FORMAT' });
+
+      // 5. Nested directory Unicode NFC/NFD collisions (directory and file levels)
+      const nestedDirCollisionTgz = await packTarGz([
+        { name: 'repo/src/caf\u0065\u0301/nested/a.ts', content: '1' },
+        { name: 'repo/src/caf\u00e9/Nested/b.ts', content: '2' },
+      ]);
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(nestedDirCollisionTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'ARCHIVE_PATH_COLLISION' });
+
+      const nestedDirFileConflictTgz = await packTarGz([
+        { name: 'repo/src/caf\u0065\u0301', type: 'directory' },
+        { name: 'repo/src/caf\u00e9', type: 'file', content: 'conflict' },
+      ]);
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(nestedDirFileConflictTgz),
+          workspaceParentDir: parentDir,
+        })
+      ).rejects.toMatchObject({ code: 'FILE_DIRECTORY_CONFLICT' });
+
+      // 6. Concatenated gzip members: valid concatenation succeeds AND limits still apply across members
+      const member1Tar = Buffer.concat([
+        makeTarHeaderBlock('repo/part1.txt', 0x30, 5),
+        padTarBlock(Buffer.from('part1', 'utf8')),
+      ]);
+      const member2Tar = Buffer.concat([
+        makeTarHeaderBlock('repo/part2.txt', 0x30, 5),
+        padTarBlock(Buffer.from('part2', 'utf8')),
+        Buffer.alloc(1024, 0),
+      ]);
+      const concatValidTgz = Buffer.concat([zlib.gzipSync(member1Tar), zlib.gzipSync(member2Tar)]);
+      const wsConcat = await extractRepositoryArchive({
+        archive: makeFakeAcquiredArchive(concatValidTgz),
+        workspaceParentDir: parentDir,
+      });
+      expect(await readFile(path.join(wsConcat.workspacePath, 'part1.txt'), 'utf8')).toBe('part1');
+      expect(await readFile(path.join(wsConcat.workspacePath, 'part2.txt'), 'utf8')).toBe('part2');
+      await wsConcat.cleanup();
+
+      // Entry limit enforced across concatenated gzip members
+      await expect(
+        extractRepositoryArchive({
+          archive: makeFakeAcquiredArchive(concatValidTgz),
+          workspaceParentDir: parentDir,
+          limits: { maxEntries: 1 },
+        })
+      ).rejects.toMatchObject({ code: 'ENTRY_COUNT_EXCEEDED' });
+
+      expect(await readdir(parentDir)).toEqual([]);
+    });
+  });
 });

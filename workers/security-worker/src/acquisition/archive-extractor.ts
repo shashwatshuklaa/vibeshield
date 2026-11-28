@@ -1290,6 +1290,12 @@ function createTarMetadataGuardTransform(
     }
 
     if (typeflag === 72 || typeflag === 55 || typeflag === 28 || typeflag === 30) {
+      // tar-stream@3.3.0 replaces `this._pax` whenever a new PAX `'x'` header (72) arrives.
+      // Reset `pendingPaxSize` immediately so prior `x` sizes never leak across consecutive `'x'` headers.
+      if (typeflag === 72) {
+        pendingPaxSize = null;
+      }
+
       consecutiveExtendedHeaders += 1;
       if (consecutiveExtendedHeaders > MAX_CONSECUTIVE_EXTENDED_HEADERS) {
         throw new ArchiveExtractionError(
@@ -1351,11 +1357,15 @@ function createTarMetadataGuardTransform(
             pathsToRedact
           );
         }
-        outChunks.push(extendedHeaderBuffer);
-        state = 'HEADER';
-      } else {
-        state = 'EXTENDED_DATA';
+        // tar-stream@3.3.0 leaves `_longHeader` latched when an extended header has `size === 0`;
+        // fail closed so empty `'x'`/`'g'` headers cannot corrupt downstream parser state.
+        throw new ArchiveExtractionError(
+          'MALFORMED_ARCHIVE',
+          'Archive extended metadata header has zero payload bytes.',
+          pathsToRedact
+        );
       }
+      state = 'EXTENDED_DATA';
       return;
     }
 
@@ -1391,15 +1401,14 @@ function createTarMetadataGuardTransform(
         extendedTypeflag === 55,
         pathsToRedact
       );
-      if (extendedTypeflag === 72 && parsedPaxSize !== null) {
+      if (extendedTypeflag === 72) {
         pendingPaxSize = parsedPaxSize;
       }
     } else if (extendedTypeflag === 28 || extendedTypeflag === 30) {
-      let end = payload.length;
-      while (end > 0 && payload[end - 1] === 0) {
-        end -= 1;
-      }
-      const longPath = payload.subarray(0, end).toString('utf8');
+      const firstNullIndex = payload.indexOf(0);
+      const effectivePayload =
+        firstNullIndex === -1 ? payload : payload.subarray(0, firstNullIndex);
+      const longPath = effectivePayload.toString('utf8');
       if (longPath.length === 0 || !isWellFormedUnicode(longPath)) {
         throw new ArchiveExtractionError(
           'INVALID_ARCHIVE_PATH',

@@ -89,4 +89,4 @@ pnpm run test:integration:redis
 
 ## Scope Note
 
-Task 1.7.3.1 establishes the persistent `ScanModel`, atomic worker lease/fencing operations, and worker MongoDB connectivity. GitHub credential brokering, repository tarball downloading, defensive archive extraction, security scanner containers (`Semgrep`, `Gitleaks`, `Trivy`), webhook scan triggers, and AI remediation remain intentionally unimplemented for upcoming tasks.
+This workspace currently implements worker runtime/lifecycle coordination, MongoDB lease fencing, BullMQ job consumption, the internal API HTTP archive acquisition client (`createInternalAcquisitionClient()`), and defensive archive extraction into isolated worker workspaces (`extractRepositoryArchive()`). Static security scanner execution (`Semgrep`, `Gitleaks`, `Trivy`), restricted scanner container sandboxes, scan orchestration wiring, webhook triggers, and AI remediation remain unimplemented for upcoming tasks.
