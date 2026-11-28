@@ -1,89 +1,64 @@
 import type { ClientSession } from 'mongoose';
-import { isTerminalScanLifecycleStatus, type PublicScanRecord } from '@vibeshield/types';
+import {
+  isTerminalScanLifecycleStatus,
+  ScanLifecycleStatusValue,
+  type PublicScanRecord,
+} from '@vibeshield/types';
 import { redactMongoUri, runInTransaction } from '../connection.js';
 import {
   OutboxDispatchStateValue,
   ScanDispatchOutboxModel,
-  type OutboxDispatchState,
-  type ScanDispatchOutboxAttributes,
 } from '../models/scan-dispatch-outbox.model.js';
 import { ScanModel } from '../models/scan.model.js';
 import { isValidObjectId } from '../utils/normalization.js';
 import { redactGitHubSecrets } from '../utils/redaction.js';
+import { createQueuedScan, type CreateQueuedScanInput } from './scan-lifecycle.js';
 import {
-  createQueuedScan,
+  assertValidGeneration,
+  formatScanDispatchJobId,
+  generateOutboxClaimToken,
+  MAX_DISPATCH_GENERATION,
+  MAX_OUTBOX_ATTEMPTS,
   ScanLifecycleError,
-  type CreateQueuedScanInput,
-} from './scan-lifecycle.js';
+  suppressScanDispatchOutboxInSession,
+  toPublicScanDispatchOutboxRecord,
+  type PublicScanDispatchOutboxRecord,
+  type SuppressScanDispatchOutboxResult,
+} from './scan-shared.js';
 
-export interface PublicScanDispatchOutboxRecord {
-  id: string;
-  scanId: string;
-  organizationId: string;
-  projectId: string;
-  state: OutboxDispatchState;
-  attempts: number;
-  dispatchGeneration: number;
-  jobId: string;
-  nextAttemptAt: Date;
-  lastError: string | null;
-  dispatchedAt: Date | null;
-  suppressedAt: Date | null;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-export function formatScanDispatchJobId(scanId: string, dispatchGeneration: number): string {
-  if (!isValidObjectId(scanId)) {
-    throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
-  }
-  if (
-    !Number.isSafeInteger(dispatchGeneration) ||
-    dispatchGeneration < 1 ||
-    dispatchGeneration > 1_000_000
-  ) {
-    throw new ScanLifecycleError(
-      'dispatchGeneration must be an integer between 1 and 1000000',
-      'INVALID_DISPATCH_GENERATION'
-    );
-  }
-  return `scan-${scanId.toLowerCase()}-${dispatchGeneration}`;
-}
-
-export function toPublicScanDispatchOutboxRecord(
-  doc: ScanDispatchOutboxAttributes & { _id: { toString(): string } }
-): PublicScanDispatchOutboxRecord {
-  const scanId = doc.scanId.toString();
-  return {
-    id: doc._id.toString(),
-    scanId,
-    organizationId: doc.organizationId.toString(),
-    projectId: doc.projectId.toString(),
-    state: doc.state,
-    attempts: doc.attempts,
-    dispatchGeneration: doc.dispatchGeneration,
-    jobId: formatScanDispatchJobId(scanId, doc.dispatchGeneration),
-    nextAttemptAt: doc.nextAttemptAt,
-    lastError: doc.lastError ?? null,
-    dispatchedAt: doc.dispatchedAt ?? null,
-    suppressedAt: doc.suppressedAt ?? null,
-    createdAt: doc.createdAt,
-    updatedAt: doc.updatedAt,
-  };
-}
-
-function assertValidGeneration(generation: number): number {
-  if (!Number.isSafeInteger(generation) || generation < 1 || generation > 1_000_000) {
-    throw new ScanLifecycleError(
-      'dispatchGeneration must be a positive integer',
-      'INVALID_DISPATCH_GENERATION'
-    );
-  }
-  return generation;
-}
+export {
+  formatScanDispatchJobId,
+  MAX_DISPATCH_GENERATION,
+  MAX_OUTBOX_ATTEMPTS,
+  toPublicScanDispatchOutboxRecord,
+  type PublicScanDispatchOutboxRecord,
+  type SuppressScanDispatchOutboxResult,
+};
 
 function sanitizeErrorSummary(message: string): string {
   return redactGitHubSecrets(redactMongoUri(message.trim())).slice(0, 500);
+}
+
+function assertValidClaimToken(claimToken: string): string {
+  if (typeof claimToken !== 'string' || claimToken.trim().length < 16) {
+    throw new ScanLifecycleError(
+      'Invalid outbox claim fencing token',
+      'INVALID_OUTBOX_CLAIM_TOKEN'
+    );
+  }
+  return claimToken;
+}
+
+async function applySession<TQuery>(
+  query: TQuery,
+  session?: ClientSession
+): Promise<Awaited<TQuery>> {
+  if (session && query && typeof (query as { session?: unknown }).session === 'function') {
+    return (await (
+      query as unknown as { session(s: ClientSession): Promise<Awaited<TQuery>> }
+    ).session(session)) as Awaited<TQuery>;
+  }
+  return await query;
 }
 
 export interface CreateQueuedScanWithOutboxResult {
@@ -113,10 +88,12 @@ export async function createQueuedScanWithOutbox(
           state: OutboxDispatchStateValue.PENDING,
           attempts: 0,
           dispatchGeneration: 1,
+          claimToken: null,
           nextAttemptAt: now,
           lastError: null,
           dispatchedAt: null,
           suppressedAt: null,
+          exhaustedAt: null,
         },
       ],
       { session }
@@ -145,7 +122,8 @@ export async function createQueuedScanWithOutbox(
 }
 
 /**
- * Queries bounded pending/retryable outbox entries whose `nextAttemptAt <= now`.
+ * Queries bounded pending/retryable outbox entries whose `nextAttemptAt <= now` and
+ * `attempts < MAX_OUTBOX_ATTEMPTS`, never returning exhausted records or exposing `claimToken`.
  */
 export async function findPendingScanDispatchOutboxCandidates(
   input: {
@@ -159,6 +137,7 @@ export async function findPendingScanDispatchOutboxCandidates(
   const docs = await ScanDispatchOutboxModel.find({
     state: OutboxDispatchStateValue.PENDING,
     nextAttemptAt: { $lte: now },
+    attempts: { $lt: MAX_OUTBOX_ATTEMPTS },
   })
     .sort({ nextAttemptAt: 1 })
     .limit(limit);
@@ -166,23 +145,58 @@ export async function findPendingScanDispatchOutboxCandidates(
   return docs.map(toPublicScanDispatchOutboxRecord);
 }
 
+/**
+ * Queries bounded outbox entries that have reached `EXHAUSTED` state so future reconcilers or
+ * operators can inspect and fail or explicitly recover permanently failing dispatches.
+ */
+export async function findExhaustedScanDispatchOutboxCandidates(
+  input: {
+    limit?: number;
+  } = {}
+): Promise<PublicScanDispatchOutboxRecord[]> {
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 50), 1), 100);
+
+  const docs = await ScanDispatchOutboxModel.find({
+    state: OutboxDispatchStateValue.EXHAUSTED,
+  })
+    .sort({ exhaustedAt: 1 })
+    .limit(limit);
+
+  return docs.map(toPublicScanDispatchOutboxRecord);
+}
+
 export type ClaimPendingScanDispatchResult =
-  | { status: 'CLAIMED'; outbox: PublicScanDispatchOutboxRecord; jobId: string }
+  | {
+      status: 'CLAIMED';
+      outbox: PublicScanDispatchOutboxRecord;
+      jobId: string;
+      claimToken: string;
+    }
   | { status: 'SUPPRESSED'; outbox: PublicScanDispatchOutboxRecord }
+  | { status: 'EXHAUSTED'; outbox: PublicScanDispatchOutboxRecord }
   | { status: 'STALE_OR_CONFLICT' }
   | { status: 'NOT_FOUND' };
 
 /**
- * Atomically claims a `PENDING` outbox record for dispatch in a given `dispatchGeneration`,
- * bumping `nextAttemptAt` by `claimWindowMs` and incrementing `attempts`. Automatically suppresses
- * dispatch if the referenced Scan has been cancelled, terminated, or removed.
+ * Atomically claims a `PENDING` outbox record for dispatch in a given `dispatchGeneration` inside a
+ * MongoDB transaction:
+ * - Only authorizes enqueueing when the authoritative `Scan` is `QUEUED`, `isActive: true`,
+ *   uncancelled, and `attemptCount < maxAttempts` (never dispatching while `ACQUIRING`/`IN_PROGRESS`).
+ * - Fences against concurrent `Scan` transitions using `$inc: { dispatchRevision: 1 }` on `ScanModel`,
+ *   forcing MongoDB `WriteConflict` retries under snapshot isolation instead of write skew.
+ * - Never increments `attempts` when the scan is cancelled, terminal, ineligible, or already exhausted.
+ * - Mints a fresh per-claim secret `claimToken` (`select: false`), bumping `nextAttemptAt` by
+ *   `claimWindowMs` and incrementing `attempts` only while `attempts < MAX_OUTBOX_ATTEMPTS`.
  */
-export async function claimPendingScanDispatch(input: {
-  scanId: string;
-  dispatchGeneration: number;
-  claimWindowMs?: number;
-  now?: Date;
-}): Promise<ClaimPendingScanDispatchResult> {
+export async function claimPendingScanDispatch(
+  input: {
+    scanId: string;
+    dispatchGeneration: number;
+    claimWindowMs?: number;
+    now?: Date;
+  },
+  externalSession?: ClientSession
+): Promise<ClaimPendingScanDispatchResult> {
   if (!isValidObjectId(input.scanId)) {
     throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
   }
@@ -194,83 +208,197 @@ export async function claimPendingScanDispatch(input: {
   const now = input.now ?? new Date();
   const nextClaimExpiry = new Date(now.getTime() + claimWindowMs);
 
-  const claimed = await ScanDispatchOutboxModel.findOneAndUpdate(
-    {
-      scanId: input.scanId,
-      state: OutboxDispatchStateValue.PENDING,
-      dispatchGeneration: generation,
-      nextAttemptAt: { $lte: now },
-    },
-    {
-      $set: {
-        nextAttemptAt: nextClaimExpiry,
-      },
-      $inc: {
-        attempts: 1,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+  const execute = async (session: ClientSession): Promise<ClaimPendingScanDispatchResult> => {
+    const existingOutbox = await applySession(
+      ScanDispatchOutboxModel.findOne({ scanId: input.scanId }),
+      session
+    );
+    if (!existingOutbox) {
+      return { status: 'NOT_FOUND' };
     }
-  );
 
-  if (!claimed) {
-    const existing = await ScanDispatchOutboxModel.findOne({ scanId: input.scanId });
-    return existing ? { status: 'STALE_OR_CONFLICT' } : { status: 'NOT_FOUND' };
-  }
+    if (
+      existingOutbox.state === OutboxDispatchStateValue.EXHAUSTED &&
+      existingOutbox.dispatchGeneration === generation
+    ) {
+      return {
+        status: 'EXHAUSTED',
+        outbox: toPublicScanDispatchOutboxRecord(existingOutbox),
+      };
+    }
 
-  const scan = await ScanModel.findOne({
-    _id: input.scanId,
-    organizationId: claimed.organizationId,
-    projectId: claimed.projectId,
-  })
-    .select('_id status isActive cancellation.requestedAt')
-    .lean();
+    if (
+      existingOutbox.state !== OutboxDispatchStateValue.PENDING ||
+      existingOutbox.dispatchGeneration !== generation ||
+      existingOutbox.nextAttemptAt.getTime() > now.getTime()
+    ) {
+      return { status: 'STALE_OR_CONFLICT' };
+    }
 
-  if (
-    !scan ||
-    !scan.isActive ||
-    isTerminalScanLifecycleStatus(scan.status) ||
-    (scan.cancellation?.requestedAt !== null && scan.cancellation?.requestedAt !== undefined)
-  ) {
-    const suppressed = await suppressScanDispatchOutbox({
-      scanId: input.scanId,
-      dispatchGeneration: generation,
-      now,
+    const scanQuery = ScanModel.findOne({
+      _id: input.scanId,
+      organizationId: existingOutbox.organizationId,
+      projectId: existingOutbox.projectId,
     });
-    if (suppressed.status === 'SUPPRESSED') {
-      return { status: 'SUPPRESSED', outbox: suppressed.outbox };
+    const scanSelected =
+      scanQuery && typeof (scanQuery as { select?: unknown }).select === 'function'
+        ? (scanQuery as { select(fields: string): typeof scanQuery }).select(
+            '_id status isActive cancellation.requestedAt attemptCount maxAttempts'
+          )
+        : scanQuery;
+    const scan = await applySession(scanSelected, session);
+
+    if (
+      !scan ||
+      !scan.isActive ||
+      isTerminalScanLifecycleStatus(scan.status) ||
+      (scan.cancellation?.requestedAt !== null && scan.cancellation?.requestedAt !== undefined)
+    ) {
+      const suppressed = await suppressScanDispatchOutboxInSession(
+        {
+          scanId: input.scanId,
+          dispatchGeneration: generation,
+          now,
+        },
+        session
+      );
+      if (suppressed.status === 'SUPPRESSED') {
+        return { status: 'SUPPRESSED', outbox: suppressed.outbox };
+      }
+      return { status: 'STALE_OR_CONFLICT' };
     }
-    return { status: 'STALE_OR_CONFLICT' };
+
+    if (scan.status !== ScanLifecycleStatusValue.QUEUED || scan.attemptCount >= scan.maxAttempts) {
+      return { status: 'STALE_OR_CONFLICT' };
+    }
+
+    if (existingOutbox.attempts >= MAX_OUTBOX_ATTEMPTS) {
+      const exhausted = await ScanDispatchOutboxModel.findOneAndUpdate(
+        {
+          scanId: input.scanId,
+          state: OutboxDispatchStateValue.PENDING,
+          dispatchGeneration: generation,
+          attempts: { $gte: MAX_OUTBOX_ATTEMPTS },
+        },
+        {
+          $set: {
+            state: OutboxDispatchStateValue.EXHAUSTED,
+            exhaustedAt: now,
+            dispatchedAt: null,
+            suppressedAt: null,
+            claimToken: null,
+          },
+        },
+        {
+          returnDocument: 'after',
+          runValidators: true,
+          session,
+        }
+      );
+
+      if (exhausted) {
+        return {
+          status: 'EXHAUSTED',
+          outbox: toPublicScanDispatchOutboxRecord(exhausted),
+        };
+      }
+      return { status: 'STALE_OR_CONFLICT' };
+    }
+
+    // Write-fence the QUEUED scan inside the transaction so concurrent claims or cancellations
+    // trigger MongoDB WriteConflict rather than committing stale snapshot reads.
+    const fencedScan = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: existingOutbox.organizationId,
+        projectId: existingOutbox.projectId,
+        status: ScanLifecycleStatusValue.QUEUED,
+        isActive: true,
+        'cancellation.requestedAt': null,
+        $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+      },
+      {
+        $inc: {
+          dispatchRevision: 1,
+        },
+      },
+      {
+        returnDocument: 'after',
+        session,
+      }
+    );
+
+    if (!fencedScan) {
+      return { status: 'STALE_OR_CONFLICT' };
+    }
+
+    const claimToken = generateOutboxClaimToken();
+    const claimed = await ScanDispatchOutboxModel.findOneAndUpdate(
+      {
+        scanId: input.scanId,
+        state: OutboxDispatchStateValue.PENDING,
+        dispatchGeneration: generation,
+        nextAttemptAt: { $lte: now },
+        attempts: { $lt: MAX_OUTBOX_ATTEMPTS },
+      },
+      {
+        $set: {
+          nextAttemptAt: nextClaimExpiry,
+          claimToken,
+        },
+        $inc: {
+          attempts: 1,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (!claimed) {
+      return { status: 'STALE_OR_CONFLICT' };
+    }
+
+    const publicOutbox = toPublicScanDispatchOutboxRecord(claimed);
+    return {
+      status: 'CLAIMED',
+      outbox: publicOutbox,
+      jobId: publicOutbox.jobId,
+      claimToken,
+    };
+  };
+
+  if (externalSession) {
+    return await execute(externalSession);
   }
 
-  const publicOutbox = toPublicScanDispatchOutboxRecord(claimed);
-  return {
-    status: 'CLAIMED',
-    outbox: publicOutbox,
-    jobId: publicOutbox.jobId,
-  };
+  return await runInTransaction(execute);
 }
 
 export type MarkScanDispatchSucceededResult =
   | { status: 'DISPATCHED'; outbox: PublicScanDispatchOutboxRecord }
+  | { status: 'STALE_CLAIM' }
   | { status: 'STALE_GENERATION' }
   | { status: 'NOT_FOUND' };
 
 /**
- * Marks a `PENDING` outbox record as `DISPATCHED`, strictly fenced by `dispatchGeneration` so an
- * older dispatcher cannot overwrite a newer re-armed dispatch generation.
+ * Marks a `PENDING` outbox record as `DISPATCHED`, strictly fenced by both `dispatchGeneration` and
+ * the active per-claim `claimToken` so older or supplanted dispatchers cannot commit success.
+ * Clears `claimToken` upon transition.
  */
 export async function markScanDispatchSucceeded(input: {
   scanId: string;
   dispatchGeneration: number;
+  claimToken: string;
   now?: Date;
 }): Promise<MarkScanDispatchSucceededResult> {
   if (!isValidObjectId(input.scanId)) {
     throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
   }
   const generation = assertValidGeneration(input.dispatchGeneration);
+  const claimToken = assertValidClaimToken(input.claimToken);
   const now = input.now ?? new Date();
 
   const updated = await ScanDispatchOutboxModel.findOneAndUpdate(
@@ -278,13 +406,16 @@ export async function markScanDispatchSucceeded(input: {
       scanId: input.scanId,
       state: OutboxDispatchStateValue.PENDING,
       dispatchGeneration: generation,
+      claimToken,
     },
     {
       $set: {
         state: OutboxDispatchStateValue.DISPATCHED,
         dispatchedAt: now,
         suppressedAt: null,
+        exhaustedAt: null,
         lastError: null,
+        claimToken: null,
       },
     },
     {
@@ -298,21 +429,34 @@ export async function markScanDispatchSucceeded(input: {
   }
 
   const existing = await ScanDispatchOutboxModel.findOne({ scanId: input.scanId });
-  return existing ? { status: 'STALE_GENERATION' } : { status: 'NOT_FOUND' };
+  if (!existing) {
+    return { status: 'NOT_FOUND' };
+  }
+  if (
+    existing.state !== OutboxDispatchStateValue.PENDING ||
+    existing.dispatchGeneration !== generation
+  ) {
+    return { status: 'STALE_GENERATION' };
+  }
+  return { status: 'STALE_CLAIM' };
 }
 
 export type RecordScanDispatchFailureResult =
   | { status: 'SCHEDULED_RETRY'; outbox: PublicScanDispatchOutboxRecord }
+  | { status: 'EXHAUSTED'; outbox: PublicScanDispatchOutboxRecord }
+  | { status: 'STALE_CLAIM' }
   | { status: 'STALE_GENERATION' }
   | { status: 'NOT_FOUND' };
 
 /**
- * Records a safe, credential-redacted error on a `PENDING` outbox entry and schedules the next
- * retry attempt while fenced by `dispatchGeneration`.
+ * Records a safe, credential-redacted error on a `PENDING` outbox entry while fenced by both
+ * `dispatchGeneration` and `claimToken`. Clears `claimToken` on completion and transitions to
+ * `EXHAUSTED` once `attempts >= MAX_OUTBOX_ATTEMPTS`.
  */
 export async function recordScanDispatchFailure(input: {
   scanId: string;
   dispatchGeneration: number;
+  claimToken: string;
   errorMessage: string;
   retryDelayMs?: number;
   now?: Date;
@@ -321,20 +465,25 @@ export async function recordScanDispatchFailure(input: {
     throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
   }
   const generation = assertValidGeneration(input.dispatchGeneration);
+  const claimToken = assertValidClaimToken(input.claimToken);
   const retryDelayMs = Math.min(Math.max(Math.trunc(input.retryDelayMs ?? 5_000), 100), 3_600_000);
   const now = input.now ?? new Date();
   const nextAttemptAt = new Date(now.getTime() + retryDelayMs);
+  const safeError = sanitizeErrorSummary(input.errorMessage);
 
-  const updated = await ScanDispatchOutboxModel.findOneAndUpdate(
+  const retryUpdated = await ScanDispatchOutboxModel.findOneAndUpdate(
     {
       scanId: input.scanId,
       state: OutboxDispatchStateValue.PENDING,
       dispatchGeneration: generation,
+      claimToken,
+      attempts: { $lt: MAX_OUTBOX_ATTEMPTS },
     },
     {
       $set: {
-        lastError: sanitizeErrorSummary(input.errorMessage),
+        lastError: safeError,
         nextAttemptAt,
+        claimToken: null,
       },
     },
     {
@@ -343,18 +492,50 @@ export async function recordScanDispatchFailure(input: {
     }
   );
 
-  if (updated) {
-    return { status: 'SCHEDULED_RETRY', outbox: toPublicScanDispatchOutboxRecord(updated) };
+  if (retryUpdated) {
+    return { status: 'SCHEDULED_RETRY', outbox: toPublicScanDispatchOutboxRecord(retryUpdated) };
+  }
+
+  const exhaustedUpdated = await ScanDispatchOutboxModel.findOneAndUpdate(
+    {
+      scanId: input.scanId,
+      state: OutboxDispatchStateValue.PENDING,
+      dispatchGeneration: generation,
+      claimToken,
+      attempts: { $gte: MAX_OUTBOX_ATTEMPTS },
+    },
+    {
+      $set: {
+        state: OutboxDispatchStateValue.EXHAUSTED,
+        exhaustedAt: now,
+        dispatchedAt: null,
+        suppressedAt: null,
+        lastError: safeError,
+        claimToken: null,
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+    }
+  );
+
+  if (exhaustedUpdated) {
+    return { status: 'EXHAUSTED', outbox: toPublicScanDispatchOutboxRecord(exhaustedUpdated) };
   }
 
   const existing = await ScanDispatchOutboxModel.findOne({ scanId: input.scanId });
-  return existing ? { status: 'STALE_GENERATION' } : { status: 'NOT_FOUND' };
+  if (!existing) {
+    return { status: 'NOT_FOUND' };
+  }
+  if (
+    existing.state !== OutboxDispatchStateValue.PENDING ||
+    existing.dispatchGeneration !== generation
+  ) {
+    return { status: 'STALE_GENERATION' };
+  }
+  return { status: 'STALE_CLAIM' };
 }
-
-export type SuppressScanDispatchOutboxResult =
-  | { status: 'SUPPRESSED'; outbox: PublicScanDispatchOutboxRecord }
-  | { status: 'STALE_GENERATION' }
-  | { status: 'NOT_FOUND' };
 
 /**
  * Marks a scan's outbox record `SUPPRESSED` when its scan reaches a terminal or cancelled state.
@@ -367,41 +548,7 @@ export async function suppressScanDispatchOutbox(
   },
   session?: ClientSession
 ): Promise<SuppressScanDispatchOutboxResult> {
-  if (!isValidObjectId(input.scanId)) {
-    throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
-  }
-  const now = input.now ?? new Date();
-  const filter: Record<string, unknown> = {
-    scanId: input.scanId,
-  };
-  if (input.dispatchGeneration !== undefined) {
-    filter.dispatchGeneration = assertValidGeneration(input.dispatchGeneration);
-  }
-
-  const updated = await ScanDispatchOutboxModel.findOneAndUpdate(
-    filter,
-    {
-      $set: {
-        state: OutboxDispatchStateValue.SUPPRESSED,
-        suppressedAt: now,
-        dispatchedAt: null,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
-      ...(session ? { session } : {}),
-    }
-  );
-
-  if (updated) {
-    return { status: 'SUPPRESSED', outbox: toPublicScanDispatchOutboxRecord(updated) };
-  }
-
-  const existing = await ScanDispatchOutboxModel.findOne({ scanId: input.scanId }).session(
-    session ?? null
-  );
-  return existing ? { status: 'STALE_GENERATION' } : { status: 'NOT_FOUND' };
+  return await suppressScanDispatchOutboxInSession(input, session);
 }
 
 export type RearmScanDispatchOutboxResult =
@@ -411,9 +558,18 @@ export type RearmScanDispatchOutboxResult =
   | { status: 'NOT_FOUND' };
 
 /**
- * Safely re-arms the scan's unique outbox record for a new `dispatchGeneration` (`dispatchGeneration + 1`),
- * enabling recovery when a previously dispatched BullMQ job was dropped while the scan remains `QUEUED`.
- * Suppresses instead of re-arming if the associated scan is cancelled, inactive, or terminal.
+ * Safely re-arms the scan's unique outbox record inside a MongoDB transaction for a new
+ * `dispatchGeneration` (`dispatchGeneration + 1`), resetting `attempts: 0` and clearing any prior
+ * `claimToken` / `exhaustedAt` so recovery can enqueue `scan-{scanId}-{newGeneration}`.
+ *
+ * Concurrency guarantee: Executes inside a transaction and performs a conditional write fence
+ * (`$inc: { dispatchRevision: 1 }`) on the authoritative `QUEUED` `Scan` document so concurrent
+ * cancellations or worker claims trigger MongoDB `WriteConflict` instead of WiredTiger write skew.
+ *
+ * Coordinator note: Future periodic recovery loops calling `recoverExpiredScanLeaseCandidate()`
+ * should pass one shared `ClientSession` from `runInTransaction` and invoke either
+ * `rearmScanDispatchOutbox({ scanId }, session)` (on `REQUEUED_FOR_RECOVERY`) or
+ * `suppressScanDispatchOutbox({ scanId }, session)` inside that same transaction.
  */
 export async function rearmScanDispatchOutbox(
   input: {
@@ -422,87 +578,140 @@ export async function rearmScanDispatchOutbox(
     nextAttemptAt?: Date;
     now?: Date;
   },
-  session?: ClientSession
+  externalSession?: ClientSession
 ): Promise<RearmScanDispatchOutboxResult> {
   if (!isValidObjectId(input.scanId)) {
     throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
   }
+  if (input.expectedGeneration !== undefined) {
+    assertValidGeneration(input.expectedGeneration);
+  }
   const now = input.now ?? new Date();
   const nextAttemptAt = input.nextAttemptAt ?? now;
 
-  const existingOutbox = await ScanDispatchOutboxModel.findOne({ scanId: input.scanId }).session(
-    session ?? null
-  );
-  if (!existingOutbox) {
-    return { status: 'NOT_FOUND' };
-  }
-
-  const scan = await ScanModel.findOne({
-    _id: input.scanId,
-    organizationId: existingOutbox.organizationId,
-    projectId: existingOutbox.projectId,
-  })
-    .select('_id status isActive cancellation.requestedAt')
-    .session(session ?? null)
-    .lean();
-
-  if (
-    !scan ||
-    !scan.isActive ||
-    isTerminalScanLifecycleStatus(scan.status) ||
-    (scan.cancellation?.requestedAt !== null && scan.cancellation?.requestedAt !== undefined)
-  ) {
-    const sup = await suppressScanDispatchOutbox({ scanId: input.scanId, now }, session);
-    return {
-      status: 'SUPPRESSED_TERMINAL',
-      outbox:
-        sup.status === 'SUPPRESSED' ? sup.outbox : toPublicScanDispatchOutboxRecord(existingOutbox),
-    };
-  }
-
-  if (scan.status !== 'QUEUED') {
-    return { status: 'STALE_OR_CONFLICT' };
-  }
-
-  const filter: Record<string, unknown> = {
-    scanId: input.scanId,
-    state: { $ne: OutboxDispatchStateValue.SUPPRESSED },
-  };
-  if (input.expectedGeneration !== undefined) {
-    filter.dispatchGeneration = assertValidGeneration(input.expectedGeneration);
-  } else {
-    filter.dispatchGeneration = existingOutbox.dispatchGeneration;
-  }
-
-  const rearmed = await ScanDispatchOutboxModel.findOneAndUpdate(
-    filter,
-    {
-      $set: {
-        state: OutboxDispatchStateValue.PENDING,
-        nextAttemptAt,
-        dispatchedAt: null,
-        suppressedAt: null,
-        lastError: null,
-      },
-      $inc: {
-        dispatchGeneration: 1,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
-      ...(session ? { session } : {}),
+  const execute = async (session: ClientSession): Promise<RearmScanDispatchOutboxResult> => {
+    const existingOutbox = await applySession(
+      ScanDispatchOutboxModel.findOne({ scanId: input.scanId }),
+      session
+    );
+    if (!existingOutbox) {
+      return { status: 'NOT_FOUND' };
     }
-  );
 
-  if (!rearmed) {
-    return { status: 'STALE_OR_CONFLICT' };
+    // Write-fence the QUEUED Scan document inside this transaction so concurrent cancellation or
+    // worker claim triggers MongoDB WriteConflict (never snapshot write skew).
+    const fencedScan = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: existingOutbox.organizationId,
+        projectId: existingOutbox.projectId,
+        status: ScanLifecycleStatusValue.QUEUED,
+        isActive: true,
+        'cancellation.requestedAt': null,
+        $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+      },
+      {
+        $inc: {
+          dispatchRevision: 1,
+        },
+      },
+      {
+        returnDocument: 'after',
+        session,
+      }
+    );
+
+    if (!fencedScan) {
+      const scanQuery = ScanModel.findOne({
+        _id: input.scanId,
+        organizationId: existingOutbox.organizationId,
+        projectId: existingOutbox.projectId,
+      });
+      const scanSelected =
+        scanQuery && typeof (scanQuery as { select?: unknown }).select === 'function'
+          ? (scanQuery as { select(fields: string): typeof scanQuery }).select(
+              '_id status isActive cancellation.requestedAt'
+            )
+          : scanQuery;
+      const scan = await applySession(scanSelected, session);
+
+      if (
+        !scan ||
+        !scan.isActive ||
+        isTerminalScanLifecycleStatus(scan.status) ||
+        (scan.cancellation?.requestedAt !== null && scan.cancellation?.requestedAt !== undefined)
+      ) {
+        const sup = await suppressScanDispatchOutboxInSession(
+          { scanId: input.scanId, now },
+          session
+        );
+        return {
+          status: 'SUPPRESSED_TERMINAL',
+          outbox:
+            sup.status === 'SUPPRESSED'
+              ? sup.outbox
+              : toPublicScanDispatchOutboxRecord(existingOutbox),
+        };
+      }
+
+      return { status: 'STALE_OR_CONFLICT' };
+    }
+
+    const expectedGen =
+      input.expectedGeneration !== undefined
+        ? assertValidGeneration(input.expectedGeneration)
+        : existingOutbox.dispatchGeneration;
+
+    if (expectedGen >= MAX_DISPATCH_GENERATION) {
+      throw new ScanLifecycleError(
+        `dispatchGeneration cannot exceed ${MAX_DISPATCH_GENERATION}`,
+        'INVALID_DISPATCH_GENERATION'
+      );
+    }
+
+    const rearmed = await ScanDispatchOutboxModel.findOneAndUpdate(
+      {
+        scanId: input.scanId,
+        state: { $ne: OutboxDispatchStateValue.SUPPRESSED },
+        dispatchGeneration: expectedGen,
+      },
+      {
+        $set: {
+          state: OutboxDispatchStateValue.PENDING,
+          attempts: 0,
+          nextAttemptAt,
+          dispatchedAt: null,
+          suppressedAt: null,
+          exhaustedAt: null,
+          lastError: null,
+          claimToken: null,
+        },
+        $inc: {
+          dispatchGeneration: 1,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (!rearmed) {
+      return { status: 'STALE_OR_CONFLICT' };
+    }
+
+    const outbox = toPublicScanDispatchOutboxRecord(rearmed);
+    return {
+      status: 'REARMED',
+      outbox,
+      jobId: outbox.jobId,
+    };
+  };
+
+  if (externalSession) {
+    return await execute(externalSession);
   }
 
-  const outbox = toPublicScanDispatchOutboxRecord(rearmed);
-  return {
-    status: 'REARMED',
-    outbox,
-    jobId: outbox.jobId,
-  };
+  return await runInTransaction(execute);
 }

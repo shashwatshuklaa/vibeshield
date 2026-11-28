@@ -128,6 +128,7 @@ export interface ScanAttributes {
   idempotencyKey: string | null;
   attemptCount: number;
   maxAttempts: number;
+  dispatchRevision?: number;
   lease: ScanWorkerLeaseAttributes | null;
   cancellation: ScanCancellationAttributes;
   acquisition: ScanAcquisitionAttributes | null;
@@ -264,6 +265,7 @@ function sanitizeScanSerializedOutput(
   ret: Record<string, unknown>
 ): Record<string, unknown> {
   delete ret.__v;
+  delete ret.dispatchRevision;
   if (ret.lease && typeof ret.lease === 'object' && !Array.isArray(ret.lease)) {
     const leaseCopy = { ...(ret.lease as Record<string, unknown>) };
     delete leaseCopy.token;
@@ -397,6 +399,13 @@ export const scanSchema = new Schema<ScanAttributes>(
         validator: isPositiveInt,
         message: 'Max attempts must be a positive integer',
       },
+    },
+    dispatchRevision: {
+      type: Number,
+      required: true,
+      default: 0,
+      select: false,
+      min: [0, 'Dispatch revision cannot be negative'],
     },
     lease: {
       type: scanWorkerLeaseSchema,

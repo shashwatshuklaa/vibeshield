@@ -27,6 +27,9 @@ import {
 import { ScanModel, type ScanAttributes } from '../models/scan.model.js';
 import { isValidObjectId } from '../utils/normalization.js';
 import { redactGitHubSecrets } from '../utils/redaction.js';
+import { ScanLifecycleError, suppressScanDispatchOutboxInSession } from './scan-shared.js';
+
+export { ScanLifecycleError };
 
 export const DEFAULT_SCAN_LEASE_DURATION_MS = 60_000;
 const MIN_LEASE_DURATION_MS = 1_000;
@@ -71,16 +74,6 @@ export function isValidScanLifecycleTransition(
   to: ScanLifecycleStatus
 ): boolean {
   return ALLOWED_SCAN_TRANSITIONS[from]?.has(to) ?? false;
-}
-
-export class ScanLifecycleError extends Error {
-  public readonly code: string;
-
-  constructor(message: string, code = 'SCAN_LIFECYCLE_ERROR') {
-    super(redactGitHubSecrets(redactMongoUri(message)));
-    this.name = 'ScanLifecycleError';
-    this.code = code;
-  }
 }
 
 export type ClaimScanResult =
@@ -281,15 +274,30 @@ export async function createQueuedScan(
   return toPublicScanRecord(created);
 }
 
+async function applyOptionalSession<TQuery>(
+  query: TQuery,
+  session?: ClientSession
+): Promise<Awaited<TQuery>> {
+  if (session && query && typeof (query as { session?: unknown }).session === 'function') {
+    return (await (
+      query as unknown as { session(s: ClientSession): Promise<Awaited<TQuery>> }
+    ).session(session)) as Awaited<TQuery>;
+  }
+  return await query;
+}
+
 /**
  * Reloads a tenant-scoped scan document (optionally including internal `lease.token` when running
  * against a real Mongoose query) without breaking mocked unit-test queries.
  */
-async function findRawScanForFencingCheck(input: {
-  scanId: string;
-  organizationId: string;
-  projectId: string;
-}): Promise<(ScanAttributes & { _id: { toString(): string } }) | null> {
+async function findRawScanForFencingCheck(
+  input: {
+    scanId: string;
+    organizationId: string;
+    projectId: string;
+  },
+  session?: ClientSession
+): Promise<(ScanAttributes & { _id: { toString(): string } }) | null> {
   const query = ScanModel.findOne({
     _id: input.scanId,
     organizationId: input.organizationId,
@@ -297,14 +305,17 @@ async function findRawScanForFencingCheck(input: {
   });
 
   if (query && typeof (query as { select?: unknown }).select === 'function') {
-    return (await (
+    const selectedQuery = (
       query as unknown as {
-        select(fields: string): Promise<(ScanAttributes & { _id: { toString(): string } }) | null>;
+        select(fields: string): unknown;
       }
-    ).select('+lease.token')) as (ScanAttributes & { _id: { toString(): string } }) | null;
+    ).select('+lease.token');
+    return (await applyOptionalSession(selectedQuery, session)) as
+      (ScanAttributes & { _id: { toString(): string } }) | null;
   }
 
-  return (await query) as (ScanAttributes & { _id: { toString(): string } }) | null;
+  return (await applyOptionalSession(query, session)) as
+    (ScanAttributes & { _id: { toString(): string } }) | null;
 }
 
 function classifyFencedUpdateMiss(input: {
@@ -323,18 +334,19 @@ function classifyFencedUpdateMiss(input: {
     return { status: 'STALE_OR_CONFLICT', scan: publicRecord };
   }
 
-  // Reject stale or expired leases cleanly before considering pending cancellation signals.
+  // Require an intact stored lease subdocument and valid fencing token before checking cancellation.
   if (
-    typeof doc.lease?.token === 'string' &&
+    !doc.lease ||
+    typeof doc.lease.token !== 'string' ||
     !constantTimeTokenMatch(doc.lease.token, leaseToken)
   ) {
     return { status: 'STALE_OR_CONFLICT', scan: publicRecord };
   }
-  if (doc.lease && doc.lease.expiresAt.getTime() <= now.getTime()) {
+  if (!doc.lease.expiresAt || new Date(doc.lease.expiresAt).getTime() <= now.getTime()) {
     return { status: 'STALE_OR_CONFLICT', scan: publicRecord };
   }
 
-  if (doc.cancellation?.requestedAt !== null) {
+  if (doc.cancellation?.requestedAt !== null && doc.cancellation?.requestedAt !== undefined) {
     return { status: 'CANCEL_REQUESTED', scan: publicRecord };
   }
 
@@ -344,11 +356,14 @@ function classifyFencedUpdateMiss(input: {
 /**
  * Retrieves a single scan strictly scoped to `(organizationId, projectId)`.
  */
-export async function findScanByIdInOrganization(input: {
-  organizationId: string;
-  projectId: string;
-  scanId: string;
-}): Promise<PublicScanRecord | null> {
+export async function findScanByIdInOrganization(
+  input: {
+    organizationId: string;
+    projectId: string;
+    scanId: string;
+  },
+  session?: ClientSession
+): Promise<PublicScanRecord | null> {
   if (
     !isValidObjectId(input.organizationId) ||
     !isValidObjectId(input.projectId) ||
@@ -357,11 +372,14 @@ export async function findScanByIdInOrganization(input: {
     return null;
   }
 
-  const doc = await ScanModel.findOne({
-    _id: input.scanId,
-    organizationId: input.organizationId,
-    projectId: input.projectId,
-  });
+  const doc = (await applyOptionalSession(
+    ScanModel.findOne({
+      _id: input.scanId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+    }),
+    session
+  )) as (ScanAttributes & { _id: { toString(): string } }) | null;
 
   return doc ? toPublicScanRecord(doc) : null;
 }
@@ -422,6 +440,7 @@ export async function claimQueuedScanForAcquisition(input: {
       status: ScanLifecycleStatusValue.QUEUED,
       isActive: true,
       'cancellation.requestedAt': null,
+      $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
     },
     {
       $set: {
@@ -456,28 +475,35 @@ export async function claimQueuedScanForAcquisition(input: {
   }
 
   // Respect pre-acquisition cancellation cleanly if the queued scan has a pending cancellation.
-  const cancelledQueued = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: ScanLifecycleStatusValue.QUEUED,
-      isActive: true,
-      'cancellation.requestedAt': { $ne: null },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.CANCELLED,
-        isActive: false,
-        cancelledAt: now,
-        lease: null,
+  const cancelledQueued = await runInTransaction(async (session) => {
+    const cancelled = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: ScanLifecycleStatusValue.QUEUED,
+        isActive: true,
+        'cancellation.requestedAt': { $ne: null },
       },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.CANCELLED,
+          isActive: false,
+          cancelledAt: now,
+          lease: null,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+    if (cancelled) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
     }
-  );
+    return cancelled;
+  });
 
   if (cancelledQueued) {
     return {
@@ -525,173 +551,185 @@ export async function reclaimExpiredScanLease(input: {
   const expiresAt = new Date(now.getTime() + leaseDurationMs);
   const leaseToken = generateLeaseToken();
 
-  // If cancellation was requested before the stale lease was reclaimed, finalize CANCELLED cleanly.
-  const cancelledExpired = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: {
-        $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
-      },
-      isActive: true,
-      'cancellation.requestedAt': { $ne: null },
-      'lease.expiresAt': { $lte: now },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.CANCELLED,
-        isActive: false,
-        cancelledAt: now,
-        lease: null,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
-    }
-  );
-
-  if (cancelledExpired) {
-    return {
-      status: 'CANCELLED',
-      scan: toPublicScanRecord(cancelledExpired),
-    };
-  }
-
-  const reclaimed = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: {
-        $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
-      },
-      isActive: true,
-      'cancellation.requestedAt': null,
-      'lease.expiresAt': { $lte: now },
-      $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.ACQUIRING,
+  return await runInTransaction(async (session) => {
+    // If cancellation was requested before the stale lease was reclaimed, finalize CANCELLED cleanly.
+    const cancelledExpired = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: {
+          $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+        },
         isActive: true,
-        acquiringAt: now,
-        resolvedCommitSha: null,
-        acquisition: null,
-        inProgressAt: null,
-        lease: {
-          workerId,
-          token: leaseToken,
-          acquiredAt: now,
-          heartbeatAt: now,
-          expiresAt,
+        'cancellation.requestedAt': { $ne: null },
+        'lease.expiresAt': { $lte: now },
+      },
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.CANCELLED,
+          isActive: false,
+          cancelledAt: now,
+          lease: null,
         },
       },
-      $inc: {
-        attemptCount: 1,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (cancelledExpired) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return {
+        status: 'CANCELLED',
+        scan: toPublicScanRecord(cancelledExpired),
+      };
     }
-  );
 
-  if (reclaimed) {
-    return {
-      status: 'RECLAIMED',
-      scan: toPublicScanRecord(reclaimed),
-      leaseToken,
-    };
-  }
+    const reclaimed = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: {
+          $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+        },
+        isActive: true,
+        'cancellation.requestedAt': null,
+        'lease.expiresAt': { $lte: now },
+        $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+      },
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.ACQUIRING,
+          isActive: true,
+          acquiringAt: now,
+          resolvedCommitSha: null,
+          acquisition: null,
+          inProgressAt: null,
+          lease: {
+            workerId,
+            token: leaseToken,
+            acquiredAt: now,
+            heartbeatAt: now,
+            expiresAt,
+          },
+        },
+        $inc: {
+          attemptCount: 1,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
 
-  // Fail permanently only if an expired active lease exhausted attempts AND has no pending cancellation.
-  const exhausted = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: {
-        $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
-      },
-      isActive: true,
-      'cancellation.requestedAt': null,
-      'lease.expiresAt': { $lte: now },
-      $expr: { $gte: ['$attemptCount', '$maxAttempts'] },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.FAILED,
-        isActive: false,
-        failedAt: now,
-        failureCode: ScanFailureCodeValue.LEASE_EXPIRED,
-        failureMessage: 'Worker lease expired after maximum allowed scan attempts',
-        lease: null,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+    if (reclaimed) {
+      return {
+        status: 'RECLAIMED',
+        scan: toPublicScanRecord(reclaimed),
+        leaseToken,
+      };
     }
-  );
 
-  if (exhausted) {
-    return {
-      status: 'MAX_ATTEMPTS_EXHAUSTED',
-      scan: toPublicScanRecord(exhausted),
-    };
-  }
+    // Fail permanently only if an expired active lease exhausted attempts AND has no pending cancellation.
+    const exhausted = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: {
+          $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+        },
+        isActive: true,
+        'cancellation.requestedAt': null,
+        'lease.expiresAt': { $lte: now },
+        $expr: { $gte: ['$attemptCount', '$maxAttempts'] },
+      },
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.FAILED,
+          isActive: false,
+          failedAt: now,
+          failureCode: ScanFailureCodeValue.LEASE_EXPIRED,
+          failureMessage: 'Worker lease expired after maximum allowed scan attempts',
+          lease: null,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
 
-  // Handle narrow race where cancellation arrived between initial check and exhausted update.
-  const cancelledAfterRace = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: {
-        $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
-      },
-      isActive: true,
-      'cancellation.requestedAt': { $ne: null },
-      'lease.expiresAt': { $lte: now },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.CANCELLED,
-        isActive: false,
-        cancelledAt: now,
-        lease: null,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+    if (exhausted) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return {
+        status: 'MAX_ATTEMPTS_EXHAUSTED',
+        scan: toPublicScanRecord(exhausted),
+      };
     }
-  );
 
-  if (cancelledAfterRace) {
-    return {
-      status: 'CANCELLED',
-      scan: toPublicScanRecord(cancelledAfterRace),
-    };
-  }
+    // Handle narrow race where cancellation arrived between initial check and exhausted update.
+    const cancelledAfterRace = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: {
+          $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+        },
+        isActive: true,
+        'cancellation.requestedAt': { $ne: null },
+        'lease.expiresAt': { $lte: now },
+      },
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.CANCELLED,
+          isActive: false,
+          cancelledAt: now,
+          lease: null,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
 
-  const existing = await findScanByIdInOrganization({
-    scanId: input.scanId,
-    organizationId: input.organizationId,
-    projectId: input.projectId,
-  });
-  if (existing && existing.status === ScanLifecycleStatusValue.CANCELLED) {
+    if (cancelledAfterRace) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return {
+        status: 'CANCELLED',
+        scan: toPublicScanRecord(cancelledAfterRace),
+      };
+    }
+
+    const existing = await findScanByIdInOrganization(
+      {
+        scanId: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+      },
+      session
+    );
+    if (existing && existing.status === ScanLifecycleStatusValue.CANCELLED) {
+      return {
+        status: 'CANCELLED',
+        scan: existing,
+      };
+    }
     return {
-      status: 'CANCELLED',
+      status: 'NOT_RECLAIMABLE',
       scan: existing,
     };
-  }
-  return {
-    status: 'NOT_RECLAIMABLE',
-    scan: existing,
-  };
+  });
 }
 
 /**
@@ -900,178 +938,224 @@ export async function transitionScanToInProgress(input: {
 }
 
 /**
- * Atomically transitions an active leased `IN_PROGRESS` scan to `COMPLETED`, clearing the worker lease.
+ * Atomically transitions an active leased `IN_PROGRESS` scan to `COMPLETED`, clearing the worker lease
+ * and suppressing any queued dispatch outbox in the same MongoDB transaction.
  * Refuses completion if cancellation has been requested (`CANCEL_REQUESTED`) or the lease is invalid/stale.
  */
-export async function completeScanWithLease(input: {
-  scanId: string;
-  organizationId: string;
-  projectId: string;
-  leaseToken: string;
-  now?: Date;
-}): Promise<FencedScanMutationResult> {
+export async function completeScanWithLease(
+  input: {
+    scanId: string;
+    organizationId: string;
+    projectId: string;
+    leaseToken: string;
+    now?: Date;
+  },
+  externalSession?: ClientSession
+): Promise<FencedScanMutationResult> {
   assertValidIds(input.organizationId, input.projectId, input.scanId);
   const leaseToken = assertValidLeaseToken(input.leaseToken);
   const now = input.now ?? new Date();
 
-  const updated = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: ScanLifecycleStatusValue.IN_PROGRESS,
-      isActive: true,
-      'cancellation.requestedAt': null,
-      'lease.token': leaseToken,
-      'lease.expiresAt': { $gt: now },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.COMPLETED,
-        isActive: false,
-        completedAt: now,
-        lease: null,
+  const execute = async (session: ClientSession): Promise<FencedScanMutationResult> => {
+    const updated = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: ScanLifecycleStatusValue.IN_PROGRESS,
+        isActive: true,
+        'cancellation.requestedAt': null,
+        'lease.token': leaseToken,
+        'lease.expiresAt': { $gt: now },
       },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.COMPLETED,
+          isActive: false,
+          completedAt: now,
+          lease: null,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (updated) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
     }
-  );
 
-  if (updated) {
-    return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
+    const rawExisting = await findRawScanForFencingCheck(
+      {
+        scanId: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+      },
+      session
+    );
+    return classifyFencedUpdateMiss({
+      doc: rawExisting,
+      expectedStatuses: [ScanLifecycleStatusValue.IN_PROGRESS],
+      leaseToken,
+      now,
+    });
+  };
+
+  if (externalSession) {
+    return await execute(externalSession);
   }
-
-  const rawExisting = await findRawScanForFencingCheck({
-    scanId: input.scanId,
-    organizationId: input.organizationId,
-    projectId: input.projectId,
-  });
-  return classifyFencedUpdateMiss({
-    doc: rawExisting,
-    expectedStatuses: [ScanLifecycleStatusValue.IN_PROGRESS],
-    leaseToken,
-    now,
-  });
+  return await runInTransaction(execute);
 }
 
 /**
  * Atomically transitions an active leased scan (`ACQUIRING` or `IN_PROGRESS`) to `FAILED` with
- * redacted failure details while respecting pending cancellations (`CANCEL_REQUESTED`) and
- * rejecting stale workers whose lease token no longer matches.
+ * redacted failure details and suppresses its dispatch outbox inside the same transaction while
+ * respecting pending cancellations (`CANCEL_REQUESTED`) and rejecting stale lease tokens.
  */
-export async function failScanWithLease(input: {
-  scanId: string;
-  organizationId: string;
-  projectId: string;
-  leaseToken: string;
-  failureCode: ScanFailureCode;
-  failureMessage: string;
-  now?: Date;
-}): Promise<FencedScanMutationResult> {
+export async function failScanWithLease(
+  input: {
+    scanId: string;
+    organizationId: string;
+    projectId: string;
+    leaseToken: string;
+    failureCode: ScanFailureCode;
+    failureMessage: string;
+    now?: Date;
+  },
+  externalSession?: ClientSession
+): Promise<FencedScanMutationResult> {
   assertValidIds(input.organizationId, input.projectId, input.scanId);
   const leaseToken = assertValidLeaseToken(input.leaseToken);
   const now = input.now ?? new Date();
   const safeMessage = redactGitHubSecrets(redactMongoUri(input.failureMessage)).slice(0, 500);
 
-  const updated = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: {
-        $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+  const execute = async (session: ClientSession): Promise<FencedScanMutationResult> => {
+    const updated = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: {
+          $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+        },
+        isActive: true,
+        'cancellation.requestedAt': null,
+        'lease.token': leaseToken,
+        'lease.expiresAt': { $gt: now },
       },
-      isActive: true,
-      'cancellation.requestedAt': null,
-      'lease.token': leaseToken,
-      'lease.expiresAt': { $gt: now },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.FAILED,
-        isActive: false,
-        failedAt: now,
-        failureCode: input.failureCode,
-        failureMessage: safeMessage,
-        lease: null,
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.FAILED,
+          isActive: false,
+          failedAt: now,
+          failureCode: input.failureCode,
+          failureMessage: safeMessage,
+          lease: null,
+        },
       },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (updated) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
     }
-  );
 
-  if (updated) {
-    return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
+    const rawExisting = await findRawScanForFencingCheck(
+      {
+        scanId: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+      },
+      session
+    );
+    return classifyFencedUpdateMiss({
+      doc: rawExisting,
+      expectedStatuses: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+      leaseToken,
+      now,
+    });
+  };
+
+  if (externalSession) {
+    return await execute(externalSession);
   }
-
-  const rawExisting = await findRawScanForFencingCheck({
-    scanId: input.scanId,
-    organizationId: input.organizationId,
-    projectId: input.projectId,
-  });
-  return classifyFencedUpdateMiss({
-    doc: rawExisting,
-    expectedStatuses: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
-    leaseToken,
-    now,
-  });
+  return await runInTransaction(execute);
 }
 
 /**
  * Safely honors a pending or in-flight cancellation from the currently leased worker, moving the
- * scan cleanly to terminal `CANCELLED` status under lease-token fencing.
+ * scan cleanly to terminal `CANCELLED` status and suppressing the dispatch outbox atomically.
  */
-export async function cancelScanWithLease(input: {
-  scanId: string;
-  organizationId: string;
-  projectId: string;
-  leaseToken: string;
-  now?: Date;
-}): Promise<FencedScanMutationResult> {
+export async function cancelScanWithLease(
+  input: {
+    scanId: string;
+    organizationId: string;
+    projectId: string;
+    leaseToken: string;
+    now?: Date;
+  },
+  externalSession?: ClientSession
+): Promise<FencedScanMutationResult> {
   assertValidIds(input.organizationId, input.projectId, input.scanId);
   const leaseToken = assertValidLeaseToken(input.leaseToken);
   const now = input.now ?? new Date();
 
-  const updated = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: {
-        $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+  const execute = async (session: ClientSession): Promise<FencedScanMutationResult> => {
+    const updated = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: {
+          $in: [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS],
+        },
+        isActive: true,
+        'lease.token': leaseToken,
+        'lease.expiresAt': { $gt: now },
       },
-      isActive: true,
-      'lease.token': leaseToken,
-      'lease.expiresAt': { $gt: now },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.CANCELLED,
-        isActive: false,
-        cancelledAt: now,
-        lease: null,
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.CANCELLED,
+          isActive: false,
+          cancelledAt: now,
+          lease: null,
+        },
       },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (updated) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
     }
-  );
 
-  if (updated) {
-    return { status: 'UPDATED', scan: toPublicScanRecord(updated) };
+    const existing = await findScanByIdInOrganization(
+      {
+        scanId: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+      },
+      session
+    );
+    return { status: 'STALE_OR_CONFLICT', scan: existing };
+  };
+
+  if (externalSession) {
+    return await execute(externalSession);
   }
-
-  const existing = await findScanByIdInOrganization({
-    scanId: input.scanId,
-    organizationId: input.organizationId,
-    projectId: input.projectId,
-  });
-  return { status: 'STALE_OR_CONFLICT', scan: existing };
+  return await runInTransaction(execute);
 }
 
 /**
@@ -1155,6 +1239,7 @@ export async function requestScanCancellation(input: {
       );
 
       if (cancelled) {
+        await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
         return {
           status: 'CANCELLED_IMMEDIATELY',
           scan: toPublicScanRecord(cancelled),
@@ -1575,7 +1660,8 @@ function assertNonNegativeIntegerMetric(value: unknown, fieldName: string): numb
  * - Sets `isActive = false`, clears `lease = null`, stamps `preparedAt`, and leaves `completedAt = null`.
  */
 export async function completeAcquisitionPreparedWithLease(
-  input: CompleteAcquisitionPreparedInput
+  input: CompleteAcquisitionPreparedInput,
+  externalSession?: ClientSession
 ): Promise<CompleteAcquisitionPreparedResult> {
   assertValidIds(input.organizationId, input.projectId, input.scanId);
   const leaseToken = assertValidLeaseToken(input.leaseToken);
@@ -1631,64 +1717,79 @@ export async function completeAcquisitionPreparedWithLease(
     return { readyDoc: doc as ScanAttributes & { resolvedCommitSha: string } };
   };
 
-  const currentDoc = await findRawScanForFencingCheck({
-    scanId: input.scanId,
-    organizationId: input.organizationId,
-    projectId: input.projectId,
-  });
-  const preCheck = inspectCurrent(currentDoc);
-  if (!('readyDoc' in preCheck)) {
-    return preCheck;
-  }
+  const execute = async (session: ClientSession): Promise<CompleteAcquisitionPreparedResult> => {
+    const currentDoc = await findRawScanForFencingCheck(
+      {
+        scanId: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+      },
+      session
+    );
+    const preCheck = inspectCurrent(currentDoc);
+    if (!('readyDoc' in preCheck)) {
+      return preCheck;
+    }
 
-  const authoritativeCommitSha = preCheck.readyDoc.resolvedCommitSha;
-  const updated = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: ScanLifecycleStatusValue.ACQUIRING,
-      isActive: true,
-      'cancellation.requestedAt': null,
-      'lease.token': leaseToken,
-      'lease.expiresAt': { $gt: now },
-      resolvedCommitSha: authoritativeCommitSha,
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.PREPARED,
-        isActive: false,
-        preparedAt: now,
-        lease: null,
-        acquisition: {
-          resolvedCommitSha: authoritativeCommitSha,
-          compressedArchiveBytes,
-          extractedBytes,
-          extractedFileCount,
-          acquisitionCompletedAt,
+    const authoritativeCommitSha = preCheck.readyDoc.resolvedCommitSha;
+    const updated = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: ScanLifecycleStatusValue.ACQUIRING,
+        isActive: true,
+        'cancellation.requestedAt': null,
+        'lease.token': leaseToken,
+        'lease.expiresAt': { $gt: now },
+        resolvedCommitSha: authoritativeCommitSha,
+      },
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.PREPARED,
+          isActive: false,
+          preparedAt: now,
+          lease: null,
+          acquisition: {
+            resolvedCommitSha: authoritativeCommitSha,
+            compressedArchiveBytes,
+            extractedBytes,
+            extractedFileCount,
+            acquisitionCompletedAt,
+          },
         },
       },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (updated) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return { status: 'PREPARED', scan: toPublicScanRecord(updated) };
     }
-  );
 
-  if (updated) {
-    return { status: 'PREPARED', scan: toPublicScanRecord(updated) };
-  }
+    const racedDoc = await findRawScanForFencingCheck(
+      {
+        scanId: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+      },
+      session
+    );
+    const postCheck = inspectCurrent(racedDoc);
+    if (!('readyDoc' in postCheck)) {
+      return postCheck;
+    }
+    return { status: 'STALE_OR_CONFLICT', scan: toPublicScanRecord(racedDoc!) };
+  };
 
-  const racedDoc = await findRawScanForFencingCheck({
-    scanId: input.scanId,
-    organizationId: input.organizationId,
-    projectId: input.projectId,
-  });
-  const postCheck = inspectCurrent(racedDoc);
-  if (!('readyDoc' in postCheck)) {
-    return postCheck;
+  if (externalSession) {
+    return await execute(externalSession);
   }
-  return { status: 'STALE_OR_CONFLICT', scan: toPublicScanRecord(racedDoc!) };
+  return await runInTransaction(execute);
 }
 
 export type ReleaseScanLeaseForRetryResult =
@@ -2196,110 +2297,153 @@ export async function recoverExpiredScanLeaseCandidate(
     projectId: string;
     now?: Date;
   },
-  session?: ClientSession
+  externalSession?: ClientSession
 ): Promise<RecoverExpiredScanLeaseResult> {
   assertValidIds(input.organizationId, input.projectId, input.scanId);
   const now = input.now ?? new Date();
   const activeStatuses = [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS];
 
-  const cancelled = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: { $in: activeStatuses },
-      isActive: true,
-      'cancellation.requestedAt': { $ne: null },
-      'lease.expiresAt': { $lte: now },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.CANCELLED,
-        isActive: false,
-        cancelledAt: now,
-        lease: null,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
-      ...(session ? { session } : {}),
-    }
-  );
-
-  if (cancelled) {
-    return { status: 'FINALIZED_CANCELLED', scan: toPublicScanRecord(cancelled) };
-  }
-
-  const exhausted = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: { $in: activeStatuses },
-      isActive: true,
-      'cancellation.requestedAt': null,
-      'lease.expiresAt': { $lte: now },
-      $expr: { $gte: ['$attemptCount', '$maxAttempts'] },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.FAILED,
-        isActive: false,
-        failedAt: now,
-        failureCode: ScanFailureCodeValue.LEASE_EXPIRED,
-        failureMessage: 'Worker lease expired after maximum allowed scan attempts',
-        lease: null,
-      },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
-      ...(session ? { session } : {}),
-    }
-  );
-
-  if (exhausted) {
-    return { status: 'FINALIZED_EXHAUSTED', scan: toPublicScanRecord(exhausted) };
-  }
-
-  const requeued = await ScanModel.findOneAndUpdate(
-    {
-      _id: input.scanId,
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      status: { $in: activeStatuses },
-      isActive: true,
-      'cancellation.requestedAt': null,
-      'lease.expiresAt': { $lte: now },
-      $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
-    },
-    {
-      $set: {
-        status: ScanLifecycleStatusValue.QUEUED,
+  const execute = async (session: ClientSession): Promise<RecoverExpiredScanLeaseResult> => {
+    const cancelled = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: { $in: activeStatuses },
         isActive: true,
-        lease: null,
-        resolvedCommitSha: null,
-        acquisition: null,
-        acquiringAt: null,
-        inProgressAt: null,
+        'cancellation.requestedAt': { $ne: null },
+        'lease.expiresAt': { $lte: now },
       },
-    },
-    {
-      returnDocument: 'after',
-      runValidators: true,
-      ...(session ? { session } : {}),
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.CANCELLED,
+          isActive: false,
+          cancelledAt: now,
+          lease: null,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (cancelled) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return { status: 'FINALIZED_CANCELLED', scan: toPublicScanRecord(cancelled) };
     }
-  );
 
-  if (requeued) {
-    return { status: 'REQUEUED_FOR_RECOVERY', scan: toPublicScanRecord(requeued) };
+    const exhausted = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: { $in: activeStatuses },
+        isActive: true,
+        'cancellation.requestedAt': null,
+        'lease.expiresAt': { $lte: now },
+        $expr: { $gte: ['$attemptCount', '$maxAttempts'] },
+      },
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.FAILED,
+          isActive: false,
+          failedAt: now,
+          failureCode: ScanFailureCodeValue.LEASE_EXPIRED,
+          failureMessage: 'Worker lease expired after maximum allowed scan attempts',
+          lease: null,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (exhausted) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return { status: 'FINALIZED_EXHAUSTED', scan: toPublicScanRecord(exhausted) };
+    }
+
+    const requeued = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: { $in: activeStatuses },
+        isActive: true,
+        'cancellation.requestedAt': null,
+        'lease.expiresAt': { $lte: now },
+        $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+      },
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.QUEUED,
+          isActive: true,
+          lease: null,
+          resolvedCommitSha: null,
+          acquisition: null,
+          acquiringAt: null,
+          inProgressAt: null,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (requeued) {
+      return { status: 'REQUEUED_FOR_RECOVERY', scan: toPublicScanRecord(requeued) };
+    }
+
+    // Catch narrow race where cancellation landed after the initial check and before exhausted/requeued updates.
+    const cancelledAfterRace = await ScanModel.findOneAndUpdate(
+      {
+        _id: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        status: { $in: activeStatuses },
+        isActive: true,
+        'cancellation.requestedAt': { $ne: null },
+        'lease.expiresAt': { $lte: now },
+      },
+      {
+        $set: {
+          status: ScanLifecycleStatusValue.CANCELLED,
+          isActive: false,
+          cancelledAt: now,
+          lease: null,
+        },
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+        session,
+      }
+    );
+
+    if (cancelledAfterRace) {
+      await suppressScanDispatchOutboxInSession({ scanId: input.scanId, now }, session);
+      return { status: 'FINALIZED_CANCELLED', scan: toPublicScanRecord(cancelledAfterRace) };
+    }
+
+    const existing = await findScanByIdInOrganization(
+      {
+        scanId: input.scanId,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+      },
+      session
+    );
+    return { status: 'ALREADY_HANDLED', scan: existing };
+  };
+
+  if (externalSession) {
+    return await execute(externalSession);
   }
-
-  const existing = await findScanByIdInOrganization({
-    scanId: input.scanId,
-    organizationId: input.organizationId,
-    projectId: input.projectId,
-  });
-  return { status: 'ALREADY_HANDLED', scan: existing };
+  return await runInTransaction(execute);
 }

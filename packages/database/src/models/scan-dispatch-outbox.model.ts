@@ -3,13 +3,16 @@ import { redactMongoUri } from '../connection.js';
 import { getOrCreateModel } from '../utils/normalization.js';
 import { redactGitHubSecrets } from '../utils/redaction.js';
 
-export const OUTBOX_DISPATCH_STATES = ['PENDING', 'DISPATCHED', 'SUPPRESSED'] as const;
+export const MAX_OUTBOX_ATTEMPTS = 25;
+
+export const OUTBOX_DISPATCH_STATES = ['PENDING', 'DISPATCHED', 'SUPPRESSED', 'EXHAUSTED'] as const;
 export type OutboxDispatchState = (typeof OUTBOX_DISPATCH_STATES)[number];
 
 export const OutboxDispatchStateValue = {
   PENDING: 'PENDING',
   DISPATCHED: 'DISPATCHED',
   SUPPRESSED: 'SUPPRESSED',
+  EXHAUSTED: 'EXHAUSTED',
 } as const satisfies Record<OutboxDispatchState, OutboxDispatchState>;
 
 function isNonNegativeInt(value: unknown): boolean {
@@ -51,10 +54,12 @@ export interface ScanDispatchOutboxAttributes {
   state: OutboxDispatchState;
   attempts: number;
   dispatchGeneration: number;
+  claimToken: string | null;
   nextAttemptAt: Date;
   lastError: string | null;
   dispatchedAt: Date | null;
   suppressedAt: Date | null;
+  exhaustedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -66,6 +71,7 @@ function sanitizeOutboxSerializedOutput(
   ret: Record<string, unknown>
 ): Record<string, unknown> {
   delete ret.__v;
+  delete ret.claimToken;
   return ret;
 }
 
@@ -100,7 +106,7 @@ export const scanDispatchOutboxSchema = new Schema<ScanDispatchOutboxAttributes>
       required: true,
       default: 0,
       min: [0, 'Dispatch attempt count cannot be negative'],
-      max: [10_000, 'Dispatch attempt count exceeds maximum allowed bound'],
+      max: [MAX_OUTBOX_ATTEMPTS, 'Dispatch attempt count exceeds maximum allowed bound'],
       validate: {
         validator: isNonNegativeInt,
         message: 'Dispatch attempts must be a non-negative integer',
@@ -116,6 +122,13 @@ export const scanDispatchOutboxSchema = new Schema<ScanDispatchOutboxAttributes>
         validator: isPositiveInt,
         message: 'Dispatch generation must be a positive integer',
       },
+    },
+    claimToken: {
+      type: String,
+      default: null,
+      select: false,
+      minlength: [16, 'Outbox claim token is too short'],
+      maxlength: [128, 'Outbox claim token cannot exceed 128 characters'],
     },
     nextAttemptAt: {
       type: Date,
@@ -133,6 +146,10 @@ export const scanDispatchOutboxSchema = new Schema<ScanDispatchOutboxAttributes>
       default: null,
     },
     suppressedAt: {
+      type: Date,
+      default: null,
+    },
+    exhaustedAt: {
       type: Date,
       default: null,
     },
@@ -158,6 +175,9 @@ scanDispatchOutboxSchema.pre('validate', function () {
     if (this.suppressedAt !== null && this.suppressedAt !== undefined) {
       this.invalidate('suppressedAt', 'PENDING outbox record must have suppressedAt set to null');
     }
+    if (this.exhaustedAt !== null && this.exhaustedAt !== undefined) {
+      this.invalidate('exhaustedAt', 'PENDING outbox record must have exhaustedAt set to null');
+    }
   } else if (this.state === OutboxDispatchStateValue.DISPATCHED) {
     if (!(this.dispatchedAt instanceof Date)) {
       this.invalidate('dispatchedAt', 'DISPATCHED outbox record requires dispatchedAt timestamp');
@@ -165,12 +185,28 @@ scanDispatchOutboxSchema.pre('validate', function () {
     if (this.suppressedAt !== null && this.suppressedAt !== undefined) {
       this.invalidate('suppressedAt', 'DISPATCHED outbox record must not set suppressedAt');
     }
+    if (this.exhaustedAt !== null && this.exhaustedAt !== undefined) {
+      this.invalidate('exhaustedAt', 'DISPATCHED outbox record must not set exhaustedAt');
+    }
   } else if (this.state === OutboxDispatchStateValue.SUPPRESSED) {
     if (!(this.suppressedAt instanceof Date)) {
       this.invalidate('suppressedAt', 'SUPPRESSED outbox record requires suppressedAt timestamp');
     }
     if (this.dispatchedAt !== null && this.dispatchedAt !== undefined) {
       this.invalidate('dispatchedAt', 'SUPPRESSED outbox record must not set dispatchedAt');
+    }
+    if (this.exhaustedAt !== null && this.exhaustedAt !== undefined) {
+      this.invalidate('exhaustedAt', 'SUPPRESSED outbox record must not set exhaustedAt');
+    }
+  } else if (this.state === OutboxDispatchStateValue.EXHAUSTED) {
+    if (!(this.exhaustedAt instanceof Date)) {
+      this.invalidate('exhaustedAt', 'EXHAUSTED outbox record requires exhaustedAt timestamp');
+    }
+    if (this.dispatchedAt !== null && this.dispatchedAt !== undefined) {
+      this.invalidate('dispatchedAt', 'EXHAUSTED outbox record must not set dispatchedAt');
+    }
+    if (this.suppressedAt !== null && this.suppressedAt !== undefined) {
+      this.invalidate('suppressedAt', 'EXHAUSTED outbox record must not set suppressedAt');
     }
   }
 });

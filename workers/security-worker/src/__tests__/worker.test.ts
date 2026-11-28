@@ -103,7 +103,7 @@ function makeConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     redisConnectTimeoutMs: 5000,
     redisMaxReconnectAttempts: 10,
     concurrency: 2,
-    lockDuration: 30_000,
+    lockDuration: 75_000,
     stalledInterval: 30_000,
     maxStalledCount: 2,
     maxStartedAttempts: 5,
@@ -164,7 +164,7 @@ describe('@vibeshield/security-worker Unit Tests', () => {
         redisConnectTimeoutMs: 5000,
         redisMaxReconnectAttempts: 10,
         concurrency: 2,
-        lockDuration: 30_000,
+        lockDuration: 75_000,
         stalledInterval: 30_000,
         maxStalledCount: 2,
         maxStartedAttempts: 5,
@@ -326,7 +326,7 @@ describe('@vibeshield/security-worker Unit Tests', () => {
           expect(mockDb.isConnected()).toBe(true);
           capturedProcessor = proc;
           expect(opts.concurrency).toBe(2);
-          expect(opts.lockDuration).toBe(30_000);
+          expect(opts.lockDuration).toBe(75_000);
           expect(opts.stalledInterval).toBe(30_000);
           expect(opts.maxStalledCount).toBe(2);
           expect(opts.maxStartedAttempts).toBe(5);

@@ -1,6 +1,7 @@
 import { Worker } from 'bullmq';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import {
+  buildScanDispatchJobOptions,
   buildScanJobId,
   closeQueueResources,
   consumeInternalAuthNonce,
@@ -103,6 +104,13 @@ describe.skipIf(!REDIS_URI)('@vibeshield/queue Real Redis & BullMQ Integration T
               throw new Error('Transient test failure on attempt 1');
             }
           }
+          if (job.id === 'scan-507f1f77bcf86cd799439012-1') {
+            throw new Error('Intentional generation-1 exhaustion failure');
+          }
+          if (job.id === 'scan-507f1f77bcf86cd799439012-2') {
+            expect(job.data).toEqual({ scanId: '507f1f77bcf86cd799439012' });
+            return;
+          }
           expect(job.data).toEqual({ scanId: '507f1f77bcf86cd799439011' });
         },
         {
@@ -131,9 +139,10 @@ describe.skipIf(!REDIS_URI)('@vibeshield/queue Real Redis & BullMQ Integration T
     expect(completedIds).toEqual(expect.arrayContaining([jobIdGen1, jobIdGen2]));
     expect(gen1AttemptsSeen).toBe(2);
 
-    // Verify exhausted failure moves job into BullMQ failed state cleanly
+    // Verify exhausted failure moves job into BullMQ failed state cleanly AND next dispatchGeneration recovers it
+    const failingScanId = '507f1f77bcf86cd799439012';
     const failingJobId = buildScanJobId({
-      scanId: '507f1f77bcf86cd799439012',
+      scanId: failingScanId,
       dispatchGeneration: 1,
     });
     const existingWorker = activeWorkers[0]!;
@@ -146,10 +155,39 @@ describe.skipIf(!REDIS_URI)('@vibeshield/queue Real Redis & BullMQ Integration T
     });
     await handle.queue.add(
       'scan',
-      { scanId: '507f1f77bcf86cd799439012' },
-      { jobId: failingJobId, attempts: 1 }
+      { scanId: failingScanId },
+      buildScanDispatchJobOptions({
+        scanId: failingScanId,
+        dispatchGeneration: 1,
+        maxAttempts: 1,
+      })
     );
     expect(await failedPromise).toBe(failingJobId);
+
+    const gen1Stored = await handle.queue.getJob(failingJobId);
+    expect(await gen1Stored?.getState()).toBe('failed');
+
+    // Generation 2 for the same scanId enqueues cleanly without colliding with retained failed gen 1
+    const recoveredDone = new Promise<string>((resolve) => {
+      existingWorker.on('completed', (job) => {
+        if (job.id === buildScanJobId({ scanId: failingScanId, dispatchGeneration: 2 })) {
+          resolve(job.id);
+        }
+      });
+    });
+    await handle.queue.add(
+      'scan',
+      { scanId: failingScanId },
+      buildScanDispatchJobOptions({
+        scanId: failingScanId,
+        dispatchGeneration: 2,
+        maxAttempts: 2,
+        backoffDelayMs: 50,
+      })
+    );
+    expect(await recoveredDone).toBe(
+      buildScanJobId({ scanId: failingScanId, dispatchGeneration: 2 })
+    );
 
     await existingWorker.close();
     activeWorkers.length = 0;

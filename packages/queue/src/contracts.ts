@@ -44,6 +44,23 @@ export const DEFAULT_QUEUE_POLICY: Readonly<QueuePolicyDefaults> = Object.freeze
 });
 
 export const MAX_JOB_PAYLOAD_BYTES = 16 * 1024; // 16 KB cap to prevent bloated Redis payloads
+export const MIN_SCAN_JOB_ATTEMPTS = 1;
+export const MAX_SCAN_JOB_ATTEMPTS = 20;
+export const DEFAULT_MONGODB_SCAN_LEASE_DURATION_MS = 60_000;
+
+export interface ScanDispatchJobOptionsInput {
+  scanId: string;
+  dispatchGeneration: number;
+  maxAttempts: number;
+  backoffDelayMs?: number;
+  priority?: number;
+  delay?: number;
+}
+
+export interface ScanDispatchJobOptions extends DefaultJobOptions {
+  jobId: string;
+  attempts: number;
+}
 
 const SENSITIVE_FIELD_NAME_REGEX =
   /token|secret|private.?key|password|authorization|cookie|pem|credential|signature|api.?key|archive|tarball|source.?code/i;
@@ -89,8 +106,8 @@ export function buildDefaultJobOptions(
   const attempts =
     typeof overrides.attempts === 'number' &&
     Number.isInteger(overrides.attempts) &&
-    overrides.attempts >= 1 &&
-    overrides.attempts <= 20
+    overrides.attempts >= MIN_SCAN_JOB_ATTEMPTS &&
+    overrides.attempts <= MAX_SCAN_JOB_ATTEMPTS
       ? overrides.attempts
       : DEFAULT_QUEUE_POLICY.attempts;
 
@@ -108,6 +125,58 @@ export function buildDefaultJobOptions(
     ...(overrides.priority !== undefined ? { priority: overrides.priority } : {}),
     ...(overrides.delay !== undefined ? { delay: overrides.delay } : {}),
     sizeLimit: overrides.sizeLimit ?? MAX_JOB_PAYLOAD_BYTES,
+  };
+}
+
+/**
+ * Builds deterministic, per-job BullMQ enqueue options derived strictly from authoritative
+ * persisted Scan/Outbox fields (`scanId`, `dispatchGeneration`, and `Scan.maxAttempts`).
+ *
+ * Alignment guarantees:
+ * - Aligns BullMQ `attempts` directly with MongoDB `Scan.maxAttempts` (`1..20`) without ever
+ *   reading retry bounds from the minimal `{ scanId }` queue payload.
+ * - Sets deterministic `jobId: scan-{scanId}-{dispatchGeneration}` so duplicate dispatches within
+ *   the same generation collapse while reconciler re-arms mint a fresh non-colliding generation ID.
+ * - Limitation: Until the active dispatcher and periodic reconciler loops are implemented, a scan
+ *   whose BullMQ job exhausts attempts early (e.g., via repeated stalled-worker re-deliveries) or
+ *   returns to `QUEUED` via expired-lease recovery relies on the reconciler calling
+ *   `rearmScanDispatchOutbox()` to mint `dispatchGeneration + 1`.
+ */
+export function buildScanDispatchJobOptions(
+  input: ScanDispatchJobOptionsInput
+): ScanDispatchJobOptions {
+  if (
+    !Number.isInteger(input.maxAttempts) ||
+    input.maxAttempts < MIN_SCAN_JOB_ATTEMPTS ||
+    input.maxAttempts > MAX_SCAN_JOB_ATTEMPTS
+  ) {
+    throw new Error(
+      `Invalid authoritative scan maxAttempts: must be an integer between ${MIN_SCAN_JOB_ATTEMPTS} and ${MAX_SCAN_JOB_ATTEMPTS}`
+    );
+  }
+
+  const jobId = buildScanJobId({
+    scanId: input.scanId,
+    dispatchGeneration: input.dispatchGeneration,
+  });
+
+  const backoffDelayMs =
+    input.backoffDelayMs === undefined
+      ? (DEFAULT_QUEUE_POLICY.backoff as { delay: number }).delay
+      : input.backoffDelayMs;
+  if (!Number.isInteger(backoffDelayMs) || backoffDelayMs < 50 || backoffDelayMs > 600_000) {
+    throw new Error('Invalid backoffDelayMs: must be an integer between 50 and 600000 ms');
+  }
+
+  return {
+    ...buildDefaultJobOptions({
+      attempts: input.maxAttempts,
+      backoff: { type: 'exponential', delay: backoffDelayMs },
+      ...(input.priority !== undefined ? { priority: input.priority } : {}),
+      ...(input.delay !== undefined ? { delay: input.delay } : {}),
+    }),
+    jobId,
+    attempts: input.maxAttempts,
   };
 }
 

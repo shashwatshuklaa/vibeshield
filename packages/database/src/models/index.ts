@@ -129,6 +129,7 @@ export {
 } from './scan.model.js';
 
 export {
+  MAX_OUTBOX_ATTEMPTS,
   OUTBOX_DISPATCH_STATES,
   OutboxDispatchStateValue,
   scanDispatchOutboxSchema,

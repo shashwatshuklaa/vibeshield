@@ -4,12 +4,14 @@ import {
   buildDefaultJobOptions,
   buildInternalAuthNonceKey,
   buildRedisConnectionOptions,
+  buildScanDispatchJobOptions,
   buildScanJobId,
   buildWorkerPolicyOptions,
   closeQueueResources,
   closeWorkerWithGrace,
   consumeInternalAuthNonce,
   createBullWorker,
+  DEFAULT_MONGODB_SCAN_LEASE_DURATION_MS,
   DEFAULT_QUEUE_POLICY,
   DEFAULT_WORKER_POLICY,
   defaultRedisManager,
@@ -19,8 +21,11 @@ import {
   isTlsRedisUrl,
   isValidQueueName,
   isValidRedisUrl,
+  isWorkerLockAlignedWithScanLease,
   JOB_PRIORITIES,
   MAX_JOB_PAYLOAD_BYTES,
+  MAX_SCAN_JOB_ATTEMPTS,
+  MIN_SCAN_JOB_ATTEMPTS,
   QUEUE_NAMES,
   redactRedisUrl,
   RedisConnectionError,
@@ -302,6 +307,42 @@ describe('@vibeshield/queue Unit Tests', () => {
       expect(hardened.attempts).toBe(DEFAULT_QUEUE_POLICY.attempts);
       expect(hardened.removeOnComplete).toEqual(DEFAULT_QUEUE_POLICY.removeOnComplete);
       expect(JOB_PRIORITIES.HIGH).toBeLessThan(JOB_PRIORITIES.NORMAL);
+
+      // Authoritative per-job dispatch options align BullMQ attempts with Scan.maxAttempts
+      const dispatchOpts = buildScanDispatchJobOptions({
+        scanId: '507F1F77BCF86CD799439011',
+        dispatchGeneration: 3,
+        maxAttempts: 5,
+        backoffDelayMs: 2500,
+      });
+      expect(dispatchOpts.jobId).toBe('scan-507f1f77bcf86cd799439011-3');
+      expect(dispatchOpts.attempts).toBe(5);
+      expect(dispatchOpts.backoff).toEqual({ type: 'exponential', delay: 2500 });
+      expect(dispatchOpts.removeOnComplete).toEqual(DEFAULT_QUEUE_POLICY.removeOnComplete);
+      expect(dispatchOpts.removeOnFail).toEqual(DEFAULT_QUEUE_POLICY.removeOnFail);
+
+      expect(() =>
+        buildScanDispatchJobOptions({
+          scanId: '507f1f77bcf86cd799439011',
+          dispatchGeneration: 1,
+          maxAttempts: MIN_SCAN_JOB_ATTEMPTS - 1,
+        })
+      ).toThrow(/maxAttempts/);
+      expect(() =>
+        buildScanDispatchJobOptions({
+          scanId: '507f1f77bcf86cd799439011',
+          dispatchGeneration: 1,
+          maxAttempts: MAX_SCAN_JOB_ATTEMPTS + 1,
+        })
+      ).toThrow(/maxAttempts/);
+      expect(() =>
+        buildScanDispatchJobOptions({
+          scanId: '507f1f77bcf86cd799439011',
+          dispatchGeneration: 1,
+          maxAttempts: 3,
+          backoffDelayMs: 10,
+        })
+      ).toThrow(/backoffDelayMs/);
     });
 
     it('validates strict { scanId } payloads and rejects unknown fields, invalid IDs, and credentials', () => {
@@ -382,8 +423,23 @@ describe('@vibeshield/queue Unit Tests', () => {
       expect(manager.getState()).toBe('not_initialized');
     });
 
-    it('validates worker policy defaults, bounded overrides, and worker factory guards', async () => {
+    it('validates worker policy defaults, bounded overrides, lease-lock alignment, and worker factory guards', async () => {
       expect(buildWorkerPolicyOptions()).toEqual(DEFAULT_WORKER_POLICY);
+      expect(DEFAULT_WORKER_POLICY.lockDuration).toBeGreaterThan(
+        DEFAULT_MONGODB_SCAN_LEASE_DURATION_MS
+      );
+      expect(
+        isWorkerLockAlignedWithScanLease({
+          lockDurationMs: DEFAULT_WORKER_POLICY.lockDuration,
+          scanLeaseDurationMs: DEFAULT_MONGODB_SCAN_LEASE_DURATION_MS,
+        })
+      ).toBe(true);
+      expect(
+        isWorkerLockAlignedWithScanLease({
+          lockDurationMs: 30_000,
+          scanLeaseDurationMs: 60_000,
+        })
+      ).toBe(false);
 
       expect(
         buildWorkerPolicyOptions({

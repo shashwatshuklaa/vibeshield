@@ -18,6 +18,7 @@ import {
   isValidScanLifecycleTransition,
   loadScanExecutionTarget,
   markScanDispatchSucceeded,
+  MAX_OUTBOX_ATTEMPTS,
   OutboxDispatchStateValue,
   ProjectModel,
   rearmScanDispatchOutbox,
@@ -49,6 +50,14 @@ function makeValidScanInput(overrides: Record<string, unknown> = {}) {
     isActive: true,
     ...overrides,
   };
+}
+
+function makeMockSession() {
+  const session = {
+    withTransaction: async (fn: () => Promise<unknown>) => await fn(),
+    endSession: async () => undefined,
+  };
+  return vi.spyOn(mongoose, 'startSession').mockResolvedValue(session as never);
 }
 
 describe('ScanModel & Scan Lifecycle Unit Tests', () => {
@@ -231,13 +240,64 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
       expect(findOneSpy).not.toHaveBeenCalled();
     });
 
-    it('returns STALE_OR_CONFLICT or CANCEL_REQUESTED when fenced lease updates match zero documents', async () => {
+    it('returns STALE_OR_CONFLICT or CANCEL_REQUESTED when fenced lease updates match zero documents and requires stored lease token (L3)', async () => {
+      makeMockSession();
       const orgId = new mongoose.Types.ObjectId().toString();
       const projId = new mongoose.Types.ObjectId().toString();
       const scanId = new mongoose.Types.ObjectId().toString();
       const leaseToken = 'fencing_token_1234567890abcdef';
+      const now = new Date();
 
       vi.spyOn(ScanModel, 'findOneAndUpdate').mockResolvedValue(null);
+      const existingAcquiringMissingLeaseWithCancel = new ScanModel(
+        makeValidScanInput({
+          _id: scanId,
+          organizationId: orgId,
+          projectId: projId,
+          status: ScanLifecycleStatusValue.ACQUIRING,
+          isActive: true,
+          lease: null,
+          cancellation: {
+            requestedAt: now,
+            requestedByUserId: null,
+            reason: 'User cancelled',
+          },
+        })
+      );
+      vi.spyOn(ScanModel, 'findOne').mockResolvedValue(
+        existingAcquiringMissingLeaseWithCancel as never
+      );
+
+      // L3: Missing/null lease subdocument MUST return STALE_OR_CONFLICT even if cancellation is set
+      await expect(
+        transitionScanToInProgress({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken,
+          acquisition: {
+            resolvedCommitSha: 'b'.repeat(40),
+            compressedArchiveBytes: 512,
+            extractedBytes: 1024,
+            extractedFileCount: 12,
+          },
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      await expect(
+        failScanWithLease({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken,
+          failureCode: ScanFailureCodeValue.ACQUISITION_FAILED,
+          failureMessage: 'Failed',
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      // Valid active ACQUIRING lease + pending cancellation -> CANCEL_REQUESTED
       const existingAcquiringWithCancel = new ScanModel(
         makeValidScanInput({
           _id: scanId,
@@ -245,8 +305,15 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
           projectId: projId,
           status: ScanLifecycleStatusValue.ACQUIRING,
           isActive: true,
+          lease: {
+            workerId: 'worker-1',
+            token: leaseToken,
+            acquiredAt: now,
+            heartbeatAt: now,
+            expiresAt: new Date(now.getTime() + 60_000),
+          },
           cancellation: {
-            requestedAt: new Date(),
+            requestedAt: now,
             requestedByUserId: null,
             reason: 'User cancelled',
           },
@@ -265,15 +332,16 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
           extractedBytes: 1024,
           extractedFileCount: 12,
         },
+        now,
       });
       expect(transitionResult.status).toBe('CANCEL_REQUESTED');
 
       await expect(
-        renewScanWorkerLease({ scanId, organizationId: orgId, projectId: projId, leaseToken })
+        renewScanWorkerLease({ scanId, organizationId: orgId, projectId: projId, leaseToken, now })
       ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
 
       await expect(
-        completeScanWithLease({ scanId, organizationId: orgId, projectId: projId, leaseToken })
+        completeScanWithLease({ scanId, organizationId: orgId, projectId: projId, leaseToken, now })
       ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
 
       await expect(
@@ -284,15 +352,15 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
           leaseToken,
           failureCode: ScanFailureCodeValue.ACQUISITION_FAILED,
           failureMessage: 'Failed',
+          now,
         })
       ).resolves.toMatchObject({ status: 'CANCEL_REQUESTED' });
 
       await expect(
-        cancelScanWithLease({ scanId, organizationId: orgId, projectId: projId, leaseToken })
+        cancelScanWithLease({ scanId, organizationId: orgId, projectId: projId, leaseToken, now })
       ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
 
       // Active IN_PROGRESS scan with matching valid lease + pending cancellation returns CANCEL_REQUESTED
-      const now = new Date();
       const inProgressWithCancel = new ScanModel(
         makeValidScanInput({
           _id: scanId,
@@ -422,6 +490,7 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
     });
 
     it('fences completeAcquisitionPreparedWithLease strictly by DB commit SHA, lease token, and cancellation state', async () => {
+      makeMockSession();
       const orgId = new mongoose.Types.ObjectId().toString();
       const projId = new mongoose.Types.ObjectId().toString();
       const scanId = new mongoose.Types.ObjectId().toString();
@@ -579,6 +648,8 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
           })
         ) as never
       );
+      vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate').mockResolvedValueOnce(null);
+      vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockResolvedValueOnce(null);
 
       const preparedRes = await completeAcquisitionPreparedWithLease({
         scanId,
@@ -800,17 +871,26 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
       expect(capturedLimit).toBe(100);
     });
 
-    it('validates ScanDispatchOutboxModel state invariants, generation fencing, and secret redaction', async () => {
+    it('validates ScanDispatchOutboxModel state invariants, generation + claimToken fencing, exhaustion ceiling, and secret redaction', async () => {
+      makeMockSession();
       const base = {
         scanId: new mongoose.Types.ObjectId(),
         organizationId: new mongoose.Types.ObjectId(),
         projectId: new mongoose.Types.ObjectId(),
       };
 
-      const validPending = new ScanDispatchOutboxModel({ ...base });
+      const validPending = new ScanDispatchOutboxModel({
+        ...base,
+        claimToken: 'secret_outbox_claim_token_123456',
+      });
       expect(validPending.validateSync()).toBeUndefined();
       expect(validPending.state).toBe(OutboxDispatchStateValue.PENDING);
       expect(validPending.dispatchGeneration).toBe(1);
+
+      // claimToken must never leak via JSON serialization or object conversion
+      const jsonOut = validPending.toJSON() as unknown as Record<string, unknown>;
+      expect(jsonOut.claimToken).toBeUndefined();
+      expect(JSON.stringify(validPending)).not.toContain('secret_outbox_claim_token_123456');
 
       const invalidPendingWithDispatchedAt = new ScanDispatchOutboxModel({
         ...base,
@@ -833,11 +913,32 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
       });
       await expect(invalidSuppressedWithoutTime.validate()).rejects.toThrow(/suppressedAt/i);
 
+      const invalidExhaustedWithoutTime = new ScanDispatchOutboxModel({
+        ...base,
+        state: OutboxDispatchStateValue.EXHAUSTED,
+        exhaustedAt: null,
+      });
+      await expect(invalidExhaustedWithoutTime.validate()).rejects.toThrow(/exhaustedAt/i);
+
+      const validExhausted = new ScanDispatchOutboxModel({
+        ...base,
+        state: OutboxDispatchStateValue.EXHAUSTED,
+        attempts: MAX_OUTBOX_ATTEMPTS,
+        exhaustedAt: new Date(),
+      });
+      expect(validExhausted.validateSync()).toBeUndefined();
+
       const badGeneration = new ScanDispatchOutboxModel({ ...base, dispatchGeneration: 0 });
       expect(badGeneration.validateSync()?.errors.dispatchGeneration).toBeDefined();
 
       const badAttempts = new ScanDispatchOutboxModel({ ...base, attempts: -1 });
       expect(badAttempts.validateSync()?.errors.attempts).toBeDefined();
+
+      const overMaxAttempts = new ScanDispatchOutboxModel({
+        ...base,
+        attempts: MAX_OUTBOX_ATTEMPTS + 1,
+      });
+      expect(overMaxAttempts.validateSync()?.errors.attempts).toBeDefined();
 
       const withSecretErr = new ScanDispatchOutboxModel({
         ...base,
@@ -851,20 +952,62 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
       const scanIdHex = base.scanId.toString();
       expect(formatScanDispatchJobId(scanIdHex, 3)).toBe(`scan-${scanIdHex}-3`);
 
-      // Old dispatcher fencing checks
+      // Rejects invalid/missing claimToken before querying MongoDB
+      await expect(
+        markScanDispatchSucceeded({
+          scanId: scanIdHex,
+          dispatchGeneration: 1,
+          claimToken: 'short',
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_OUTBOX_CLAIM_TOKEN' });
+
+      await expect(
+        recordScanDispatchFailure({
+          scanId: scanIdHex,
+          dispatchGeneration: 1,
+          claimToken: 'short',
+          errorMessage: 'Redis down',
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_OUTBOX_CLAIM_TOKEN' });
+
+      // Stale claimToken within same PENDING generation -> STALE_CLAIM
       vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate').mockResolvedValueOnce(null);
       vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockResolvedValueOnce(validPending as never);
       await expect(
-        markScanDispatchSucceeded({ scanId: scanIdHex, dispatchGeneration: 1 })
-      ).resolves.toEqual({ status: 'STALE_GENERATION' });
+        markScanDispatchSucceeded({
+          scanId: scanIdHex,
+          dispatchGeneration: 1,
+          claimToken: 'old_supplanted_claim_token_123456',
+        })
+      ).resolves.toEqual({ status: 'STALE_CLAIM' });
 
-      vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate').mockResolvedValueOnce(null);
+      vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate')
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null);
       vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockResolvedValueOnce(validPending as never);
       await expect(
         recordScanDispatchFailure({
           scanId: scanIdHex,
           dispatchGeneration: 1,
+          claimToken: 'old_supplanted_claim_token_123456',
           errorMessage: 'Redis down',
+        })
+      ).resolves.toEqual({ status: 'STALE_CLAIM' });
+
+      // Old dispatcher generation mismatch -> STALE_GENERATION
+      vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate').mockResolvedValueOnce(null);
+      vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockResolvedValueOnce(
+        new ScanDispatchOutboxModel({
+          ...base,
+          dispatchGeneration: 2,
+          state: OutboxDispatchStateValue.PENDING,
+        }) as never
+      );
+      await expect(
+        markScanDispatchSucceeded({
+          scanId: scanIdHex,
+          dispatchGeneration: 1,
+          claimToken: 'any_valid_claim_token_1234567890',
         })
       ).resolves.toEqual({ status: 'STALE_GENERATION' });
 
@@ -872,6 +1015,7 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
       vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockReturnValueOnce({
         session: vi.fn(async () => validPending),
       } as never);
+      vi.spyOn(ScanModel, 'findOneAndUpdate').mockResolvedValueOnce(null);
       vi.spyOn(ScanModel, 'findOne').mockReturnValueOnce({
         select: () => ({
           session: () => ({

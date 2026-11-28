@@ -11,6 +11,7 @@ import {
 } from 'bullmq';
 import {
   buildDefaultJobOptions,
+  DEFAULT_MONGODB_SCAN_LEASE_DURATION_MS,
   DEFAULT_QUEUE_POLICY,
   isValidQueueName,
   QUEUE_KEY_PREFIX,
@@ -33,13 +34,36 @@ import type {
 
 export { UnrecoverableError, type Job, type Processor };
 
+/**
+ * Default BullMQ worker lock and stalled-job timings.
+ * `lockDuration` (75_000 ms) intentionally exceeds `DEFAULT_MONGODB_SCAN_LEASE_DURATION_MS`
+ * (60_000 ms) so crashed workers' BullMQ locks do not expire and trigger premature stalled
+ * re-deliveries before the authoritative MongoDB lease expires (healthy workers renew locks
+ * automatically at `lockDuration / 2`).
+ */
 export const DEFAULT_WORKER_POLICY = Object.freeze({
   concurrency: 2,
-  lockDuration: 30_000,
+  lockDuration: 75_000,
   stalledInterval: 30_000,
   maxStalledCount: 2,
   maxStartedAttempts: 5,
 });
+
+/**
+ * Verifies whether BullMQ worker `lockDurationMs` exceeds the MongoDB `scanLeaseDurationMs` so
+ * stalled-job detection does not prematurely re-deliver a job while its Mongo lease is still valid.
+ */
+export function isWorkerLockAlignedWithScanLease(input: {
+  lockDurationMs: number;
+  scanLeaseDurationMs?: number;
+}): boolean {
+  const leaseDurationMs = input.scanLeaseDurationMs ?? DEFAULT_MONGODB_SCAN_LEASE_DURATION_MS;
+  return (
+    Number.isFinite(input.lockDurationMs) &&
+    Number.isFinite(leaseDurationMs) &&
+    input.lockDurationMs > leaseDurationMs
+  );
+}
 
 export interface ManagedQueueHandle<TData = ScanQueueJobPayload, TName extends string = string> {
   readonly name: string;
