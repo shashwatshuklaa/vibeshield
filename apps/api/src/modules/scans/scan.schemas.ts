@@ -1,3 +1,4 @@
+import { isValidObjectId } from '@vibeshield/database';
 import { SCAN_LIFECYCLE_STATUSES, SCAN_TRIGGER_SOURCES } from '@vibeshield/types';
 import { z } from '@vibeshield/env';
 
@@ -32,6 +33,39 @@ function isValidGitRef(value: string): boolean {
 
 const SAFE_IDENTIFIER_REGEX = /^[A-Za-z0-9._-]{1,128}$/;
 
+function objectIdParamSchema(label: string) {
+  return z
+    .string()
+    .trim()
+    .refine((value) => isValidObjectId(value), {
+      message: `${label} must be a valid ObjectId`,
+    });
+}
+
+function safeIdentifierSchema(label: string) {
+  return z
+    .string()
+    .trim()
+    .regex(
+      SAFE_IDENTIFIER_REGEX,
+      `${label} must be 1–128 characters: letters, digits, dots, underscores, hyphens`
+    )
+    .refine((value) => !INLINE_SECRET_CHECK_REGEX.test(value), {
+      message: `${label} must not contain secret or token patterns`,
+    })
+    .nullable()
+    .optional();
+}
+
+export const scanProjectParamsSchema = z.object({
+  projectId: objectIdParamSchema('Project ID'),
+});
+
+export const scanItemParamsSchema = z.object({
+  projectId: objectIdParamSchema('Project ID'),
+  scanId: objectIdParamSchema('Scan ID'),
+});
+
 /**
  * Schema for `POST /api/v1/organizations/:organizationId/projects/:projectId/scans`.
  *
@@ -50,24 +84,8 @@ export const createScanBodySchema = z
         message:
           'Git reference contains invalid characters or patterns (control characters, path traversal, embedded secrets)',
       }),
-    idempotencyKey: z
-      .string()
-      .trim()
-      .regex(
-        SAFE_IDENTIFIER_REGEX,
-        'Idempotency key must be 1–128 characters: letters, digits, dots, underscores, hyphens'
-      )
-      .nullable()
-      .optional(),
-    correlationId: z
-      .string()
-      .trim()
-      .regex(
-        SAFE_IDENTIFIER_REGEX,
-        'Correlation ID must be 1–128 characters: letters, digits, dots, underscores, hyphens'
-      )
-      .nullable()
-      .optional(),
+    idempotencyKey: safeIdentifierSchema('Idempotency key'),
+    correlationId: safeIdentifierSchema('Correlation ID'),
   })
   .strict();
 

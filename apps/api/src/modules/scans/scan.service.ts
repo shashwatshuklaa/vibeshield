@@ -1,21 +1,24 @@
 import {
+  acquireOrganizationMutationLock,
   createQueuedScanWithOutbox,
   findScanByIdInOrganization,
-  isValidObjectId,
-  listScansPagedByProjectInOrganization,
-  ProjectRepositoryConnectionModel,
-  OrganizationMembershipModel,
-  requestScanCancellation,
-  runInTransaction,
-  acquireOrganizationMutationLock,
-  ProjectModel,
+  getEffectiveConnectionStatus,
   GitHubInstallationModel,
   GitHubInstallationStatusValue,
-  getEffectiveConnectionStatus,
+  isValidObjectId,
+  listScansPagedByProjectInOrganization,
+  OrganizationMembershipModel,
+  ProjectModel,
+  ProjectRepositoryConnectionModel,
+  requestScanCancellation,
+  runInTransaction,
 } from '@vibeshield/database';
+
+type TransactionSession = Parameters<Parameters<typeof runInTransaction>[0]>[0];
 import {
   hasOrganizationPermission,
   OrganizationPermission,
+  type OrganizationPermissionType,
 } from '../organizations/organization.permissions.js';
 import { OrganizationError } from '../organizations/organization.types.js';
 import type { PublicScanRecord } from '@vibeshield/types';
@@ -31,6 +34,60 @@ function isMongoDuplicateKeyError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const err = error as { code?: unknown; cause?: { code?: unknown } };
   return err.code === 11000 || err.cause?.code === 11000;
+}
+
+function assertValidProjectIdentifier(projectId: string): void {
+  if (!isValidObjectId(projectId)) {
+    throw new ScanError(400, 'VALIDATION_ERROR', 'Invalid project identifier', [
+      { field: 'projectId', message: 'Project ID must be a valid ObjectId' },
+    ]);
+  }
+}
+
+function assertValidScanIdentifier(scanId: string): void {
+  if (!isValidObjectId(scanId)) {
+    throw new ScanError(400, 'VALIDATION_ERROR', 'Invalid scan identifier', [
+      { field: 'scanId', message: 'Scan ID must be a valid ObjectId' },
+    ]);
+  }
+}
+
+/**
+ * Acquires the per-organization mutation lock and re-validates actor membership + permission
+ * inside the active MongoDB transaction so concurrent membership removal or role demotion
+ * cannot be bypassed via middleware TOCTOU.
+ */
+async function assertActorPermissionInOrganizationTx(
+  actorUserId: string,
+  organizationId: string,
+  permission: OrganizationPermissionType,
+  session: TransactionSession
+): Promise<void> {
+  const locked = await acquireOrganizationMutationLock(organizationId, session);
+  if (!locked) {
+    throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+  }
+
+  const membership = await OrganizationMembershipModel.findOne({
+    organizationId,
+    userId: actorUserId,
+    status: 'ACTIVE',
+  })
+    .session(session)
+    .lean();
+
+  if (!membership) {
+    throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+  }
+
+  if (
+    !hasOrganizationPermission(
+      membership.role as Parameters<typeof hasOrganizationPermission>[0],
+      permission
+    )
+  ) {
+    throw new OrganizationError(403, 'FORBIDDEN', 'Insufficient organization permissions');
+  }
 }
 
 export interface ScanServiceDependencies {
@@ -69,13 +126,14 @@ export interface ScanService {
  * Creates the public scan management service.
  *
  * Security model:
- * - `createScan` acquires the organization mutation lock inside a MongoDB transaction,
- *   re-validates actor membership and permission, then verifies the project, its connected
- *   repository, and the parent GitHub installation before atomically creating the scan +
- *   dispatch outbox. Repository identifiers are NEVER accepted from the request body.
- * - `cancelScan` delegates entirely to `requestScanCancellation`, which owns its own
- *   transaction and mutation lock. No manual state machine is re-implemented here.
- * - `listScans` and `getScan` are tenant-scoped reads; they never expose internal fields.
+ * - Both `createScan` and `cancelScan` acquire the organization mutation lock inside a
+ *   MongoDB transaction and re-validate actor membership + permission before mutating state.
+ * - `createScan` verifies the project, active non-archived GitHub repository connection, and
+ *   matching active parent GitHub installation before atomically creating the scan + outbox.
+ *   Repository identifiers are NEVER accepted from the request body.
+ * - `cancelScan` delegates cancellation transitions & outbox suppression to
+ *   `requestScanCancellation` within the same authorized transaction.
+ * - `listScans` and `getScan` are tenant-scoped reads validating identifiers at the boundary.
  */
 export function createScanService(dependencies: ScanServiceDependencies = {}): ScanService {
   const getNow = dependencies.now ?? (() => new Date());
@@ -87,12 +145,10 @@ export function createScanService(dependencies: ScanServiceDependencies = {}): S
       projectId: string,
       input: CreateScanInput
     ): Promise<PublicScanRecord> {
-      if (!isValidObjectId(organizationId)) {
+      if (!isValidObjectId(organizationId) || !isValidObjectId(actorUserId)) {
         throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
       }
-      if (!isValidObjectId(projectId)) {
-        throw new ScanError(400, 'INVALID_PROJECT_ID', 'Invalid project ID');
-      }
+      assertValidProjectIdentifier(projectId);
 
       const now = getNow();
 
@@ -101,32 +157,12 @@ export function createScanService(dependencies: ScanServiceDependencies = {}): S
       try {
         scan = await runInTransaction(async (session) => {
           // 1. Acquire organization mutation lock and re-validate membership + permission inside tx
-          const locked = await acquireOrganizationMutationLock(organizationId, session);
-          if (!locked) {
-            throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
-          }
-
-          // Re-validate membership in-transaction (TOCTOU protection)
-          const membership = await OrganizationMembershipModel.findOne({
+          await assertActorPermissionInOrganizationTx(
+            actorUserId,
             organizationId,
-            userId: actorUserId,
-            status: 'ACTIVE',
-          })
-            .session(session)
-            .lean();
-
-          if (!membership) {
-            throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
-          }
-
-          if (
-            !hasOrganizationPermission(
-              membership.role as Parameters<typeof hasOrganizationPermission>[0],
-              OrganizationPermission.SCAN_CREATE
-            )
-          ) {
-            throw new OrganizationError(403, 'FORBIDDEN', 'Insufficient organization permissions');
-          }
+            OrganizationPermission.SCAN_CREATE,
+            session
+          );
 
           // 2. Verify project belongs to org and is not archived
           const project = await ProjectModel.findOne({
@@ -172,7 +208,15 @@ export function createScanService(dependencies: ScanServiceDependencies = {}): S
             );
           }
 
-          // 4. Verify parent GitHub installation is active
+          if (connection.isArchivedOnGitHub === true) {
+            throw new ScanError(
+              409,
+              'REPOSITORY_ARCHIVED',
+              'Connected GitHub repository is archived and cannot accept new scans'
+            );
+          }
+
+          // 4. Verify parent GitHub installation is active and matches connection metadata
           const installation = await GitHubInstallationModel.findOne({
             _id: connection.installationRecordId,
             organizationId,
@@ -186,12 +230,13 @@ export function createScanService(dependencies: ScanServiceDependencies = {}): S
 
           if (
             installation.status !== GitHubInstallationStatusValue.ACTIVE ||
-            installation.isActive !== true
+            installation.isActive !== true ||
+            installation.githubInstallationId !== connection.githubInstallationId
           ) {
             throw new ScanError(
               409,
               'INSTALLATION_UNAVAILABLE',
-              'GitHub installation is suspended or revoked'
+              'GitHub installation is suspended, revoked, or mismatched'
             );
           }
 
@@ -234,6 +279,11 @@ export function createScanService(dependencies: ScanServiceDependencies = {}): S
       projectId: string,
       query: ListScansQuery
     ): Promise<PaginatedScansResult> {
+      if (!isValidObjectId(organizationId)) {
+        throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+      }
+      assertValidProjectIdentifier(projectId);
+
       const { scans, total } = await listScansPagedByProjectInOrganization({
         organizationId,
         projectId,
@@ -264,6 +314,12 @@ export function createScanService(dependencies: ScanServiceDependencies = {}): S
       projectId: string,
       scanId: string
     ): Promise<PublicScanRecord> {
+      if (!isValidObjectId(organizationId)) {
+        throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+      }
+      assertValidProjectIdentifier(projectId);
+      assertValidScanIdentifier(scanId);
+
       const scan = await findScanByIdInOrganization({ organizationId, projectId, scanId });
       if (!scan) {
         throw new ScanError(404, 'SCAN_NOT_FOUND', 'Scan not found');
@@ -281,12 +337,32 @@ export function createScanService(dependencies: ScanServiceDependencies = {}): S
       result: 'CANCELLED_IMMEDIATELY' | 'CANCELLATION_REQUESTED';
       scan: PublicScanRecord;
     }> {
-      const outcome = await requestScanCancellation({
-        scanId,
-        organizationId,
-        projectId,
-        requestedByUserId: actorUserId,
-        reason: input.reason ?? null,
+      if (!isValidObjectId(organizationId) || !isValidObjectId(actorUserId)) {
+        throw new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found');
+      }
+      assertValidProjectIdentifier(projectId);
+      assertValidScanIdentifier(scanId);
+
+      const now = getNow();
+      const outcome = await runInTransaction(async (session) => {
+        await assertActorPermissionInOrganizationTx(
+          actorUserId,
+          organizationId,
+          OrganizationPermission.SCAN_CANCEL,
+          session
+        );
+
+        return await requestScanCancellation(
+          {
+            scanId,
+            organizationId,
+            projectId,
+            requestedByUserId: actorUserId,
+            reason: input.reason ?? null,
+            now,
+          },
+          session
+        );
       });
 
       if (outcome.status === 'NOT_FOUND') {
@@ -305,7 +381,6 @@ export function createScanService(dependencies: ScanServiceDependencies = {}): S
         return { result: 'CANCELLED_IMMEDIATELY', scan: outcome.scan };
       }
 
-      // CANCELLATION_REQUESTED
       return { result: 'CANCELLATION_REQUESTED', scan: outcome.scan };
     },
   };

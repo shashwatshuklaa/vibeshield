@@ -610,7 +610,8 @@ export async function consumeScanCreationRateLimit(
       );
     }
 
-    const effectiveTtlMs = ttlMs > 0 ? ttlMs : input.windowMs;
+    // Lua repairs ttl < 0 to ARGV[1], so ttlMs === 0 only occurs when <1ms remains before expiry.
+    const effectiveTtlMs = Math.max(1, ttlMs);
     const nowMs = input.nowMs ?? Date.now();
     const allowed = current <= input.maxRequests;
     const remaining = Math.max(0, input.maxRequests - current);

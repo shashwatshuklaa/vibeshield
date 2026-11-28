@@ -305,7 +305,20 @@ describe.skipIf(!REDIS_URI)('Scan Creation Rate Limiting — Real Redis Integrat
     expect(r3.status).toBe(429);
     expect(r3.body.error.code).toBe('RATE_LIMIT_EXCEEDED');
 
-    // 2. User 2 in Org 2 is unaffected
+    // 2. Concurrent burst against real Redis Lua script: strictly 2 allowed, 4 blocked (429)
+    const burstUser = await setupUserAndOrg('burst');
+    const burstResults = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        request(app)
+          .post(`/api/v1/organizations/${burstUser.orgId}/projects/${projectId}/scans`)
+          .set('Authorization', `Bearer ${burstUser.token}`)
+          .send({ requestedRef: 'main' })
+      )
+    );
+    const burstStatuses = burstResults.map((r) => r.status).sort((a, b) => a - b);
+    expect(burstStatuses).toEqual([201, 201, 429, 429, 429, 429]);
+
+    // 3. User 2 in Org 2 is unaffected
     const u2r1 = await request(app)
       .post(`/api/v1/organizations/${user2.orgId}/projects/${projectId}/scans`)
       .set('Authorization', `Bearer ${user2.token}`)

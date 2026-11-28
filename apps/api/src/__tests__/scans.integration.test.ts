@@ -1,7 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import request from 'supertest';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  claimQueuedScanForAcquisition,
+  completeScanWithLease,
   connectDatabase,
   disconnectDatabase,
   GitHubInstallationModel,
@@ -15,11 +17,13 @@ import {
   ScanDispatchOutboxModel,
   ScanModel,
   SessionModel,
+  transitionScanToInProgress,
   UserModel,
 } from '@vibeshield/database';
 import { createApp } from '../app.js';
 import { createScanCreationRateLimiter } from '../middlewares/scan-rate-limit.js';
 import type { AuthRuntimeConfig } from '../modules/auth/auth.types.js';
+import { createScanService } from '../modules/scans/scan.service.js';
 
 const REPLICA_URI = process.env.MONGODB_INTEGRATION_URI;
 
@@ -370,5 +374,306 @@ describe.skipIf(!REPLICA_URI)('Public Scan API — Real MongoDB Integration Test
       .set('Authorization', `Bearer ${orgA.token}`);
     expect(idorOrg.status).toBe(404);
     expect(idorOrg.body.error.code).toBe('ORGANIZATION_NOT_FOUND');
+  });
+
+  it('handles concurrent duplicate idempotencyKey creation and rolls back scan when outbox creation fails', async () => {
+    const app = buildApp();
+    const seeded = await seedOrgProjectAndConnection(app, 'conc-idem');
+
+    // 1. Concurrent duplicate idempotencyKey: strictly one 201 and one 409 SCAN_ALREADY_EXISTS
+    const [r1, r2] = await Promise.all([
+      request(app)
+        .post(`/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans`)
+        .set('Authorization', `Bearer ${seeded.token}`)
+        .send({ requestedRef: 'main', idempotencyKey: 'concurrent-idem-1' }),
+      request(app)
+        .post(`/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans`)
+        .set('Authorization', `Bearer ${seeded.token}`)
+        .send({ requestedRef: 'main', idempotencyKey: 'concurrent-idem-1' }),
+    ]);
+
+    const statuses = [r1.status, r2.status].sort((a, b) => a - b);
+    expect(statuses).toEqual([201, 409]);
+    expect(await ScanModel.countDocuments({ projectId: seeded.projectId })).toBe(1);
+    expect(await ScanDispatchOutboxModel.countDocuments({ projectId: seeded.projectId })).toBe(1);
+
+    // 2. Outbox-failure transaction rollback: neither scan nor outbox persists
+    const createSpy = vi
+      .spyOn(ScanDispatchOutboxModel, 'create')
+      .mockRejectedValueOnce(new Error('Simulated outbox failure'));
+    try {
+      const failRes = await request(app)
+        .post(`/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans`)
+        .set('Authorization', `Bearer ${seeded.token}`)
+        .send({ requestedRef: 'main', idempotencyKey: 'rollback-test-key' });
+      expect(failRes.status).toBe(500);
+    } finally {
+      createSpy.mockRestore();
+    }
+
+    expect(
+      await ScanModel.countDocuments({
+        projectId: seeded.projectId,
+        idempotencyKey: 'rollback-test-key',
+      })
+    ).toBe(0);
+    expect(await ScanDispatchOutboxModel.countDocuments({ projectId: seeded.projectId })).toBe(1);
+  });
+
+  it('rejects scan creation when GitHub repository is archived or installation ID mismatches connection', async () => {
+    const app = buildApp();
+    const seeded = await seedOrgProjectAndConnection(app, 'conn-state');
+
+    // 1. Archived on GitHub -> 409 REPOSITORY_ARCHIVED
+    await ProjectRepositoryConnectionModel.updateOne(
+      { _id: seeded.connectionId },
+      { $set: { isArchivedOnGitHub: true } }
+    );
+    const archivedRepoRes = await request(app)
+      .post(`/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans`)
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({ requestedRef: 'main' });
+    expect(archivedRepoRes.status).toBe(409);
+    expect(archivedRepoRes.body.error.code).toBe('REPOSITORY_ARCHIVED');
+
+    // 2. Mismatched githubInstallationId between connection and installation -> 409 INSTALLATION_UNAVAILABLE
+    await ProjectRepositoryConnectionModel.updateOne(
+      { _id: seeded.connectionId },
+      {
+        $set: {
+          isArchivedOnGitHub: false,
+          githubInstallationId: seeded.githubInstallationId + 999,
+        },
+      }
+    );
+    const mismatchRes = await request(app)
+      .post(`/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans`)
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({ requestedRef: 'main' });
+    expect(mismatchRes.status).toBe(409);
+    expect(mismatchRes.body.error.code).toBe('INSTALLATION_UNAVAILABLE');
+    expect(await ScanModel.countDocuments({ projectId: seeded.projectId })).toBe(0);
+  });
+
+  it('enforces in-transaction membership & role revalidation on cancelScan (TOCTOU protection)', async () => {
+    const app = buildApp();
+    const seeded = await seedOrgProjectAndConnection(app, 'toctou-cancel');
+
+    // Register & add a second user as MEMBER
+    const memberEmail = `member-toctou-${randomBytes(3).toString('hex')}@test.com`;
+    const memberPassword = 'member-secure-password-123!';
+    const memberReg = await request(app)
+      .post('/api/v1/auth/register')
+      .send({ email: memberEmail, displayName: 'Member User', password: memberPassword });
+    expect(memberReg.status).toBe(201);
+    const memberUserId = memberReg.body.user.id as string;
+
+    const addRes = await request(app)
+      .post(`/api/v1/organizations/${seeded.organizationId}/members`)
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({ email: memberEmail, role: 'MEMBER' });
+    expect(addRes.status).toBe(201);
+    const membershipId = addRes.body.member.membershipId as string;
+
+    // Create a QUEUED scan
+    const createRes = await request(app)
+      .post(`/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans`)
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({ requestedRef: 'main' });
+    expect(createRes.status).toBe(201);
+    const scanId = createRes.body.scan.id as string;
+
+    // Demote member to VIEWER, then invoke scanService.cancelScan directly (simulating a request
+    // that passed HTTP RBAC middleware right before the role downgrade committed).
+    const demoteRes = await request(app)
+      .patch(`/api/v1/organizations/${seeded.organizationId}/members/${membershipId}`)
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({ role: 'VIEWER' });
+    expect(demoteRes.status).toBe(200);
+
+    const scanService = createScanService();
+    await expect(
+      scanService.cancelScan(memberUserId, seeded.organizationId, seeded.projectId, scanId, {
+        reason: 'Stale middleware auth',
+      })
+    ).rejects.toMatchObject({
+      statusCode: 403,
+      code: 'FORBIDDEN',
+    });
+
+    // Scan & outbox must remain completely untouched
+    const scanDoc = await ScanModel.findById(scanId).lean();
+    expect(scanDoc?.status).toBe('QUEUED');
+    const outboxDoc = await ScanDispatchOutboxModel.findOne({ scanId }).lean();
+    expect(outboxDoc?.state).toBe('PENDING');
+
+    // Concurrent race / post-removal revocation: DELETE member returns 200, in-tx cancelScan rejects 404
+    await expect(
+      request(app)
+        .delete(`/api/v1/organizations/${seeded.organizationId}/members/${membershipId}`)
+        .set('Authorization', `Bearer ${seeded.token}`)
+    ).resolves.toMatchObject({ status: 200 });
+
+    await expect(
+      scanService.cancelScan(memberUserId, seeded.organizationId, seeded.projectId, scanId, {})
+    ).rejects.toMatchObject({
+      statusCode: 404,
+      code: 'ORGANIZATION_NOT_FOUND',
+    });
+    expect((await ScanModel.findById(scanId).lean())?.status).toBe('QUEUED');
+  });
+
+  it('prevents same-org cross-project IDOR, suppresses populated lease.token, supports IN_PROGRESS/terminal cancellation, and orders ties by _id desc', async () => {
+    const app = buildApp();
+    const seeded = await seedOrgProjectAndConnection(app, 'lifecycle-idor');
+
+    // Second project in the same organization
+    const proj2Res = await request(app)
+      .post(`/api/v1/organizations/${seeded.organizationId}/projects`)
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({ name: 'Project Two', slug: `proj2-${randomBytes(3).toString('hex')}` });
+    expect(proj2Res.status).toBe(201);
+    const project2Id = proj2Res.body.project.id as string;
+
+    // 1. Deterministic _id: -1 pagination tiebreaker when timestamps collide
+    const fixedTime = new Date('2026-01-01T00:00:00.000Z');
+    const s1 = await ScanModel.create({
+      organizationId: seeded.organizationId,
+      projectId: seeded.projectId,
+      repositoryConnectionId: seeded.connectionId,
+      githubInstallationId: seeded.githubInstallationId,
+      githubRepositoryId: seeded.githubRepositoryId,
+      requestedRef: 'tie-first',
+      status: 'COMPLETED',
+      isActive: false,
+      triggerSource: 'manual',
+      queuedAt: fixedTime,
+      completedAt: fixedTime,
+      createdAt: fixedTime,
+      updatedAt: fixedTime,
+    });
+    const s2 = await ScanModel.create({
+      organizationId: seeded.organizationId,
+      projectId: seeded.projectId,
+      repositoryConnectionId: seeded.connectionId,
+      githubInstallationId: seeded.githubInstallationId,
+      githubRepositoryId: seeded.githubRepositoryId,
+      requestedRef: 'tie-second',
+      status: 'COMPLETED',
+      isActive: false,
+      triggerSource: 'manual',
+      queuedAt: fixedTime,
+      completedAt: fixedTime,
+      createdAt: fixedTime,
+      updatedAt: fixedTime,
+    });
+
+    const page1Res = await request(app)
+      .get(
+        `/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans?page=1&limit=1`
+      )
+      .set('Authorization', `Bearer ${seeded.token}`);
+    expect(page1Res.status).toBe(200);
+    expect(page1Res.body.scans[0].id).toBe(s2._id.toString());
+
+    const page2Res = await request(app)
+      .get(
+        `/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans?page=2&limit=1`
+      )
+      .set('Authorization', `Bearer ${seeded.token}`);
+    expect(page2Res.status).toBe(200);
+    expect(page2Res.body.scans[0].id).toBe(s1._id.toString());
+
+    // 2. Terminal COMPLETED scan cannot be cancelled -> 409 SCAN_ALREADY_TERMINAL
+    const terminalCancel = await request(app)
+      .post(
+        `/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans/${s1._id.toString()}/cancel`
+      )
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({});
+    expect(terminalCancel.status).toBe(409);
+    expect(terminalCancel.body.error.code).toBe('SCAN_ALREADY_TERMINAL');
+
+    // 3. Create live scan, claim lease (populates lease.token), transition to IN_PROGRESS
+    const createLive = await request(app)
+      .post(`/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans`)
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({ requestedRef: 'main' });
+    expect(createLive.status).toBe(201);
+    const liveScanId = createLive.body.scan.id as string;
+
+    const claim = await claimQueuedScanForAcquisition({
+      scanId: liveScanId,
+      organizationId: seeded.organizationId,
+      projectId: seeded.projectId,
+      workerId: 'worker-audit-1',
+    });
+    expect(claim.status).toBe('CLAIMED');
+    if (claim.status !== 'CLAIMED') throw new Error('Expected CLAIMED');
+
+    const inProg = await transitionScanToInProgress({
+      scanId: liveScanId,
+      organizationId: seeded.organizationId,
+      projectId: seeded.projectId,
+      leaseToken: claim.leaseToken,
+      acquisition: {
+        resolvedCommitSha: 'a'.repeat(40),
+        compressedArchiveBytes: 1024,
+        extractedBytes: 2048,
+        extractedFileCount: 5,
+      },
+    });
+    expect(inProg.status).toBe('UPDATED');
+
+    // Populated lease.token must NEVER leak via GET /:scanId or GET /scans
+    const detailWithLease = await request(app)
+      .get(
+        `/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans/${liveScanId}`
+      )
+      .set('Authorization', `Bearer ${seeded.token}`);
+    expect(detailWithLease.status).toBe(200);
+    expect(detailWithLease.body.scan.lease).toBeTruthy();
+    expect(detailWithLease.body.scan.lease.workerId).toBe('worker-audit-1');
+    expect(detailWithLease.body.scan.lease).not.toHaveProperty('token');
+    expect(JSON.stringify(detailWithLease.body)).not.toContain(claim.leaseToken);
+    expect(detailWithLease.body.scan).not.toHaveProperty('dispatchRevision');
+
+    // 4. IN_PROGRESS scan cancellation returns 202 CANCELLATION_REQUESTED
+    const cancelInProgress = await request(app)
+      .post(
+        `/api/v1/organizations/${seeded.organizationId}/projects/${seeded.projectId}/scans/${liveScanId}/cancel`
+      )
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({ reason: 'Abort live scan' });
+    expect(cancelInProgress.status).toBe(202);
+    expect(cancelInProgress.body.message).toBe('Cancellation requested');
+    expect(cancelInProgress.body.scan.cancellation.requestedAt).toBeTruthy();
+
+    // 5. Same-organization cross-project IDOR: project2 cannot read or cancel project1's scan
+    const crossProjGet = await request(app)
+      .get(
+        `/api/v1/organizations/${seeded.organizationId}/projects/${project2Id}/scans/${liveScanId}`
+      )
+      .set('Authorization', `Bearer ${seeded.token}`);
+    expect(crossProjGet.status).toBe(404);
+    expect(crossProjGet.body.error.code).toBe('SCAN_NOT_FOUND');
+
+    const crossProjCancel = await request(app)
+      .post(
+        `/api/v1/organizations/${seeded.organizationId}/projects/${project2Id}/scans/${liveScanId}/cancel`
+      )
+      .set('Authorization', `Bearer ${seeded.token}`)
+      .send({});
+    expect(crossProjCancel.status).toBe(404);
+    expect(crossProjCancel.body.error.code).toBe('SCAN_NOT_FOUND');
+
+    // Completing scan sees pending cancellation request cleanly (fencing honored)
+    const completed = await completeScanWithLease({
+      scanId: liveScanId,
+      organizationId: seeded.organizationId,
+      projectId: seeded.projectId,
+      leaseToken: claim.leaseToken,
+    });
+    expect(completed.status).toBe('CANCEL_REQUESTED');
   });
 });

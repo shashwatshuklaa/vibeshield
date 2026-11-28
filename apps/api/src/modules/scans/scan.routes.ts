@@ -22,12 +22,10 @@ export interface ScanRouterDependencies {
  *   authenticate (org router)
  *   → requireOrgMembership (validates organizationId, sets req.organizationAuth)
  *   → requireOrganizationPermission(SCAN_*)
+ *   → scanCreateRateLimiter (fail-closed Redis fixed-window limiter per (org, user) on POST /)
  *   → controller handler
  *
  * No endpoint is reachable before both authentication and RBAC checks pass.
- *
- * Rate limiting for scan creation is implemented as a focused in-process token-bucket
- * per (organizationId, userId). See NOTE below for Scope D details.
  */
 export function createScanRouter(dependencies: ScanRouterDependencies): Router {
   const router: Router = Router({ mergeParams: true });

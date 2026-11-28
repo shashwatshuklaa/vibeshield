@@ -4,6 +4,8 @@ import {
   cancelScanBodySchema,
   createScanBodySchema,
   listScansQuerySchema,
+  scanItemParamsSchema,
+  scanProjectParamsSchema,
 } from './scan.schemas.js';
 import type { ScanService } from './scan.service.js';
 
@@ -16,7 +18,7 @@ function getSingleParam(value: string | string[] | undefined): string {
  *
  * All handlers follow the existing project-controller pattern:
  *  1. Guard against missing req.auth / req.organizationAuth (defense-in-depth; middleware should have blocked earlier).
- *  2. Parse and validate request with Zod (throws ZodError → 400 VALIDATION_ERROR via error handler).
+ *  2. Parse and validate route params, query, and body with Zod (throws ZodError → 400 VALIDATION_ERROR via error handler).
  *  3. Call service method.
  *  4. Respond.
  *  5. Forward any error to next().
@@ -29,7 +31,9 @@ export function createScanController(scanService: ScanService) {
           next(new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found'));
           return;
         }
-        const projectId = getSingleParam(req.params['projectId']);
+        const { projectId } = scanProjectParamsSchema.parse({
+          projectId: getSingleParam(req.params['projectId']),
+        });
         const parsed = createScanBodySchema.parse(req.body);
         const scan = await scanService.createScan(
           req.auth.user.id,
@@ -49,7 +53,9 @@ export function createScanController(scanService: ScanService) {
           next(new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found'));
           return;
         }
-        const projectId = getSingleParam(req.params['projectId']);
+        const { projectId } = scanProjectParamsSchema.parse({
+          projectId: getSingleParam(req.params['projectId']),
+        });
         const query = listScansQuerySchema.parse(req.query);
         const result = await scanService.listScans(
           req.organizationAuth.organization.id,
@@ -68,8 +74,10 @@ export function createScanController(scanService: ScanService) {
           next(new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found'));
           return;
         }
-        const projectId = getSingleParam(req.params['projectId']);
-        const scanId = getSingleParam(req.params['scanId']);
+        const { projectId, scanId } = scanItemParamsSchema.parse({
+          projectId: getSingleParam(req.params['projectId']),
+          scanId: getSingleParam(req.params['scanId']),
+        });
         const scan = await scanService.getScan(
           req.organizationAuth.organization.id,
           projectId,
@@ -87,8 +95,10 @@ export function createScanController(scanService: ScanService) {
           next(new OrganizationError(404, 'ORGANIZATION_NOT_FOUND', 'Organization not found'));
           return;
         }
-        const projectId = getSingleParam(req.params['projectId']);
-        const scanId = getSingleParam(req.params['scanId']);
+        const { projectId, scanId } = scanItemParamsSchema.parse({
+          projectId: getSingleParam(req.params['projectId']),
+          scanId: getSingleParam(req.params['scanId']),
+        });
         const parsed = cancelScanBodySchema.parse(req.body);
         const { result, scan } = await scanService.cancelScan(
           req.auth.user.id,

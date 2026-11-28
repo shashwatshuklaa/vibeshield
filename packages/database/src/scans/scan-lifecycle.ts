@@ -1164,14 +1164,17 @@ export async function cancelScanWithLease(
  * - If `ACQUIRING` or `IN_PROGRESS`, stamps `cancellation.requestedAt` so the active worker halts safely.
  * - If already terminal, preserves terminal state cleanly.
  */
-export async function requestScanCancellation(input: {
-  scanId: string;
-  organizationId: string;
-  projectId: string;
-  requestedByUserId?: string | null;
-  reason?: string | null;
-  now?: Date;
-}): Promise<RequestCancellationResult> {
+export async function requestScanCancellation(
+  input: {
+    scanId: string;
+    organizationId: string;
+    projectId: string;
+    requestedByUserId?: string | null;
+    reason?: string | null;
+    now?: Date;
+  },
+  externalSession?: ClientSession
+): Promise<RequestCancellationResult> {
   assertValidIds(input.organizationId, input.projectId, input.scanId);
   if (input.requestedByUserId && !isValidObjectId(input.requestedByUserId)) {
     throw new ScanLifecycleError('Invalid requestedByUserId identifier', 'INVALID_SCAN_IDENTIFIER');
@@ -1183,7 +1186,7 @@ export async function requestScanCancellation(input: {
       ? redactGitHubSecrets(redactMongoUri(input.reason.trim())).slice(0, 300)
       : null;
 
-  return runInTransaction(async (session) => {
+  const execute = async (session: ClientSession): Promise<RequestCancellationResult> => {
     const locked = await acquireOrganizationMutationLock(input.organizationId, session);
     if (!locked) {
       return { status: 'NOT_FOUND' };
@@ -1285,7 +1288,13 @@ export async function requestScanCancellation(input: {
       status: 'CANCELLATION_REQUESTED',
       scan: toPublicScanRecord(marked),
     };
-  });
+  };
+
+  if (externalSession) {
+    return await execute(externalSession);
+  }
+
+  return await runInTransaction(execute);
 }
 
 export type ScanAcquisitionDenialReason =

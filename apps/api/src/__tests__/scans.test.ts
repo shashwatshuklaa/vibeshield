@@ -525,6 +525,39 @@ describe('Public Scan API — Unit Tests (mocked service)', () => {
       expect(res.body.error.code).toBe('VALIDATION_ERROR');
     });
 
+    it('returns 400 VALIDATION_ERROR when projectId is malformed', async () => {
+      const { app, setupOrgAndToken } = createHarness();
+      const { orgId, token } = await setupOrgAndToken(
+        `scan-badproj-${randomBytes(4).toString('hex')}@test.com`
+      );
+      const res = await request(app)
+        .post(`/api/v1/organizations/${orgId}/projects/not-a-valid-id/scans`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ requestedRef: 'main' });
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('returns 400 VALIDATION_ERROR for secret-shaped idempotencyKey or correlationId', async () => {
+      const { app, setupOrgAndToken } = createHarness();
+      const { orgId, token } = await setupOrgAndToken(
+        `scan-secid-${randomBytes(4).toString('hex')}@test.com`
+      );
+      const res1 = await request(app)
+        .post(`/api/v1/organizations/${orgId}/projects/${projectId}/scans`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ requestedRef: 'main', idempotencyKey: 'ghp_abcdefghij123456' });
+      expect(res1.status).toBe(400);
+      expect(res1.body.error.code).toBe('VALIDATION_ERROR');
+
+      const res2 = await request(app)
+        .post(`/api/v1/organizations/${orgId}/projects/${projectId}/scans`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ requestedRef: 'main', correlationId: 'github_pat_abcdefghijklmnop' });
+      expect(res2.status).toBe(400);
+      expect(res2.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
     it('returns 404 for unknown organization', async () => {
       const { app, setupOrgAndToken } = createHarness();
       const { token } = await setupOrgAndToken(
@@ -669,6 +702,20 @@ describe('Public Scan API — Unit Tests (mocked service)', () => {
       expect(res.body.error.code).toBe('VALIDATION_ERROR');
     });
 
+    it('returns 400 VALIDATION_ERROR for malformed projectId on listScans (not 200 [])', async () => {
+      const mockService = makeMockScanService();
+      const { app, setupOrgAndToken } = createHarness(mockService);
+      const { orgId, token } = await setupOrgAndToken(
+        `scan-list-badproj-${randomBytes(4).toString('hex')}@test.com`
+      );
+      const res = await request(app)
+        .get(`/api/v1/organizations/${orgId}/projects/not-an-object-id/scans`)
+        .set('Authorization', `Bearer ${token}`);
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+      expect(mockService.listScans).not.toHaveBeenCalled();
+    });
+
     it('returns 200 with scans and pagination metadata', async () => {
       const { app, setupOrgAndToken } = createHarness();
       const { orgId, token } = await setupOrgAndToken(
@@ -733,6 +780,28 @@ describe('Public Scan API — Unit Tests (mocked service)', () => {
       expect(res.body.error.message).toBe('Scan not found');
     });
 
+    it('returns 400 VALIDATION_ERROR for malformed projectId or scanId on getScan', async () => {
+      const mockService = makeMockScanService();
+      const { app, setupOrgAndToken } = createHarness(mockService);
+      const { orgId, token } = await setupOrgAndToken(
+        `scan-get-badid-${randomBytes(4).toString('hex')}@test.com`
+      );
+      const resBadScan = await request(app)
+        .get(`/api/v1/organizations/${orgId}/projects/${projectId}/scans/invalid-scan-id`)
+        .set('Authorization', `Bearer ${token}`);
+      expect(resBadScan.status).toBe(400);
+      expect(resBadScan.body.error.code).toBe('VALIDATION_ERROR');
+
+      const resBadProj = await request(app)
+        .get(
+          `/api/v1/organizations/${orgId}/projects/invalid-proj-id/scans/${randomBytes(12).toString('hex')}`
+        )
+        .set('Authorization', `Bearer ${token}`);
+      expect(resBadProj.status).toBe(400);
+      expect(resBadProj.body.error.code).toBe('VALIDATION_ERROR');
+      expect(mockService.getScan).not.toHaveBeenCalled();
+    });
+
     it('returns 200 with scan and no leaked fields', async () => {
       const { app, setupOrgAndToken } = createHarness();
       const { orgId, token } = await setupOrgAndToken(
@@ -776,6 +845,30 @@ describe('Public Scan API — Unit Tests (mocked service)', () => {
         .send({ reason: 'ok', forceKill: true });
       expect(res.status).toBe(400);
       expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('returns 400 VALIDATION_ERROR for malformed projectId or scanId on cancelScan', async () => {
+      const mockService = makeMockScanService();
+      const { app, setupOrgAndToken } = createHarness(mockService);
+      const { orgId, token } = await setupOrgAndToken(
+        `scan-cancel-badid-${randomBytes(4).toString('hex')}@test.com`
+      );
+      const resBadScan = await request(app)
+        .post(`/api/v1/organizations/${orgId}/projects/${projectId}/scans/not-a-scan-id/cancel`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({});
+      expect(resBadScan.status).toBe(400);
+      expect(resBadScan.body.error.code).toBe('VALIDATION_ERROR');
+
+      const resBadProj = await request(app)
+        .post(
+          `/api/v1/organizations/${orgId}/projects/not-a-proj-id/scans/${randomBytes(12).toString('hex')}/cancel`
+        )
+        .set('Authorization', `Bearer ${token}`)
+        .send({});
+      expect(resBadProj.status).toBe(400);
+      expect(resBadProj.body.error.code).toBe('VALIDATION_ERROR');
+      expect(mockService.cancelScan).not.toHaveBeenCalled();
     });
 
     it('returns 200 and "Scan cancelled" for CANCELLED_IMMEDIATELY', async () => {
@@ -1165,5 +1258,31 @@ describe('POST /scans — validation & rate limiting', () => {
     expect(res.status).toBe(503);
     expect(res.body.error.code).toBe('RATE_LIMIT_UNAVAILABLE');
     expect(mockService.createScan).not.toHaveBeenCalled();
+  });
+
+  it('sets Retry-After to 1s (not full window) when Redis PTTL returns 0 (<1ms left)', async () => {
+    const { consumeScanCreationRateLimit } = await import('@vibeshield/queue');
+    const mockManager = {
+      isConnected: () => true,
+      getQueueClient: () => ({
+        status: 'ready',
+        connect: async () => undefined,
+        ping: async () => 'PONG',
+        quit: async () => 'OK',
+        disconnect: () => undefined,
+        on: () => undefined,
+        eval: async () => [11, 0],
+      }),
+    };
+
+    const decision = await consumeScanCreationRateLimit(mockManager, {
+      organizationId: randomBytes(12).toString('hex'),
+      userId: randomBytes(12).toString('hex'),
+      maxRequests: 10,
+      windowMs: 60_000,
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.retryAfterSeconds).toBe(1);
   });
 });
