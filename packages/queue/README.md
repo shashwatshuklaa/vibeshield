@@ -16,8 +16,8 @@ Shared Redis connection lifecycle management, BullMQ queue factories, job contra
 - **Explicit Lifecycle (`RedisConnectionManager`)**: Never connects upon module import; deduplicates concurrent `connect()` calls, supports `ping()`/`getStatus()` health inspection, and closes owned queue handles before quitting Redis via `closeQueueResources()`.
 - **Queue & Worker Factories & Job Contracts** (`contracts.ts`, `factory.ts`):
   - Stable, colon-free queue names (`QUEUE_NAMES.SCAN_JOBS = 'vibeshield-v1-scan-jobs'`, prefix `vibeshield`).
-  - Minimal `ScanQueueJobPayload` contract reusing `@vibeshield/types` (`ScanStatus`) with strict runtime validation (`validateScanQueueJobPayload`) rejecting tokens, private keys, connection URIs, raw archives, or payloads > 16 KB.
-  - Deterministic `buildScanJobId()` helpers (`scan-<org>-<project>-<scanId>`, colon-free).
+  - Strictly minimal `ScanQueueJobPayload` contract (`{ scanId: string }`) with strict Zod & security runtime validation (`validateScanQueueJobPayload`) rejecting unknown fields, invalid ObjectIds, tokens, private keys, connection URIs, raw archives, or payloads > 16 KB.
+  - Deterministic `buildScanJobId()` helpers (`scan-<scanId>-<dispatchGeneration>`, colon-free).
   - Bounded default retry/backoff (`attempts: 3`, `1000ms` exponential backoff) and bounded retention (`removeOnComplete`: 24h / 1000 count, `removeOnFail`: 7d / 2000 count).
   - BullMQ Worker factory (`createBullWorker`, `createScanJobsWorker`, `buildWorkerPolicyOptions`, `closeWorkerWithGrace`) enforcing explicit processor injection, `Worker`-role Redis options (`maxRetriesPerRequest: null`), bounded concurrency/lock/stalled recovery defaults (`DEFAULT_WORKER_POLICY`), and deterministic grace-bounded shutdown.
   - Re-exports `UnrecoverableError`, `Job`, and `Processor` from `bullmq` so downstream workers can classify permanent vs transient failures consistently.

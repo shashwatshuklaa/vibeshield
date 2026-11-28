@@ -9,7 +9,6 @@ import {
   type ManagedQueueHandle,
   type ScanQueueJobPayload,
 } from '@vibeshield/queue';
-import { ScanStatus } from '@vibeshield/types';
 import {
   createSecurityWorkerRuntime,
   loadWorkerConfig,
@@ -42,23 +41,9 @@ function createStubDbManager(): WorkerDatabaseManagerLike {
   };
 }
 
-function makePayload(scanId: string, branch = 'main'): ScanQueueJobPayload {
+function makePayload(scanId: string): ScanQueueJobPayload {
   return validateScanQueueJobPayload({
     scanId,
-    organizationId: 'org-worker-int-1',
-    projectId: 'proj-worker-int-1',
-    installationRecordId: 'inst-worker-int-1',
-    githubRepositoryId: 888001,
-    commitHash: 'bead1234feed',
-    branch,
-    status: ScanStatus.QUEUED,
-    metadata: {
-      organizationId: 'org-worker-int-1',
-      projectId: 'proj-worker-int-1',
-      triggeredByUserId: 'user-worker-int-1',
-      triggerSource: 'manual',
-      enqueuedAt: new Date().toISOString(),
-    },
   });
 }
 
@@ -157,17 +142,16 @@ describe.skipIf(!REDIS_URI)(
       expect(runtime.getStatus().queueName).toBe(QUEUE_NAMES.SCAN_JOBS);
       expect(runtime.getStatus().isRunning).toBe(true);
 
-      const payload = makePayload('scan-int-happy-1');
+      const payload = makePayload('507f1f77bcf86cd799439011');
       const jobId = buildScanJobId({
-        organizationId: payload.organizationId,
-        projectId: payload.projectId,
         scanId: payload.scanId,
+        dispatchGeneration: 1,
       });
 
       const enqueued = await handle.queue.add('scan', payload, { jobId });
       await processedPromise;
 
-      expect(processed).toEqual(['scan-int-happy-1']);
+      expect(processed).toEqual(['507f1f77bcf86cd799439011']);
 
       // Give BullMQ a moment to finalize state transition to completed in Redis
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -213,27 +197,26 @@ describe.skipIf(!REDIS_URI)(
 
       await runtime.start();
 
-      // 1. Enqueue permanently invalid payload (missing required fields + leaked token key)
+      // 1. Enqueue permanently invalid payload (unknown extra fields + leaked token key)
       const poisonJob = await handle.queue.add(
         'scan',
         {
-          ...makePayload('scan-int-poison-1'),
+          ...makePayload('507f1f77bcf86cd799439021'),
           accessToken: 'ghs_leaked_secret_should_unrecoverable',
         } as unknown as ScanQueueJobPayload,
         {
-          jobId: 'scan-poison-unrecoverable-1',
+          jobId: 'scan-507f1f77bcf86cd799439021-1',
           attempts: 3,
           backoff: { type: 'fixed', delay: 50 },
         }
       );
 
       // 2. Enqueue valid payload that transiently fails once then succeeds on retry
-      const retryPayload = makePayload('scan-int-retry-1');
+      const retryPayload = makePayload('507f1f77bcf86cd799439022');
       const retryJob = await handle.queue.add('scan', retryPayload, {
         jobId: buildScanJobId({
-          organizationId: retryPayload.organizationId,
-          projectId: retryPayload.projectId,
           scanId: retryPayload.scanId,
+          dispatchGeneration: 1,
         }),
         attempts: 3,
         backoff: { type: 'fixed', delay: 50 },
@@ -246,12 +229,14 @@ describe.skipIf(!REDIS_URI)(
       const storedPoison = await handle.queue.getJob(poisonJob.id!);
       expect(await storedPoison?.getState()).toBe('failed');
       expect(storedPoison?.attemptsMade).toBe(1);
-      expect(attemptLog.some((entry) => entry.scanId === 'scan-int-poison-1')).toBe(false);
+      expect(attemptLog.some((entry) => entry.scanId === '507f1f77bcf86cd799439021')).toBe(false);
 
       // Transient error job must have retried and completed on attempt 2
       const storedRetry = await handle.queue.getJob(retryJob.id!);
       expect(await storedRetry?.getState()).toBe('completed');
-      expect(attemptLog.filter((entry) => entry.scanId === 'scan-int-retry-1')).toHaveLength(2);
+      expect(
+        attemptLog.filter((entry) => entry.scanId === '507f1f77bcf86cd799439022')
+      ).toHaveLength(2);
     });
 
     it('gracefully waits for active jobs within shutdown grace period before closing', async () => {
@@ -283,12 +268,11 @@ describe.skipIf(!REDIS_URI)(
       runtimes.push(runtime);
 
       await runtime.start();
-      const payload = makePayload('scan-int-grace-1');
+      const payload = makePayload('507f1f77bcf86cd799439031');
       const job = await handle.queue.add('scan', payload, {
         jobId: buildScanJobId({
-          organizationId: payload.organizationId,
-          projectId: payload.projectId,
           scanId: payload.scanId,
+          dispatchGeneration: 1,
         }),
       });
 

@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ScanFailureCodeValue,
   ScanLifecycleStatusValue,
@@ -7,24 +7,38 @@ import {
 } from '@vibeshield/types';
 import {
   cancelScanWithLease,
+  claimPendingScanDispatch,
   claimQueuedScanForAcquisition,
+  completeAcquisitionPreparedWithLease,
   completeScanWithLease,
   connectDatabase,
   createQueuedScan,
+  createQueuedScanWithOutbox,
   disconnectDatabase,
   failScanWithLease,
+  findExpiredActiveScanLeaseCandidates,
+  findPendingScanDispatchOutboxCandidates,
   findScanByIdInOrganization,
   GitHubInstallationModel,
   GitHubInstallationStatusValue,
   InstallationAvailabilityValue,
   listScansByProjectInOrganization,
+  loadScanExecutionTarget,
+  markScanDispatchSucceeded,
   OrganizationModel,
+  OutboxDispatchStateValue,
   ProjectModel,
   ProjectRepositoryConnectionModel,
+  rearmScanDispatchOutbox,
   reclaimExpiredScanLease,
+  recordScanDispatchFailure,
+  recoverExpiredScanLeaseCandidate,
+  releaseScanLeaseForRetry,
   renewScanWorkerLease,
   RepositoryAccessStateValue,
   requestScanCancellation,
+  runInTransaction,
+  ScanDispatchOutboxModel,
   ScanModel,
   setScanResolvedCommitWithLease,
   transitionScanToInProgress,
@@ -46,11 +60,19 @@ describe.skipIf(!REPLICA_URI)(
 
     beforeAll(async () => {
       await connectDatabase(REPLICA_URI!, { serverSelectionTimeoutMS: 10_000 });
-      await Promise.all([OrganizationModel.syncIndexes(), ScanModel.syncIndexes()]);
+      await Promise.all([
+        OrganizationModel.syncIndexes(),
+        ScanModel.syncIndexes(),
+        ScanDispatchOutboxModel.syncIndexes(),
+      ]);
     });
 
     beforeEach(async () => {
-      await Promise.all([OrganizationModel.deleteMany({}), ScanModel.deleteMany({})]);
+      await Promise.all([
+        OrganizationModel.deleteMany({}),
+        ScanModel.deleteMany({}),
+        ScanDispatchOutboxModel.deleteMany({}),
+      ]);
 
       const creatorId = new mongoose.Types.ObjectId();
       const [createdOrgA, createdOrgB] = await OrganizationModel.create([
@@ -64,6 +86,10 @@ describe.skipIf(!REPLICA_URI)(
       projectB1 = new mongoose.Types.ObjectId().toString();
       connA1 = new mongoose.Types.ObjectId().toString();
       userA = creatorId.toString();
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
     });
 
     afterAll(async () => {
@@ -1396,6 +1422,585 @@ describe.skipIf(!REPLICA_URI)(
       await Promise.all([
         ProjectRepositoryConnectionModel.deleteMany({ _id: connectionDoc._id }),
         GitHubInstallationModel.deleteMany({ _id: installationDoc._id }),
+        ProjectModel.deleteMany({ _id: projectDoc._id }),
+      ]);
+    });
+
+    it('transitions ACQUIRING -> PREPARED atomically with DB commit SHA, seals terminal state against cancel/complete/fail/stale races', async () => {
+      const t0 = new Date('2026-11-28T12:00:00.000Z');
+      const queued = await createQueuedScan({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 2001,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+
+      const claimed = await claimQueuedScanForAcquisition({
+        scanId: queued.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        workerId: 'security-worker',
+        leaseDurationMs: 30_000,
+        now: t0,
+      });
+      expect(claimed.status).toBe('CLAIMED');
+      if (claimed.status !== 'CLAIMED') {
+        return;
+      }
+
+      const authoritativeSha = 'e'.repeat(40);
+      await setScanResolvedCommitWithLease({
+        scanId: queued.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        leaseToken: claimed.leaseToken,
+        resolvedCommitSha: authoritativeSha,
+        now: t0,
+      });
+
+      const prepTime = new Date(t0.getTime() + 1_000);
+      const [prep1, prep2] = await Promise.all([
+        completeAcquisitionPreparedWithLease({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          leaseToken: claimed.leaseToken,
+          acquisition: {
+            compressedArchiveBytes: 4096,
+            extractedBytes: 16384,
+            extractedFileCount: 18,
+          },
+          now: prepTime,
+        }),
+        completeAcquisitionPreparedWithLease({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          leaseToken: claimed.leaseToken,
+          acquisition: {
+            compressedArchiveBytes: 9999,
+            extractedBytes: 99999,
+            extractedFileCount: 99,
+          },
+          now: prepTime,
+        }),
+      ]);
+
+      const outcomes = [prep1.status, prep2.status];
+      expect(outcomes.filter((s) => s === 'PREPARED')).toHaveLength(1);
+      expect(outcomes.filter((s) => s === 'INVALID_TRANSITION')).toHaveLength(1);
+
+      const preparedRecord =
+        prep1.status === 'PREPARED' ? prep1.scan : (prep2 as { scan: typeof queued }).scan;
+      expect(preparedRecord.status).toBe(ScanLifecycleStatusValue.PREPARED);
+      expect(preparedRecord.isActive).toBe(false);
+      expect(preparedRecord.preparedAt).toEqual(prepTime);
+      expect(preparedRecord.completedAt).toBeNull();
+      expect(preparedRecord.lease).toBeNull();
+      expect(preparedRecord.acquisition?.resolvedCommitSha).toBe(authoritativeSha);
+
+      // Cannot be cancelled, claimed, reclaimed, completed, or failed once PREPARED
+      await expect(
+        requestScanCancellation({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          requestedByUserId: userA,
+        })
+      ).resolves.toMatchObject({ status: 'ALREADY_TERMINAL', scan: { status: 'PREPARED' } });
+
+      await expect(
+        claimQueuedScanForAcquisition({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          workerId: 'security-worker',
+        })
+      ).resolves.toMatchObject({ status: 'NOT_CLAIMABLE', currentStatus: 'PREPARED' });
+
+      await expect(
+        reclaimExpiredScanLease({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          workerId: 'security-worker',
+          now: new Date(t0.getTime() + 120_000),
+        })
+      ).resolves.toMatchObject({ status: 'NOT_RECLAIMABLE' });
+
+      await expect(
+        completeScanWithLease({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          leaseToken: claimed.leaseToken,
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      await expect(
+        failScanWithLease({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          leaseToken: claimed.leaseToken,
+          failureCode: ScanFailureCodeValue.WORKER_INTERNAL_ERROR,
+          failureMessage: 'Should not overwrite PREPARED',
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      await expect(
+        cancelScanWithLease({
+          scanId: queued.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          leaseToken: claimed.leaseToken,
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+    });
+
+    it('supports releaseScanLeaseForRetry preserving attemptCount/idempotencyKey and fences stale tokens after reclaim', async () => {
+      const t0 = new Date('2026-11-28T12:10:00.000Z');
+      const scan = await createQueuedScan({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 2001,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.WEBHOOK,
+        idempotencyKey: 'retry-idem-key-1',
+        maxAttempts: 2,
+        now: t0,
+      });
+
+      const attempt1 = await claimQueuedScanForAcquisition({
+        scanId: scan.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        workerId: 'security-worker',
+        leaseDurationMs: 10_000,
+        now: t0,
+      });
+      expect(attempt1.status).toBe('CLAIMED');
+      if (attempt1.status !== 'CLAIMED') {
+        return;
+      }
+
+      // Persist resolved SHA on attempt 1, then release for retry -> clears transient resolvedCommitSha & lease
+      await setScanResolvedCommitWithLease({
+        scanId: scan.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        leaseToken: attempt1.leaseToken,
+        resolvedCommitSha: 'a'.repeat(40),
+        now: t0,
+      });
+
+      const released = await releaseScanLeaseForRetry({
+        scanId: scan.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        leaseToken: attempt1.leaseToken,
+        now: new Date(t0.getTime() + 1_000),
+      });
+      expect(released.status).toBe('RELEASED');
+      if (released.status === 'RELEASED') {
+        expect(released.scan.status).toBe(ScanLifecycleStatusValue.QUEUED);
+        expect(released.scan.isActive).toBe(true);
+        expect(released.scan.attemptCount).toBe(1);
+        expect(released.scan.resolvedCommitSha).toBeNull();
+        expect(released.scan.lease).toBeNull();
+      }
+
+      // Verify idempotencyKey preserved
+      const rawReleased = await ScanModel.findById(scan.id).lean();
+      expect(rawReleased?.idempotencyKey).toBe('retry-idem-key-1');
+
+      // Attempt 2 claims and advances attemptCount to 2 (= maxAttempts) -> releaseScanLeaseForRetry returns ATTEMPTS_EXHAUSTED
+      const attempt2 = await claimQueuedScanForAcquisition({
+        scanId: scan.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        workerId: 'security-worker',
+        leaseDurationMs: 10_000,
+        now: new Date(t0.getTime() + 2_000),
+      });
+      expect(attempt2.status).toBe('CLAIMED');
+      if (attempt2.status !== 'CLAIMED') {
+        return;
+      }
+
+      // Old attempt 1 token cannot release or prepare attempt 2
+      await expect(
+        releaseScanLeaseForRetry({
+          scanId: scan.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          leaseToken: attempt1.leaseToken,
+          now: new Date(t0.getTime() + 3_000),
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      await expect(
+        completeAcquisitionPreparedWithLease({
+          scanId: scan.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          leaseToken: attempt1.leaseToken,
+          acquisition: { compressedArchiveBytes: 10, extractedBytes: 20, extractedFileCount: 1 },
+          now: new Date(t0.getTime() + 3_000),
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      await expect(
+        releaseScanLeaseForRetry({
+          scanId: scan.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          leaseToken: attempt2.leaseToken,
+          now: new Date(t0.getTime() + 3_000),
+        })
+      ).resolves.toMatchObject({ status: 'ATTEMPTS_EXHAUSTED' });
+    });
+
+    it('recovers expired active leases safely under concurrent sweepers across recoverable, cancelled, and exhausted states', async () => {
+      const t0 = new Date('2026-11-28T12:20:00.000Z');
+      const expiredTime = new Date(t0.getTime() + 20_000);
+
+      const sRecoverable = await createQueuedScan({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 2001,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        maxAttempts: 3,
+        now: t0,
+      });
+      const sCancel = await createQueuedScan({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 2002,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        maxAttempts: 3,
+        now: t0,
+      });
+      const sExhausted = await createQueuedScan({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 2003,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        maxAttempts: 1,
+        now: t0,
+      });
+
+      const [c1, c2, c3] = await Promise.all([
+        claimQueuedScanForAcquisition({
+          scanId: sRecoverable.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          workerId: 'security-worker',
+          leaseDurationMs: 5_000,
+          now: t0,
+        }),
+        claimQueuedScanForAcquisition({
+          scanId: sCancel.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          workerId: 'security-worker',
+          leaseDurationMs: 5_000,
+          now: t0,
+        }),
+        claimQueuedScanForAcquisition({
+          scanId: sExhausted.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          workerId: 'security-worker',
+          leaseDurationMs: 5_000,
+          now: t0,
+        }),
+      ]);
+      expect(c1.status).toBe('CLAIMED');
+      expect(c2.status).toBe('CLAIMED');
+      expect(c3.status).toBe('CLAIMED');
+
+      await requestScanCancellation({
+        scanId: sCancel.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        requestedByUserId: userA,
+        now: t0,
+      });
+
+      const candidates = await findExpiredActiveScanLeaseCandidates({ now: expiredTime });
+      expect(candidates.map((c) => c.scanId)).toEqual(
+        expect.arrayContaining([sRecoverable.id, sCancel.id, sExhausted.id])
+      );
+
+      // Two sweepers race simultaneously on each expired scan -> exactly one mutates each scan
+      const [rA, rB] = await Promise.all([
+        recoverExpiredScanLeaseCandidate({
+          scanId: sRecoverable.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          now: expiredTime,
+        }),
+        recoverExpiredScanLeaseCandidate({
+          scanId: sRecoverable.id,
+          organizationId: orgA,
+          projectId: projectA1,
+          now: expiredTime,
+        }),
+      ]);
+      expect([rA.status, rB.status].sort()).toEqual(['ALREADY_HANDLED', 'REQUEUED_FOR_RECOVERY']);
+
+      const cancelRec = await recoverExpiredScanLeaseCandidate({
+        scanId: sCancel.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        now: expiredTime,
+      });
+      expect(cancelRec).toMatchObject({
+        status: 'FINALIZED_CANCELLED',
+        scan: { status: 'CANCELLED', isActive: false },
+      });
+
+      const exhaustRec = await recoverExpiredScanLeaseCandidate({
+        scanId: sExhausted.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        now: expiredTime,
+      });
+      expect(exhaustRec).toMatchObject({
+        status: 'FINALIZED_EXHAUSTED',
+        scan: {
+          status: 'FAILED',
+          isActive: false,
+          failureCode: ScanFailureCodeValue.LEASE_EXPIRED,
+        },
+      });
+    });
+
+    it('creates scan + outbox atomically, rolls back on failure, fences dispatch generations, and suppresses terminal scans', async () => {
+      const t0 = new Date('2026-11-28T12:30:00.000Z');
+
+      // 1. Atomic creation creates both Scan and Outbox gen 1 cleanly
+      const { scan, outbox, jobId } = await createQueuedScanWithOutbox({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 3001,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+      expect(jobId).toBe(`scan-${scan.id}-1`);
+      expect(outbox.state).toBe(OutboxDispatchStateValue.PENDING);
+      expect(outbox.organizationId).toBe(orgA);
+      expect(outbox.projectId).toBe(projectA1);
+
+      // Unique scanId constraint on outbox
+      await expect(
+        ScanDispatchOutboxModel.create({
+          scanId: scan.id,
+          organizationId: orgA,
+          projectId: projectA1,
+        })
+      ).rejects.toMatchObject({ code: 11000 });
+
+      // 2. Rollback proof (both directions):
+      // (a) Outbox creation fails after Scan insert -> Scan insert inside createQueuedScanWithOutbox rolls back
+      const scansBeforeRollback = await ScanModel.countDocuments({ organizationId: orgA });
+      const outboxBeforeRollback = await ScanDispatchOutboxModel.countDocuments({
+        organizationId: orgA,
+      });
+      vi.spyOn(ScanDispatchOutboxModel, 'create').mockRejectedValueOnce(
+        new Error('Simulated outbox failure after scan insert')
+      );
+      await expect(
+        createQueuedScanWithOutbox({
+          organizationId: orgA,
+          projectId: projectA1,
+          repositoryConnectionId: connA1,
+          githubInstallationId: 1001,
+          githubRepositoryId: 3009,
+          requestedRef: 'main',
+          triggerSource: ScanTriggerSourceValue.MANUAL,
+          createdByUserId: userA,
+          now: t0,
+        })
+      ).rejects.toThrow('Simulated outbox failure after scan insert');
+      expect(await ScanModel.countDocuments({ organizationId: orgA })).toBe(scansBeforeRollback);
+      expect(await ScanDispatchOutboxModel.countDocuments({ organizationId: orgA })).toBe(
+        outboxBeforeRollback
+      );
+
+      // (b) Subsequent error inside external transaction rolls back both Scan and Outbox created by createQueuedScanWithOutbox
+      await expect(
+        runInTransaction(async (session) => {
+          await createQueuedScanWithOutbox(
+            {
+              organizationId: orgA,
+              projectId: projectA1,
+              repositoryConnectionId: connA1,
+              githubInstallationId: 1001,
+              githubRepositoryId: 3010,
+              requestedRef: 'main',
+              triggerSource: ScanTriggerSourceValue.MANUAL,
+              createdByUserId: userA,
+              now: t0,
+            },
+            session
+          );
+          throw new Error('Simulated downstream tx abort');
+        })
+      ).rejects.toThrow('Simulated downstream tx abort');
+      expect(await ScanModel.countDocuments({ organizationId: orgA })).toBe(scansBeforeRollback);
+      expect(await ScanDispatchOutboxModel.countDocuments({ organizationId: orgA })).toBe(
+        outboxBeforeRollback
+      );
+
+      // 3. Pending query -> claim -> mark dispatched -> concurrent rearm bumps generation safely & fences old generation!
+      const pending = await findPendingScanDispatchOutboxCandidates({ now: t0 });
+      expect(pending.some((p) => p.scanId === scan.id)).toBe(true);
+
+      const claimedDispatch = await claimPendingScanDispatch({
+        scanId: scan.id,
+        dispatchGeneration: 1,
+        now: t0,
+      });
+      expect(claimedDispatch.status).toBe('CLAIMED');
+
+      await expect(
+        markScanDispatchSucceeded({ scanId: scan.id, dispatchGeneration: 1, now: t0 })
+      ).resolves.toMatchObject({
+        status: 'DISPATCHED',
+        outbox: { state: 'DISPATCHED', dispatchGeneration: 1 },
+      });
+
+      // Concurrent re-arm expecting generation 1 -> only 1 succeeds, incrementing generation to 2
+      const [rearm1, rearm2] = await Promise.all([
+        rearmScanDispatchOutbox({ scanId: scan.id, expectedGeneration: 1, now: t0 }),
+        rearmScanDispatchOutbox({ scanId: scan.id, expectedGeneration: 1, now: t0 }),
+      ]);
+      const rearmStatuses = [rearm1.status, rearm2.status].sort();
+      expect(rearmStatuses).toEqual(['REARMED', 'STALE_OR_CONFLICT']);
+      const rearmedOutbox = rearm1.status === 'REARMED' ? rearm1 : (rearm2 as typeof rearm1);
+      if (rearmedOutbox.status === 'REARMED') {
+        expect(rearmedOutbox.outbox.dispatchGeneration).toBe(2);
+        expect(rearmedOutbox.jobId).toBe(`scan-${scan.id}-2`);
+      }
+
+      // Old dispatcher (generation 1) CANNOT succeed or record failure over generation 2
+      await expect(
+        markScanDispatchSucceeded({ scanId: scan.id, dispatchGeneration: 1, now: t0 })
+      ).resolves.toEqual({ status: 'STALE_GENERATION' });
+      await expect(
+        recordScanDispatchFailure({
+          scanId: scan.id,
+          dispatchGeneration: 1,
+          errorMessage: 'Old attempt failure',
+          now: t0,
+        })
+      ).resolves.toEqual({ status: 'STALE_GENERATION' });
+
+      // Cancelling scan causes pending claim & re-arm to suppress outbox cleanly
+      await requestScanCancellation({
+        scanId: scan.id,
+        organizationId: orgA,
+        projectId: projectA1,
+        requestedByUserId: userA,
+        now: t0,
+      });
+      await expect(
+        claimPendingScanDispatch({
+          scanId: scan.id,
+          dispatchGeneration: 2,
+          now: t0,
+        })
+      ).resolves.toMatchObject({
+        status: 'SUPPRESSED',
+        outbox: { state: 'SUPPRESSED' },
+      });
+    });
+
+    it('loads authoritative ScanExecutionTarget without exposing lease.token', async () => {
+      const t0 = new Date('2026-11-28T12:40:00.000Z');
+      const projectDoc = await ProjectModel.create({
+        organizationId: orgA,
+        name: 'Target Loader Project',
+        slug: 'target-loader-project',
+        createdBy: userA,
+      });
+      const instDoc = await GitHubInstallationModel.create({
+        organizationId: orgA,
+        githubInstallationId: 9101,
+        githubAppId: 9001,
+        accountLogin: 'acme-target',
+        accountId: 8101,
+        accountType: 'Organization',
+        repositorySelection: 'selected',
+        grantedPermissions: { contents: 'read' },
+        status: GitHubInstallationStatusValue.ACTIVE,
+        isActive: true,
+        connectedByUserId: userA,
+        lastSyncedAt: t0,
+      });
+      const connDoc = await ProjectRepositoryConnectionModel.create({
+        organizationId: orgA,
+        projectId: projectDoc._id,
+        installationRecordId: instDoc._id,
+        githubInstallationId: 9101,
+        githubRepositoryId: 7101,
+        ownerLogin: 'acme-target',
+        repoName: 'web-app',
+        fullName: 'acme-target/web-app',
+        defaultBranch: 'main',
+        isPrivate: true,
+        repositoryAccessState: RepositoryAccessStateValue.CONNECTED,
+        installationAvailability: InstallationAvailabilityValue.ACTIVE,
+        isActive: true,
+        connectedByUserId: userA,
+      });
+      const created = await createQueuedScan({
+        organizationId: orgA,
+        projectId: projectDoc._id.toString(),
+        repositoryConnectionId: connDoc._id.toString(),
+        githubInstallationId: 9101,
+        githubRepositoryId: 7101,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+
+      const targetRes = await loadScanExecutionTarget(created.id);
+      expect(targetRes.status).toBe('EXECUTABLE');
+      if (targetRes.status === 'EXECUTABLE') {
+        expect(targetRes.target.organizationId).toBe(orgA);
+        expect(targetRes.target.projectId).toBe(projectDoc._id.toString());
+        expect(targetRes.target.repositoryOwner).toBe('acme-target');
+        expect(targetRes.target.repositoryName).toBe('web-app');
+        expect((targetRes.target.lease as Record<string, unknown> | null)?.token).toBeUndefined();
+      }
+
+      await Promise.all([
+        ProjectRepositoryConnectionModel.deleteMany({ _id: connDoc._id }),
+        GitHubInstallationModel.deleteMany({ _id: instDoc._id }),
         ProjectModel.deleteMany({ _id: projectDoc._id }),
       ]);
     });

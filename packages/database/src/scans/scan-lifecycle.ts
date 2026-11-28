@@ -43,11 +43,14 @@ const ALLOWED_SCAN_TRANSITIONS: Readonly<
     ScanLifecycleStatusValue.CANCELLED,
   ]),
   [ScanLifecycleStatusValue.ACQUIRING]: new Set<ScanLifecycleStatus>([
+    ScanLifecycleStatusValue.QUEUED,
     ScanLifecycleStatusValue.ACQUIRING,
+    ScanLifecycleStatusValue.PREPARED,
     ScanLifecycleStatusValue.IN_PROGRESS,
     ScanLifecycleStatusValue.FAILED,
     ScanLifecycleStatusValue.CANCELLED,
   ]),
+  [ScanLifecycleStatusValue.PREPARED]: new Set<ScanLifecycleStatus>(),
   [ScanLifecycleStatusValue.IN_PROGRESS]: new Set<ScanLifecycleStatus>([
     ScanLifecycleStatusValue.IN_PROGRESS,
     ScanLifecycleStatusValue.ACQUIRING,
@@ -213,6 +216,7 @@ export function toPublicScanRecord(
     queuedAt: doc.queuedAt,
     startedAt: doc.startedAt ?? null,
     acquiringAt: doc.acquiringAt ?? null,
+    preparedAt: doc.preparedAt ?? null,
     inProgressAt: doc.inProgressAt ?? null,
     completedAt: doc.completedAt ?? null,
     failedAt: doc.failedAt ?? null,
@@ -320,7 +324,10 @@ function classifyFencedUpdateMiss(input: {
   }
 
   // Reject stale or expired leases cleanly before considering pending cancellation signals.
-  if (doc.lease?.token !== undefined && doc.lease.token !== leaseToken) {
+  if (
+    typeof doc.lease?.token === 'string' &&
+    !constantTimeTokenMatch(doc.lease.token, leaseToken)
+  ) {
     return { status: 'STALE_OR_CONFLICT', scan: publicRecord };
   }
   if (doc.lease && doc.lease.expiresAt.getTime() <= now.getTime()) {
@@ -1523,4 +1530,776 @@ export async function verifyScanAcquisitionAuthorization(
       leaseExpiresAt: scan.lease.expiresAt,
     },
   };
+}
+
+export type CompleteAcquisitionPreparedResult =
+  | { status: 'PREPARED'; scan: PublicScanRecord }
+  | { status: 'CANCEL_REQUESTED'; scan: PublicScanRecord }
+  | { status: 'STALE_OR_CONFLICT'; scan: PublicScanRecord | null }
+  | { status: 'NOT_FOUND' }
+  | { status: 'INVALID_TRANSITION'; currentStatus: ScanLifecycleStatus; scan: PublicScanRecord }
+  | { status: 'MISSING_RESOLVED_COMMIT'; scan: PublicScanRecord };
+
+export interface CompleteAcquisitionPreparedInput {
+  scanId: string;
+  organizationId: string;
+  projectId: string;
+  leaseToken: string;
+  acquisition: {
+    compressedArchiveBytes: number;
+    extractedBytes: number;
+    extractedFileCount: number;
+    acquisitionCompletedAt?: Date;
+  };
+  now?: Date;
+}
+
+function assertNonNegativeIntegerMetric(value: unknown, fieldName: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new ScanLifecycleError(
+      `${fieldName} must be a non-negative integer`,
+      'INVALID_ACQUISITION_METRICS'
+    );
+  }
+  return value;
+}
+
+/**
+ * Atomically transitions an `ACQUIRING` scan to terminal/quiescent `PREPARED` state after
+ * defensive repository extraction succeeds.
+ *
+ * Security invariants:
+ * - Reads `resolvedCommitSha` exclusively from the authoritative MongoDB `Scan` document.
+ * - Requires matching active lease token (verified in constant time and atomically fenced in MongoDB),
+ *   non-expired lease (`expiresAt > now`), and `cancellation.requestedAt === null`.
+ * - Sets `isActive = false`, clears `lease = null`, stamps `preparedAt`, and leaves `completedAt = null`.
+ */
+export async function completeAcquisitionPreparedWithLease(
+  input: CompleteAcquisitionPreparedInput
+): Promise<CompleteAcquisitionPreparedResult> {
+  assertValidIds(input.organizationId, input.projectId, input.scanId);
+  const leaseToken = assertValidLeaseToken(input.leaseToken);
+  const compressedArchiveBytes = assertNonNegativeIntegerMetric(
+    input.acquisition.compressedArchiveBytes,
+    'compressedArchiveBytes'
+  );
+  const extractedBytes = assertNonNegativeIntegerMetric(
+    input.acquisition.extractedBytes,
+    'extractedBytes'
+  );
+  const extractedFileCount = assertNonNegativeIntegerMetric(
+    input.acquisition.extractedFileCount,
+    'extractedFileCount'
+  );
+
+  const now = input.now ?? new Date();
+  const acquisitionCompletedAt = input.acquisition.acquisitionCompletedAt ?? now;
+
+  const inspectCurrent = (
+    doc: (ScanAttributes & { _id: { toString(): string } }) | null
+  ):
+    | CompleteAcquisitionPreparedResult
+    | { readyDoc: ScanAttributes & { resolvedCommitSha: string } } => {
+    if (!doc) {
+      return { status: 'NOT_FOUND' };
+    }
+    const publicScan = toPublicScanRecord(doc);
+    if (doc.status !== ScanLifecycleStatusValue.ACQUIRING || !doc.isActive) {
+      return {
+        status: 'INVALID_TRANSITION',
+        currentStatus: doc.status,
+        scan: publicScan,
+      };
+    }
+    if (
+      !doc.lease ||
+      typeof doc.lease.token !== 'string' ||
+      !constantTimeTokenMatch(doc.lease.token, leaseToken) ||
+      new Date(doc.lease.expiresAt).getTime() <= now.getTime()
+    ) {
+      return { status: 'STALE_OR_CONFLICT', scan: publicScan };
+    }
+    if (doc.cancellation?.requestedAt !== null && doc.cancellation?.requestedAt !== undefined) {
+      return { status: 'CANCEL_REQUESTED', scan: publicScan };
+    }
+    if (
+      typeof doc.resolvedCommitSha !== 'string' ||
+      !FULL_COMMIT_SHA_REGEX.test(doc.resolvedCommitSha)
+    ) {
+      return { status: 'MISSING_RESOLVED_COMMIT', scan: publicScan };
+    }
+    return { readyDoc: doc as ScanAttributes & { resolvedCommitSha: string } };
+  };
+
+  const currentDoc = await findRawScanForFencingCheck({
+    scanId: input.scanId,
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+  });
+  const preCheck = inspectCurrent(currentDoc);
+  if (!('readyDoc' in preCheck)) {
+    return preCheck;
+  }
+
+  const authoritativeCommitSha = preCheck.readyDoc.resolvedCommitSha;
+  const updated = await ScanModel.findOneAndUpdate(
+    {
+      _id: input.scanId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      status: ScanLifecycleStatusValue.ACQUIRING,
+      isActive: true,
+      'cancellation.requestedAt': null,
+      'lease.token': leaseToken,
+      'lease.expiresAt': { $gt: now },
+      resolvedCommitSha: authoritativeCommitSha,
+    },
+    {
+      $set: {
+        status: ScanLifecycleStatusValue.PREPARED,
+        isActive: false,
+        preparedAt: now,
+        lease: null,
+        acquisition: {
+          resolvedCommitSha: authoritativeCommitSha,
+          compressedArchiveBytes,
+          extractedBytes,
+          extractedFileCount,
+          acquisitionCompletedAt,
+        },
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+    }
+  );
+
+  if (updated) {
+    return { status: 'PREPARED', scan: toPublicScanRecord(updated) };
+  }
+
+  const racedDoc = await findRawScanForFencingCheck({
+    scanId: input.scanId,
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+  });
+  const postCheck = inspectCurrent(racedDoc);
+  if (!('readyDoc' in postCheck)) {
+    return postCheck;
+  }
+  return { status: 'STALE_OR_CONFLICT', scan: toPublicScanRecord(racedDoc!) };
+}
+
+export type ReleaseScanLeaseForRetryResult =
+  | { status: 'RELEASED'; scan: PublicScanRecord }
+  | { status: 'CANCEL_REQUESTED'; scan: PublicScanRecord }
+  | { status: 'ATTEMPTS_EXHAUSTED'; scan: PublicScanRecord }
+  | { status: 'STALE_OR_CONFLICT'; scan: PublicScanRecord | null }
+  | { status: 'NOT_FOUND' }
+  | { status: 'INVALID_TRANSITION'; currentStatus: ScanLifecycleStatus; scan: PublicScanRecord };
+
+/**
+ * Voluntarily releases a leased `ACQUIRING` scan back to `QUEUED` after a retryable failure so
+ * BullMQ can schedule an immediate exponential-backoff retry without waiting for lease expiry.
+ *
+ * Distinction across lease mechanisms:
+ * - `releaseScanLeaseForRetry`: called by the active leaseholder on transient error; preserves
+ *   `attemptCount` & `idempotencyKey`, clears lease/resolvedCommitSha/acquisition, moves `ACQUIRING -> QUEUED`.
+ * - `reclaimExpiredScanLease`: called by another worker after `lease.expiresAt <= now` to take over execution
+ *   with a rotated `lease.token` and incremented `attemptCount`.
+ * - Expired-lease recovery (`recoverExpiredScanLeaseCandidate`): coordinator/sweeper primitive that finalizes
+ *   cancelled or attempt-exhausted scans, or resets recoverable stalled scans to `QUEUED` for re-dispatch.
+ */
+export async function releaseScanLeaseForRetry(input: {
+  scanId: string;
+  organizationId: string;
+  projectId: string;
+  leaseToken: string;
+  now?: Date;
+}): Promise<ReleaseScanLeaseForRetryResult> {
+  assertValidIds(input.organizationId, input.projectId, input.scanId);
+  const leaseToken = assertValidLeaseToken(input.leaseToken);
+  const now = input.now ?? new Date();
+
+  const updated = await ScanModel.findOneAndUpdate(
+    {
+      _id: input.scanId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      status: ScanLifecycleStatusValue.ACQUIRING,
+      isActive: true,
+      'cancellation.requestedAt': null,
+      'lease.token': leaseToken,
+      'lease.expiresAt': { $gt: now },
+      $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+    },
+    {
+      $set: {
+        status: ScanLifecycleStatusValue.QUEUED,
+        isActive: true,
+        lease: null,
+        resolvedCommitSha: null,
+        acquisition: null,
+        acquiringAt: null,
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+    }
+  );
+
+  if (updated) {
+    return { status: 'RELEASED', scan: toPublicScanRecord(updated) };
+  }
+
+  const rawDoc = await findRawScanForFencingCheck({
+    scanId: input.scanId,
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+  });
+  if (!rawDoc) {
+    return { status: 'NOT_FOUND' };
+  }
+
+  const publicScan = toPublicScanRecord(rawDoc);
+  if (rawDoc.status !== ScanLifecycleStatusValue.ACQUIRING || !rawDoc.isActive) {
+    return {
+      status: 'INVALID_TRANSITION',
+      currentStatus: rawDoc.status,
+      scan: publicScan,
+    };
+  }
+  if (
+    !rawDoc.lease ||
+    typeof rawDoc.lease.token !== 'string' ||
+    !constantTimeTokenMatch(rawDoc.lease.token, leaseToken) ||
+    new Date(rawDoc.lease.expiresAt).getTime() <= now.getTime()
+  ) {
+    return { status: 'STALE_OR_CONFLICT', scan: publicScan };
+  }
+  if (rawDoc.cancellation?.requestedAt !== null && rawDoc.cancellation?.requestedAt !== undefined) {
+    return { status: 'CANCEL_REQUESTED', scan: publicScan };
+  }
+  if (rawDoc.attemptCount >= rawDoc.maxAttempts) {
+    return { status: 'ATTEMPTS_EXHAUSTED', scan: publicScan };
+  }
+
+  return { status: 'STALE_OR_CONFLICT', scan: publicScan };
+}
+
+export interface ScanExecutionTarget {
+  scanId: string;
+  organizationId: string;
+  projectId: string;
+  repositoryConnectionId: string;
+  githubInstallationId: number;
+  githubRepositoryId: number;
+  repositoryOwner: string;
+  repositoryName: string;
+  requestedRef: string;
+  requestedCommitHash: string | null;
+  resolvedCommitSha: string | null;
+  status: ScanLifecycleStatus;
+  isActive: boolean;
+  triggerSource: ScanTriggerSource;
+  attemptCount: number;
+  maxAttempts: number;
+  cancellationRequestedAt: Date | null;
+  lease: {
+    workerId: string;
+    acquiredAt: Date;
+    heartbeatAt: Date;
+    expiresAt: Date;
+  } | null;
+  queuedAt: Date;
+  startedAt: Date | null;
+}
+
+export type LoadScanExecutionTargetResult =
+  | { status: 'EXECUTABLE'; target: ScanExecutionTarget }
+  | { status: 'NOT_FOUND' }
+  | {
+      status: 'TERMINAL';
+      scanId: string;
+      organizationId: string;
+      projectId: string;
+      currentStatus: ScanLifecycleStatus;
+    }
+  | {
+      status: 'CANCEL_REQUESTED';
+      scanId: string;
+      organizationId: string;
+      projectId: string;
+      currentStatus: ScanLifecycleStatus;
+      attemptCount: number;
+      maxAttempts: number;
+    }
+  | {
+      status: 'INVALID_BINDING';
+      scanId: string;
+      organizationId: string;
+      projectId: string;
+      currentStatus: ScanLifecycleStatus;
+      reason: ScanAcquisitionDenialReason;
+      failureCode: ScanFailureCode;
+      message: string;
+    };
+
+/**
+ * Loads the narrow, credential-free authoritative execution target for a worker given only `scanId`.
+ * Never selects or exposes `lease.token` or any GitHub credentials. Validates parent project,
+ * repository connection, and GitHub installation integrity from authoritative MongoDB references.
+ */
+export async function loadScanExecutionTarget(
+  scanId: string,
+  session?: ClientSession
+): Promise<LoadScanExecutionTargetResult> {
+  if (!isValidObjectId(scanId)) {
+    throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
+  }
+
+  const scan = await ScanModel.findById(scanId)
+    .select(
+      '_id organizationId projectId repositoryConnectionId githubInstallationId githubRepositoryId requestedRef requestedCommitHash resolvedCommitSha status isActive triggerSource attemptCount maxAttempts cancellation.requestedAt lease.workerId lease.acquiredAt lease.heartbeatAt lease.expiresAt queuedAt startedAt'
+    )
+    .session(session ?? null)
+    .lean();
+
+  if (!scan) {
+    return { status: 'NOT_FOUND' };
+  }
+
+  const orgId = scan.organizationId.toString();
+  const projectId = scan.projectId.toString();
+
+  if (isTerminalScanLifecycleStatus(scan.status) || !scan.isActive) {
+    return {
+      status: 'TERMINAL',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+    };
+  }
+
+  if (scan.cancellation?.requestedAt !== null && scan.cancellation?.requestedAt !== undefined) {
+    return {
+      status: 'CANCEL_REQUESTED',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      attemptCount: scan.attemptCount,
+      maxAttempts: scan.maxAttempts,
+    };
+  }
+
+  const project = await ProjectModel.findOne(
+    { _id: scan.projectId, organizationId: scan.organizationId },
+    { _id: 1, organizationId: 1, archivedAt: 1 }
+  )
+    .session(session ?? null)
+    .lean();
+
+  if (!project || project.organizationId.toString() !== orgId) {
+    return {
+      status: 'INVALID_BINDING',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      reason: 'PROJECT_NOT_FOUND',
+      failureCode: ScanFailureCodeValue.PROJECT_NOT_FOUND,
+      message: 'Parent project was not found in the scan organization.',
+    };
+  }
+
+  if (project.archivedAt !== null && project.archivedAt !== undefined) {
+    return {
+      status: 'INVALID_BINDING',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      reason: 'PROJECT_ARCHIVED',
+      failureCode: ScanFailureCodeValue.PROJECT_ARCHIVED,
+      message: 'Parent project is archived.',
+    };
+  }
+
+  const connection = await ProjectRepositoryConnectionModel.findOne(
+    {
+      _id: scan.repositoryConnectionId,
+      organizationId: scan.organizationId,
+      projectId: scan.projectId,
+    },
+    {
+      _id: 1,
+      organizationId: 1,
+      projectId: 1,
+      installationRecordId: 1,
+      githubInstallationId: 1,
+      githubRepositoryId: 1,
+      ownerLogin: 1,
+      repoName: 1,
+      repositoryAccessState: 1,
+      installationAvailability: 1,
+      isActive: 1,
+    }
+  )
+    .session(session ?? null)
+    .lean();
+
+  if (
+    !connection ||
+    connection.organizationId.toString() !== orgId ||
+    connection.projectId.toString() !== projectId
+  ) {
+    return {
+      status: 'INVALID_BINDING',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      reason: 'CONNECTION_NOT_FOUND',
+      failureCode: ScanFailureCodeValue.REPOSITORY_DISCONNECTED,
+      message: 'Project repository connection was not found.',
+    };
+  }
+
+  const effectiveConnStatus = getEffectiveConnectionStatus(connection);
+  if (connection.isActive !== true || effectiveConnStatus !== 'CONNECTED') {
+    const failureCode =
+      effectiveConnStatus === 'REPO_DELETED'
+        ? ScanFailureCodeValue.REPOSITORY_DELETED
+        : effectiveConnStatus === 'ACCESS_REVOKED'
+          ? ScanFailureCodeValue.REPOSITORY_ACCESS_REVOKED
+          : effectiveConnStatus === 'INSTALLATION_SUSPENDED'
+            ? ScanFailureCodeValue.INSTALLATION_SUSPENDED
+            : ScanFailureCodeValue.REPOSITORY_DISCONNECTED;
+    return {
+      status: 'INVALID_BINDING',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      reason: 'CONNECTION_INACTIVE',
+      failureCode,
+      message: 'Project repository connection is not active.',
+    };
+  }
+
+  const ownerLogin = typeof connection.ownerLogin === 'string' ? connection.ownerLogin.trim() : '';
+  const repoName = typeof connection.repoName === 'string' ? connection.repoName.trim() : '';
+  const isSafeBinding =
+    SAFE_GITHUB_REPO_SEGMENT_REGEX.test(ownerLogin) &&
+    SAFE_GITHUB_REPO_SEGMENT_REGEX.test(repoName) &&
+    ownerLogin !== '.' &&
+    ownerLogin !== '..' &&
+    repoName !== '.' &&
+    repoName !== '..';
+
+  if (
+    !isSafeBinding ||
+    connection.githubRepositoryId !== scan.githubRepositoryId ||
+    connection.githubInstallationId !== scan.githubInstallationId
+  ) {
+    return {
+      status: 'INVALID_BINDING',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      reason: 'CONNECTION_METADATA_MISMATCH',
+      failureCode: ScanFailureCodeValue.REPOSITORY_DISCONNECTED,
+      message: 'Scan repository or installation binding does not match active connection.',
+    };
+  }
+
+  const installation = await GitHubInstallationModel.findOne(
+    {
+      _id: connection.installationRecordId,
+      organizationId: scan.organizationId,
+    },
+    {
+      _id: 1,
+      organizationId: 1,
+      githubInstallationId: 1,
+      status: 1,
+      isActive: 1,
+      suspendedAt: 1,
+      revokedAt: 1,
+    }
+  )
+    .session(session ?? null)
+    .lean();
+
+  if (!installation || installation.organizationId.toString() !== orgId) {
+    return {
+      status: 'INVALID_BINDING',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      reason: 'INSTALLATION_NOT_FOUND',
+      failureCode: ScanFailureCodeValue.INSTALLATION_NOT_FOUND,
+      message: 'GitHub installation record was not found.',
+    };
+  }
+
+  if (
+    installation.status !== GitHubInstallationStatusValue.ACTIVE ||
+    installation.isActive !== true ||
+    (installation.suspendedAt !== null && installation.suspendedAt !== undefined) ||
+    (installation.revokedAt !== null && installation.revokedAt !== undefined)
+  ) {
+    const failureCode =
+      installation.status === GitHubInstallationStatusValue.SUSPENDED
+        ? ScanFailureCodeValue.INSTALLATION_SUSPENDED
+        : ScanFailureCodeValue.INSTALLATION_REVOKED;
+    return {
+      status: 'INVALID_BINDING',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      reason: 'INSTALLATION_UNAVAILABLE',
+      failureCode,
+      message: 'GitHub installation is suspended, revoked, or inactive.',
+    };
+  }
+
+  if (
+    installation.githubInstallationId !== scan.githubInstallationId ||
+    installation.githubInstallationId !== connection.githubInstallationId
+  ) {
+    return {
+      status: 'INVALID_BINDING',
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      currentStatus: scan.status,
+      reason: 'INSTALLATION_MISMATCH',
+      failureCode: ScanFailureCodeValue.INSTALLATION_REVOKED,
+      message: 'GitHub installation identifier does not match the authorized scan binding.',
+    };
+  }
+
+  return {
+    status: 'EXECUTABLE',
+    target: {
+      scanId: scan._id.toString(),
+      organizationId: orgId,
+      projectId,
+      repositoryConnectionId: scan.repositoryConnectionId.toString(),
+      githubInstallationId: installation.githubInstallationId,
+      githubRepositoryId: connection.githubRepositoryId,
+      repositoryOwner: ownerLogin,
+      repositoryName: repoName,
+      requestedRef: scan.requestedRef,
+      requestedCommitHash: scan.requestedCommitHash ?? null,
+      resolvedCommitSha: scan.resolvedCommitSha ?? null,
+      status: scan.status,
+      isActive: scan.isActive,
+      triggerSource: scan.triggerSource,
+      attemptCount: scan.attemptCount,
+      maxAttempts: scan.maxAttempts,
+      cancellationRequestedAt: scan.cancellation?.requestedAt ?? null,
+      lease: scan.lease
+        ? {
+            workerId: scan.lease.workerId,
+            acquiredAt: scan.lease.acquiredAt,
+            heartbeatAt: scan.lease.heartbeatAt,
+            expiresAt: scan.lease.expiresAt,
+          }
+        : null,
+      queuedAt: scan.queuedAt,
+      startedAt: scan.startedAt ?? null,
+    },
+  };
+}
+
+export interface ExpiredScanLeaseCandidate {
+  scanId: string;
+  organizationId: string;
+  projectId: string;
+  status: ScanLifecycleStatus;
+  attemptCount: number;
+  maxAttempts: number;
+  cancellationRequestedAt: Date | null;
+  leaseWorkerId: string;
+  leaseExpiresAt: Date;
+}
+
+/**
+ * Returns a bounded batch of expired active `ACQUIRING` / `IN_PROGRESS` scans backed by the
+ * `scans_active_lease_expires_idx` index, never selecting `lease.token`.
+ */
+export async function findExpiredActiveScanLeaseCandidates(
+  input: {
+    limit?: number;
+    statuses?: readonly ScanLifecycleStatus[];
+    now?: Date;
+  } = {}
+): Promise<ExpiredScanLeaseCandidate[]> {
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 25), 1), 100);
+  const now = input.now ?? new Date();
+  const targetStatuses = input.statuses ?? [
+    ScanLifecycleStatusValue.ACQUIRING,
+    ScanLifecycleStatusValue.IN_PROGRESS,
+  ];
+
+  const docs = await ScanModel.find({
+    isActive: true,
+    status: { $in: targetStatuses },
+    'lease.expiresAt': { $lte: now },
+  })
+    .select(
+      '_id organizationId projectId status attemptCount maxAttempts cancellation.requestedAt lease.workerId lease.expiresAt'
+    )
+    .sort({ 'lease.expiresAt': 1 })
+    .limit(limit)
+    .lean();
+
+  return docs
+    .filter((doc) => doc.lease && doc.lease.expiresAt)
+    .map((doc) => ({
+      scanId: doc._id.toString(),
+      organizationId: doc.organizationId.toString(),
+      projectId: doc.projectId.toString(),
+      status: doc.status,
+      attemptCount: doc.attemptCount,
+      maxAttempts: doc.maxAttempts,
+      cancellationRequestedAt: doc.cancellation?.requestedAt ?? null,
+      leaseWorkerId: doc.lease!.workerId,
+      leaseExpiresAt: doc.lease!.expiresAt,
+    }));
+}
+
+export type RecoverExpiredScanLeaseResult =
+  | { status: 'REQUEUED_FOR_RECOVERY'; scan: PublicScanRecord }
+  | { status: 'FINALIZED_CANCELLED'; scan: PublicScanRecord }
+  | { status: 'FINALIZED_EXHAUSTED'; scan: PublicScanRecord }
+  | { status: 'ALREADY_HANDLED'; scan: PublicScanRecord | null };
+
+/**
+ * Atomically recovers a single expired active scan (`ACQUIRING` / `IN_PROGRESS`) under concurrent
+ * sweepers by fencing strictly on `isActive: true` and `'lease.expiresAt': { $lte: now }`.
+ * Clears/invalidates the expired worker lease so stale workers are permanently fenced afterward.
+ */
+export async function recoverExpiredScanLeaseCandidate(
+  input: {
+    scanId: string;
+    organizationId: string;
+    projectId: string;
+    now?: Date;
+  },
+  session?: ClientSession
+): Promise<RecoverExpiredScanLeaseResult> {
+  assertValidIds(input.organizationId, input.projectId, input.scanId);
+  const now = input.now ?? new Date();
+  const activeStatuses = [ScanLifecycleStatusValue.ACQUIRING, ScanLifecycleStatusValue.IN_PROGRESS];
+
+  const cancelled = await ScanModel.findOneAndUpdate(
+    {
+      _id: input.scanId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      status: { $in: activeStatuses },
+      isActive: true,
+      'cancellation.requestedAt': { $ne: null },
+      'lease.expiresAt': { $lte: now },
+    },
+    {
+      $set: {
+        status: ScanLifecycleStatusValue.CANCELLED,
+        isActive: false,
+        cancelledAt: now,
+        lease: null,
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+      ...(session ? { session } : {}),
+    }
+  );
+
+  if (cancelled) {
+    return { status: 'FINALIZED_CANCELLED', scan: toPublicScanRecord(cancelled) };
+  }
+
+  const exhausted = await ScanModel.findOneAndUpdate(
+    {
+      _id: input.scanId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      status: { $in: activeStatuses },
+      isActive: true,
+      'cancellation.requestedAt': null,
+      'lease.expiresAt': { $lte: now },
+      $expr: { $gte: ['$attemptCount', '$maxAttempts'] },
+    },
+    {
+      $set: {
+        status: ScanLifecycleStatusValue.FAILED,
+        isActive: false,
+        failedAt: now,
+        failureCode: ScanFailureCodeValue.LEASE_EXPIRED,
+        failureMessage: 'Worker lease expired after maximum allowed scan attempts',
+        lease: null,
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+      ...(session ? { session } : {}),
+    }
+  );
+
+  if (exhausted) {
+    return { status: 'FINALIZED_EXHAUSTED', scan: toPublicScanRecord(exhausted) };
+  }
+
+  const requeued = await ScanModel.findOneAndUpdate(
+    {
+      _id: input.scanId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      status: { $in: activeStatuses },
+      isActive: true,
+      'cancellation.requestedAt': null,
+      'lease.expiresAt': { $lte: now },
+      $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+    },
+    {
+      $set: {
+        status: ScanLifecycleStatusValue.QUEUED,
+        isActive: true,
+        lease: null,
+        resolvedCommitSha: null,
+        acquisition: null,
+        acquiringAt: null,
+        inProgressAt: null,
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+      ...(session ? { session } : {}),
+    }
+  );
+
+  if (requeued) {
+    return { status: 'REQUEUED_FOR_RECOVERY', scan: toPublicScanRecord(requeued) };
+  }
+
+  const existing = await findScanByIdInOrganization({
+    scanId: input.scanId,
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+  });
+  return { status: 'ALREADY_HANDLED', scan: existing };
 }

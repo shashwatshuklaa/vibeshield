@@ -132,10 +132,6 @@ function extractSafeJobContext(
     jobName: job.name,
     attemptsMade: job.attemptsMade,
     ...(typeof rawData?.scanId === 'string' ? { scanId: rawData.scanId } : {}),
-    ...(typeof rawData?.organizationId === 'string'
-      ? { organizationId: rawData.organizationId }
-      : {}),
-    ...(typeof rawData?.projectId === 'string' ? { projectId: rawData.projectId } : {}),
   };
 }
 

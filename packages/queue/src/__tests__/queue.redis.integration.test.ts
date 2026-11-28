@@ -1,6 +1,5 @@
 import { Worker } from 'bullmq';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
-import { ScanStatus } from '@vibeshield/types';
 import {
   buildScanJobId,
   closeQueueResources,
@@ -60,56 +59,51 @@ describe.skipIf(!REDIS_URI)('@vibeshield/queue Real Redis & BullMQ Integration T
     await handle.queue.obliterate({ force: true });
 
     const payload = validateScanQueueJobPayload({
-      scanId: 'scan-real-1',
-      organizationId: 'org-real-1',
-      projectId: 'proj-real-1',
-      installationRecordId: 'inst-real-1',
-      githubRepositoryId: 777001,
-      commitHash: 'deadbeef1234',
-      branch: 'main',
-      status: ScanStatus.QUEUED,
-      metadata: {
-        organizationId: 'org-real-1',
-        projectId: 'proj-real-1',
-        triggeredByUserId: 'user-real-1',
-        triggerSource: 'manual',
-        enqueuedAt: new Date().toISOString(),
-      },
+      scanId: '507f1f77bcf86cd799439011',
     });
 
-    const jobId = buildScanJobId({
-      organizationId: payload.organizationId,
-      projectId: payload.projectId,
+    const jobIdGen1 = buildScanJobId({
       scanId: payload.scanId,
+      dispatchGeneration: 1,
     });
+    const jobIdGen2 = buildScanJobId({
+      scanId: payload.scanId,
+      dispatchGeneration: 2,
+    });
+    expect(jobIdGen1).toBe('scan-507f1f77bcf86cd799439011-1');
+    expect(jobIdGen2).toBe('scan-507f1f77bcf86cd799439011-2');
 
-    // Add initial job + duplicate job with same deterministic jobId
+    // Add initial job + duplicate job with same deterministic jobId (collapses) + different generation (kept distinct)
     const job1 = await handle.queue.add('scan', payload, {
-      jobId,
+      jobId: jobIdGen1,
       attempts: 2,
       backoff: { type: 'fixed', delay: 50 },
     });
-    await handle.queue.add('scan', payload, { jobId });
+    await handle.queue.add('scan', payload, { jobId: jobIdGen1 });
+    await handle.queue.add('scan', payload, { jobId: jobIdGen2 });
 
     const countsBeforeWorker = await inspectQueueHealth(handle, manager, true);
     expect(countsBeforeWorker.queueName).toBe(QUEUE_NAMES.SCAN_JOBS);
     expect(countsBeforeWorker.redis.isConnected).toBe(true);
-    expect(countsBeforeWorker.counts?.waiting).toBe(1);
+    expect(countsBeforeWorker.counts?.waiting).toBe(2);
 
     expect(job1.opts.removeOnComplete).toEqual(DEFAULT_QUEUE_POLICY.removeOnComplete);
     expect(job1.opts.removeOnFail).toEqual(DEFAULT_QUEUE_POLICY.removeOnFail);
 
-    // Minimal test-only worker verifying retry attempt 1 fails -> attempt 2 succeeds
-    let attemptsSeen = 0;
-    const completedPromise = new Promise<string>((resolve, reject) => {
+    // Minimal test-only worker verifying retry attempt 1 fails -> attempt 2 succeeds, and gen 2 runs separately
+    let gen1AttemptsSeen = 0;
+    const completedIds: string[] = [];
+    const completedPromise = new Promise<void>((resolve, reject) => {
       const worker = new Worker<ScanQueueJobPayload, void, 'scan'>(
         QUEUE_NAMES.SCAN_JOBS,
         async (job) => {
-          attemptsSeen += 1;
-          if (attemptsSeen === 1) {
-            throw new Error('Transient test failure on attempt 1');
+          if (job.id === jobIdGen1) {
+            gen1AttemptsSeen += 1;
+            if (gen1AttemptsSeen === 1) {
+              throw new Error('Transient test failure on attempt 1');
+            }
           }
-          expect(job.data.scanId).toBe('scan-real-1');
+          expect(job.data).toEqual({ scanId: '507f1f77bcf86cd799439011' });
         },
         {
           connection: manager.getWorkerConnectionOptions(),
@@ -119,24 +113,28 @@ describe.skipIf(!REDIS_URI)('@vibeshield/queue Real Redis & BullMQ Integration T
       activeWorkers.push(worker);
 
       worker.on('completed', (job) => {
-        resolve(job.id ?? '');
+        if (job.id) {
+          completedIds.push(job.id);
+        }
+        if (completedIds.includes(jobIdGen1) && completedIds.includes(jobIdGen2)) {
+          resolve();
+        }
       });
       worker.on('failed', (_job, err) => {
-        if (attemptsSeen >= 2) {
+        if (gen1AttemptsSeen >= 2) {
           reject(err);
         }
       });
     });
 
-    const completedId = await completedPromise;
-    expect(completedId).toBe(jobId);
-    expect(attemptsSeen).toBe(2);
+    await completedPromise;
+    expect(completedIds).toEqual(expect.arrayContaining([jobIdGen1, jobIdGen2]));
+    expect(gen1AttemptsSeen).toBe(2);
 
     // Verify exhausted failure moves job into BullMQ failed state cleanly
     const failingJobId = buildScanJobId({
-      organizationId: 'org-real-1',
-      projectId: 'proj-real-1',
-      scanId: 'scan-real-fail',
+      scanId: '507f1f77bcf86cd799439012',
+      dispatchGeneration: 1,
     });
     const existingWorker = activeWorkers[0]!;
     const failedPromise = new Promise<string>((resolve) => {
@@ -148,7 +146,7 @@ describe.skipIf(!REDIS_URI)('@vibeshield/queue Real Redis & BullMQ Integration T
     });
     await handle.queue.add(
       'scan',
-      { ...payload, scanId: 'scan-real-fail' },
+      { scanId: '507f1f77bcf86cd799439012' },
       { jobId: failingJobId, attempts: 1 }
     );
     expect(await failedPromise).toBe(failingJobId);

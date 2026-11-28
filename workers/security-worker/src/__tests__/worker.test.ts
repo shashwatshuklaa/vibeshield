@@ -10,7 +10,6 @@ import {
   type Processor,
   type ScanQueueJobPayload,
 } from '@vibeshield/queue';
-import { ScanStatus } from '@vibeshield/types';
 import {
   buildValidatedScanProcessor,
   clearSecurityScanProcessor,
@@ -115,23 +114,13 @@ function makeConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
   };
 }
 
+const VALID_SCAN_ID = '507f1f77bcf86cd799439011';
+const TRANSIENT_FAIL_SCAN_ID = '507f1f77bcf86cd799439012';
+const PERMANENT_FAIL_SCAN_ID = '507f1f77bcf86cd799439013';
+
 function makeValidPayload(overrides: Partial<ScanQueueJobPayload> = {}): ScanQueueJobPayload {
   return {
-    scanId: 'scan-worker-1',
-    organizationId: 'org-worker-1',
-    projectId: 'proj-worker-1',
-    installationRecordId: 'inst-worker-1',
-    githubRepositoryId: 90123,
-    commitHash: 'a1b2c3d4',
-    branch: 'main',
-    status: ScanStatus.QUEUED,
-    metadata: {
-      organizationId: 'org-worker-1',
-      projectId: 'proj-worker-1',
-      triggeredByUserId: 'user-worker-1',
-      triggerSource: 'manual',
-      enqueuedAt: '2026-11-27T12:00:00Z',
-    },
+    scanId: VALID_SCAN_ID,
     ...overrides,
   };
 }
@@ -261,10 +250,10 @@ describe('@vibeshield/security-worker Unit Tests', () => {
 
     it('wraps permanent payload/name errors in UnrecoverableError while preserving transient errors for retry', async () => {
       const innerSpy = vi.fn(async (payload: ScanQueueJobPayload) => {
-        if (payload.branch === 'transient-fail') {
+        if (payload.scanId === TRANSIENT_FAIL_SCAN_ID) {
           throw new Error('Temporary upstream timeout');
         }
-        if (payload.branch === 'permanent-fail') {
+        if (payload.scanId === PERMANENT_FAIL_SCAN_ID) {
           throw new UnrecoverableError('Repository archived permanently');
         }
         return payload.scanId;
@@ -278,7 +267,15 @@ describe('@vibeshield/security-worker Unit Tests', () => {
       );
       expect(innerSpy).not.toHaveBeenCalled();
 
-      // Malformed / credential-bearing payload -> UnrecoverableError (never retried)
+      // Unknown extra fields or credential-bearing payload -> UnrecoverableError (never retried)
+      await expect(
+        wrapped(
+          makeFakeJob({
+            ...makeValidPayload(),
+            organizationId: '507f1f77bcf86cd799439099',
+          })
+        )
+      ).rejects.toThrowError(UnrecoverableError);
       await expect(
         wrapped(
           makeFakeJob({
@@ -291,18 +288,18 @@ describe('@vibeshield/security-worker Unit Tests', () => {
 
       // Valid payload + transient error -> standard Error (retryable by BullMQ)
       const transientErr = await wrapped(
-        makeFakeJob(makeValidPayload({ branch: 'transient-fail' }))
+        makeFakeJob(makeValidPayload({ scanId: TRANSIENT_FAIL_SCAN_ID }))
       ).catch((e: unknown) => e);
       expect(transientErr).toBeInstanceOf(Error);
       expect(transientErr).not.toBeInstanceOf(UnrecoverableError);
 
       // Valid payload + explicit UnrecoverableError -> UnrecoverableError
       await expect(
-        wrapped(makeFakeJob(makeValidPayload({ branch: 'permanent-fail' })))
+        wrapped(makeFakeJob(makeValidPayload({ scanId: PERMANENT_FAIL_SCAN_ID })))
       ).rejects.toThrowError(UnrecoverableError);
 
       // Valid payload -> passes validated payload directly to processor
-      await expect(wrapped(makeFakeJob(makeValidPayload()))).resolves.toBe('scan-worker-1');
+      await expect(wrapped(makeFakeJob(makeValidPayload()))).resolves.toBe(VALID_SCAN_ID);
     });
   });
 

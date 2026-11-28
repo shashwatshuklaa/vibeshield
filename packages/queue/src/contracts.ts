@@ -1,6 +1,5 @@
 import type { DefaultJobOptions } from 'bullmq';
 import { z } from 'zod';
-import { ScanStatus } from '@vibeshield/types';
 import type { QueuePolicyDefaults, ScanQueueJobPayload } from './types.js';
 
 /**
@@ -16,7 +15,7 @@ export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 export const QUEUE_KEY_PREFIX = 'vibeshield';
 
 const VALID_QUEUE_NAME_REGEX = /^[a-z0-9][a-z0-9._-]{1,63}$/;
-const VALID_JOB_ID_REGEX = /^[A-Za-z0-9._-]{1,128}$/;
+const OBJECT_ID_HEX_REGEX = /^[a-fA-F0-9]{24}$/;
 
 /**
  * Lower numeric value = higher BullMQ execution priority (`0` is unprioritized in BullMQ).
@@ -60,30 +59,24 @@ export function isValidQueueName(name: string): boolean {
 }
 
 /**
- * Builds deterministic, colon-free BullMQ job IDs so duplicate dispatches collapse safely.
+ * Builds deterministic, colon-free BullMQ job IDs incorporating both `scanId` and monotonically
+ * increasing `dispatchGeneration` (`scan-{scanId}-{generation}`), collapsing duplicates within a
+ * generation while permitting explicit re-dispatch on new generations.
  */
-export function buildScanJobId(input: {
-  organizationId: string;
-  projectId: string;
-  scanId: string;
-}): string {
-  const cleanSegment = (value: string, label: string): string => {
-    const trimmed = value.trim();
-    if (!VALID_JOB_ID_REGEX.test(trimmed)) {
-      throw new Error(`Invalid ${label} segment for scan job ID`);
-    }
-    return trimmed;
-  };
-
-  const org = cleanSegment(input.organizationId, 'organizationId');
-  const proj = cleanSegment(input.projectId, 'projectId');
-  const scan = cleanSegment(input.scanId, 'scanId');
-  const jobId = `scan-${org}-${proj}-${scan}`;
-
-  if (jobId.length > 180) {
-    throw new Error('Generated scan job ID exceeds maximum allowed length');
+export function buildScanJobId(input: { scanId: string; dispatchGeneration: number }): string {
+  const trimmedScanId = typeof input.scanId === 'string' ? input.scanId.trim() : '';
+  if (!OBJECT_ID_HEX_REGEX.test(trimmedScanId)) {
+    throw new Error('Invalid scanId for scan job ID: must be a 24-character hex ObjectId');
   }
-  return jobId;
+  if (
+    !Number.isSafeInteger(input.dispatchGeneration) ||
+    input.dispatchGeneration < 1 ||
+    input.dispatchGeneration > 1_000_000
+  ) {
+    throw new Error('Invalid dispatchGeneration for scan job ID: must be an integer >= 1');
+  }
+
+  return `scan-${trimmedScanId.toLowerCase()}-${input.dispatchGeneration}`;
 }
 
 /**
@@ -118,33 +111,13 @@ export function buildDefaultJobOptions(
   };
 }
 
-const safeIdentifierSchema = z.string().trim().min(1).max(128);
-
-export const queueJobMetadataSchema = z
-  .object({
-    correlationId: safeIdentifierSchema.optional(),
-    organizationId: safeIdentifierSchema,
-    projectId: safeIdentifierSchema,
-    triggeredByUserId: safeIdentifierSchema.nullable().optional(),
-    triggerSource: z.enum(['manual', 'webhook', 'scheduled', 'system']),
-    enqueuedAt: z.string().trim().min(1).max(64),
-  })
-  .strict();
-
 export const scanQueueJobPayloadSchema = z
   .object({
-    scanId: safeIdentifierSchema,
-    organizationId: safeIdentifierSchema,
-    projectId: safeIdentifierSchema,
-    installationRecordId: safeIdentifierSchema.nullable().optional(),
-    githubRepositoryId: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).nullable().optional(),
-    commitHash: z
+    scanId: z
       .string()
       .trim()
-      .regex(/^[a-fA-F0-9]{7,64}$/, 'Commit hash must be a valid Git SHA hex string'),
-    branch: z.string().trim().min(1).max(255),
-    status: z.nativeEnum(ScanStatus),
-    metadata: queueJobMetadataSchema,
+      .regex(OBJECT_ID_HEX_REGEX, 'scanId must be a valid 24-character hex ObjectId')
+      .transform((value) => value.toLowerCase()),
   })
   .strict();
 
@@ -179,17 +152,10 @@ function assertNoSecretsOrOversizedPayload(value: unknown): void {
 }
 
 /**
- * Strictly validates an initial scan-job payload before enqueueing, blocking unvalidated keys,
- * oversized blobs, inline credentials, and private keys.
+ * Strictly validates a minimal `{ scanId }` scan-job payload before enqueueing or processing,
+ * rejecting unknown keys, invalid ObjectId formats, oversized blobs, and inline credentials.
  */
 export function validateScanQueueJobPayload(input: unknown): ScanQueueJobPayload {
   assertNoSecretsOrOversizedPayload(input);
-  const parsed = scanQueueJobPayloadSchema.parse(input);
-  if (
-    parsed.metadata.organizationId !== parsed.organizationId ||
-    parsed.metadata.projectId !== parsed.projectId
-  ) {
-    throw new Error('Job payload organizationId/projectId must match metadata ownership fields');
-  }
-  return parsed;
+  return scanQueueJobPayloadSchema.parse(input);
 }

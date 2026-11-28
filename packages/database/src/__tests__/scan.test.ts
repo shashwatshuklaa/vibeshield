@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  isTerminalScanLifecycleStatus,
   ScanFailureCodeValue,
   ScanLifecycleStatusValue,
   ScanTriggerSourceValue,
@@ -8,14 +9,26 @@ import {
 import {
   cancelScanWithLease,
   claimQueuedScanForAcquisition,
+  completeAcquisitionPreparedWithLease,
   completeScanWithLease,
   createQueuedScan,
   failScanWithLease,
+  findExpiredActiveScanLeaseCandidates,
+  formatScanDispatchJobId,
   isValidScanLifecycleTransition,
+  loadScanExecutionTarget,
+  markScanDispatchSucceeded,
+  OutboxDispatchStateValue,
+  ProjectModel,
+  rearmScanDispatchOutbox,
+  recordScanDispatchFailure,
+  releaseScanLeaseForRetry,
   renewScanWorkerLease,
+  ScanDispatchOutboxModel,
   ScanLifecycleError,
   ScanModel,
   setScanResolvedCommitWithLease,
+  suppressScanDispatchOutbox,
   toPublicScanRecord,
   transitionScanToInProgress,
   verifyScanAcquisitionAuthorization,
@@ -134,14 +147,24 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
     it('allows only legal scan lifecycle state transitions and seals terminal states', () => {
       expect(isValidScanLifecycleTransition('QUEUED', 'ACQUIRING')).toBe(true);
       expect(isValidScanLifecycleTransition('QUEUED', 'CANCELLED')).toBe(true);
+      expect(isValidScanLifecycleTransition('ACQUIRING', 'QUEUED')).toBe(true);
+      expect(isValidScanLifecycleTransition('ACQUIRING', 'PREPARED')).toBe(true);
       expect(isValidScanLifecycleTransition('ACQUIRING', 'IN_PROGRESS')).toBe(true);
       expect(isValidScanLifecycleTransition('IN_PROGRESS', 'COMPLETED')).toBe(true);
       expect(isValidScanLifecycleTransition('IN_PROGRESS', 'ACQUIRING')).toBe(true);
 
+      expect(isTerminalScanLifecycleStatus('PREPARED')).toBe(true);
+
       // Illegal skips and terminal exits
+      expect(isValidScanLifecycleTransition('QUEUED', 'PREPARED')).toBe(false);
       expect(isValidScanLifecycleTransition('QUEUED', 'COMPLETED')).toBe(false);
       expect(isValidScanLifecycleTransition('QUEUED', 'IN_PROGRESS')).toBe(false);
       expect(isValidScanLifecycleTransition('ACQUIRING', 'COMPLETED')).toBe(false);
+      expect(isValidScanLifecycleTransition('PREPARED', 'COMPLETED')).toBe(false);
+      expect(isValidScanLifecycleTransition('PREPARED', 'FAILED')).toBe(false);
+      expect(isValidScanLifecycleTransition('PREPARED', 'CANCELLED')).toBe(false);
+      expect(isValidScanLifecycleTransition('PREPARED', 'QUEUED')).toBe(false);
+      expect(isValidScanLifecycleTransition('PREPARED', 'IN_PROGRESS')).toBe(false);
       expect(isValidScanLifecycleTransition('COMPLETED', 'IN_PROGRESS')).toBe(false);
       expect(isValidScanLifecycleTransition('FAILED', 'QUEUED')).toBe(false);
       expect(isValidScanLifecycleTransition('CANCELLED', 'ACQUIRING')).toBe(false);
@@ -357,6 +380,527 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
       ).rejects.toMatchObject({ code: 'INVALID_COMMIT_SHA' });
 
       expect(updateSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('PREPARED lifecycle, retry release, execution target loader, recovery & outbox foundations', () => {
+    it('enforces PREPARED terminal schema invariants and preparedAt/completedAt rules', async () => {
+      const preparedAt = new Date();
+      const sha = 'c'.repeat(40);
+      const validPrepared = new ScanModel(
+        makeValidScanInput({
+          status: ScanLifecycleStatusValue.PREPARED,
+          isActive: false,
+          resolvedCommitSha: sha,
+          preparedAt,
+          completedAt: null,
+          lease: null,
+          acquisition: {
+            resolvedCommitSha: sha,
+            compressedArchiveBytes: 256,
+            extractedBytes: 512,
+            extractedFileCount: 4,
+            acquisitionCompletedAt: preparedAt,
+          },
+        })
+      );
+      expect(validPrepared.validateSync()).toBeUndefined();
+      const pub = toPublicScanRecord(validPrepared);
+      expect(pub.status).toBe('PREPARED');
+      expect(pub.isActive).toBe(false);
+      expect(pub.preparedAt).toEqual(preparedAt);
+      expect(pub.completedAt).toBeNull();
+      expect(pub.lease).toBeNull();
+
+      const invalidActivePrepared = new ScanModel(
+        makeValidScanInput({
+          status: ScanLifecycleStatusValue.PREPARED,
+          isActive: true,
+        })
+      );
+      await expect(invalidActivePrepared.validate()).rejects.toThrow(/isActive/i);
+    });
+
+    it('fences completeAcquisitionPreparedWithLease strictly by DB commit SHA, lease token, and cancellation state', async () => {
+      const orgId = new mongoose.Types.ObjectId().toString();
+      const projId = new mongoose.Types.ObjectId().toString();
+      const scanId = new mongoose.Types.ObjectId().toString();
+      const validToken = 'valid_lease_token_1234567890';
+      const newerToken = 'newer_lease_token_1234567890';
+      const now = new Date();
+      const sha = 'd'.repeat(40);
+
+      const makeMockSelectQuery = (doc: unknown) => ({
+        select: vi.fn(async () => doc),
+      });
+
+      // Missing resolvedCommitSha on DB document -> MISSING_RESOLVED_COMMIT
+      vi.spyOn(ScanModel, 'findOne').mockReturnValueOnce(
+        makeMockSelectQuery(
+          new ScanModel(
+            makeValidScanInput({
+              _id: scanId,
+              organizationId: orgId,
+              projectId: projId,
+              status: ScanLifecycleStatusValue.ACQUIRING,
+              isActive: true,
+              resolvedCommitSha: null,
+              lease: {
+                workerId: 'security-worker',
+                token: validToken,
+                acquiredAt: now,
+                heartbeatAt: now,
+                expiresAt: new Date(now.getTime() + 60_000),
+              },
+            })
+          )
+        ) as never
+      );
+      await expect(
+        completeAcquisitionPreparedWithLease({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken: validToken,
+          acquisition: { compressedArchiveBytes: 100, extractedBytes: 200, extractedFileCount: 2 },
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'MISSING_RESOLVED_COMMIT' });
+
+      // Stale worker cannot see cancellation or prepare
+      vi.spyOn(ScanModel, 'findOne').mockReturnValueOnce(
+        makeMockSelectQuery(
+          new ScanModel(
+            makeValidScanInput({
+              _id: scanId,
+              organizationId: orgId,
+              projectId: projId,
+              status: ScanLifecycleStatusValue.ACQUIRING,
+              isActive: true,
+              resolvedCommitSha: sha,
+              cancellation: { requestedAt: now, requestedByUserId: null, reason: 'Stop' },
+              lease: {
+                workerId: 'security-worker',
+                token: newerToken,
+                acquiredAt: now,
+                heartbeatAt: now,
+                expiresAt: new Date(now.getTime() + 60_000),
+              },
+            })
+          )
+        ) as never
+      );
+      await expect(
+        completeAcquisitionPreparedWithLease({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken: validToken,
+          acquisition: { compressedArchiveBytes: 100, extractedBytes: 200, extractedFileCount: 2 },
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      // Active valid lease with cancellation requested -> CANCEL_REQUESTED
+      vi.spyOn(ScanModel, 'findOne').mockReturnValueOnce(
+        makeMockSelectQuery(
+          new ScanModel(
+            makeValidScanInput({
+              _id: scanId,
+              organizationId: orgId,
+              projectId: projId,
+              status: ScanLifecycleStatusValue.ACQUIRING,
+              isActive: true,
+              resolvedCommitSha: sha,
+              cancellation: { requestedAt: now, requestedByUserId: null, reason: 'Stop' },
+              lease: {
+                workerId: 'security-worker',
+                token: validToken,
+                acquiredAt: now,
+                heartbeatAt: now,
+                expiresAt: new Date(now.getTime() + 60_000),
+              },
+            })
+          )
+        ) as never
+      );
+      await expect(
+        completeAcquisitionPreparedWithLease({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken: validToken,
+          acquisition: { compressedArchiveBytes: 100, extractedBytes: 200, extractedFileCount: 2 },
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'CANCEL_REQUESTED' });
+
+      // Valid preparation reads DB commit SHA and leaves completedAt unset
+      vi.spyOn(ScanModel, 'findOne').mockReturnValueOnce(
+        makeMockSelectQuery(
+          new ScanModel(
+            makeValidScanInput({
+              _id: scanId,
+              organizationId: orgId,
+              projectId: projId,
+              status: ScanLifecycleStatusValue.ACQUIRING,
+              isActive: true,
+              resolvedCommitSha: sha,
+              lease: {
+                workerId: 'security-worker',
+                token: validToken,
+                acquiredAt: now,
+                heartbeatAt: now,
+                expiresAt: new Date(now.getTime() + 60_000),
+              },
+            })
+          )
+        ) as never
+      );
+      const updateSpy = vi.spyOn(ScanModel, 'findOneAndUpdate').mockResolvedValueOnce(
+        new ScanModel(
+          makeValidScanInput({
+            _id: scanId,
+            organizationId: orgId,
+            projectId: projId,
+            status: ScanLifecycleStatusValue.PREPARED,
+            isActive: false,
+            resolvedCommitSha: sha,
+            preparedAt: now,
+            completedAt: null,
+            lease: null,
+            acquisition: {
+              resolvedCommitSha: sha,
+              compressedArchiveBytes: 100,
+              extractedBytes: 200,
+              extractedFileCount: 2,
+              acquisitionCompletedAt: now,
+            },
+          })
+        ) as never
+      );
+
+      const preparedRes = await completeAcquisitionPreparedWithLease({
+        scanId,
+        organizationId: orgId,
+        projectId: projId,
+        leaseToken: validToken,
+        acquisition: { compressedArchiveBytes: 100, extractedBytes: 200, extractedFileCount: 2 },
+        now,
+      });
+      expect(preparedRes.status).toBe('PREPARED');
+      if (preparedRes.status === 'PREPARED') {
+        expect(preparedRes.scan.isActive).toBe(false);
+        expect(preparedRes.scan.completedAt).toBeNull();
+        expect(preparedRes.scan.preparedAt).toEqual(now);
+        expect(preparedRes.scan.lease).toBeNull();
+        expect(preparedRes.scan.acquisition?.resolvedCommitSha).toBe(sha);
+      }
+      expect(updateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resolvedCommitSha: sha,
+          'lease.token': validToken,
+          'cancellation.requestedAt': null,
+        }),
+        expect.objectContaining({
+          $set: expect.objectContaining({
+            status: 'PREPARED',
+            isActive: false,
+            lease: null,
+          }),
+        }),
+        expect.anything()
+      );
+    });
+
+    it('fences releaseScanLeaseForRetry against stale workers, cancellations, and exhausted attempts', async () => {
+      const orgId = new mongoose.Types.ObjectId().toString();
+      const projId = new mongoose.Types.ObjectId().toString();
+      const scanId = new mongoose.Types.ObjectId().toString();
+      const validToken = 'valid_lease_token_1234567890';
+      const newerToken = 'newer_lease_token_1234567890';
+      const now = new Date();
+
+      vi.spyOn(ScanModel, 'findOneAndUpdate').mockResolvedValue(null);
+      const mockSelectDoc = (doc: unknown) =>
+        vi.spyOn(ScanModel, 'findOne').mockReturnValueOnce({
+          select: vi.fn(async () => doc),
+        } as never);
+
+      // Old worker cannot release newer worker's lease
+      mockSelectDoc(
+        new ScanModel(
+          makeValidScanInput({
+            _id: scanId,
+            organizationId: orgId,
+            projectId: projId,
+            status: ScanLifecycleStatusValue.ACQUIRING,
+            isActive: true,
+            lease: {
+              workerId: 'security-worker',
+              token: newerToken,
+              acquiredAt: now,
+              heartbeatAt: now,
+              expiresAt: new Date(now.getTime() + 60_000),
+            },
+          })
+        )
+      );
+      await expect(
+        releaseScanLeaseForRetry({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken: validToken,
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'STALE_OR_CONFLICT' });
+
+      // Pending cancellation -> CANCEL_REQUESTED
+      mockSelectDoc(
+        new ScanModel(
+          makeValidScanInput({
+            _id: scanId,
+            organizationId: orgId,
+            projectId: projId,
+            status: ScanLifecycleStatusValue.ACQUIRING,
+            isActive: true,
+            cancellation: { requestedAt: now, requestedByUserId: null, reason: 'Cancel' },
+            lease: {
+              workerId: 'security-worker',
+              token: validToken,
+              acquiredAt: now,
+              heartbeatAt: now,
+              expiresAt: new Date(now.getTime() + 60_000),
+            },
+          })
+        )
+      );
+      await expect(
+        releaseScanLeaseForRetry({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken: validToken,
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'CANCEL_REQUESTED' });
+
+      // Exhausted attempts -> ATTEMPTS_EXHAUSTED
+      mockSelectDoc(
+        new ScanModel(
+          makeValidScanInput({
+            _id: scanId,
+            organizationId: orgId,
+            projectId: projId,
+            status: ScanLifecycleStatusValue.ACQUIRING,
+            isActive: true,
+            attemptCount: 3,
+            maxAttempts: 3,
+            lease: {
+              workerId: 'security-worker',
+              token: validToken,
+              acquiredAt: now,
+              heartbeatAt: now,
+              expiresAt: new Date(now.getTime() + 60_000),
+            },
+          })
+        )
+      );
+      await expect(
+        releaseScanLeaseForRetry({
+          scanId,
+          organizationId: orgId,
+          projectId: projId,
+          leaseToken: validToken,
+          now,
+        })
+      ).resolves.toMatchObject({ status: 'ATTEMPTS_EXHAUSTED' });
+    });
+
+    it('projects execution target safely without +lease.token and detects non-executable states', async () => {
+      const scanId = new mongoose.Types.ObjectId().toString();
+      const orgId = new mongoose.Types.ObjectId().toString();
+      const projectId = new mongoose.Types.ObjectId().toString();
+      const connId = new mongoose.Types.ObjectId().toString();
+
+      let selectedFields = '';
+      vi.spyOn(ScanModel, 'findById').mockImplementation((() => {
+        const chain = {
+          select: (fields: string) => {
+            selectedFields = fields;
+            return chain;
+          },
+          session: () => chain,
+          lean: async () => ({
+            _id: scanId,
+            organizationId: orgId,
+            projectId,
+            repositoryConnectionId: connId,
+            githubInstallationId: 11,
+            githubRepositoryId: 22,
+            requestedRef: 'main',
+            requestedCommitHash: null,
+            resolvedCommitSha: null,
+            status: ScanLifecycleStatusValue.QUEUED,
+            isActive: true,
+            triggerSource: ScanTriggerSourceValue.MANUAL,
+            attemptCount: 0,
+            maxAttempts: 3,
+            cancellation: { requestedAt: null },
+            lease: null,
+            queuedAt: new Date(),
+            startedAt: null,
+          }),
+        };
+        return chain;
+      }) as never);
+
+      vi.spyOn(ProjectModel, 'findOne').mockImplementation((() => {
+        const chain = {
+          session: () => chain,
+          lean: async () => ({
+            _id: projectId,
+            organizationId: orgId,
+            archivedAt: new Date(),
+          }),
+        };
+        return chain;
+      }) as never);
+
+      const res = await loadScanExecutionTarget(scanId);
+      expect(selectedFields).not.toContain('+lease.token');
+      expect(selectedFields).not.toContain('lease.token');
+      expect(res).toMatchObject({
+        status: 'INVALID_BINDING',
+        reason: 'PROJECT_ARCHIVED',
+        failureCode: ScanFailureCodeValue.PROJECT_ARCHIVED,
+      });
+    });
+
+    it('queries bounded expired-lease candidates without selecting lease.token', async () => {
+      let selectedFields = '';
+      let capturedLimit = 0;
+      const chain = {
+        select: (fields: string) => {
+          selectedFields = fields;
+          return chain;
+        },
+        sort: () => chain,
+        limit: (n: number) => {
+          capturedLimit = n;
+          return chain;
+        },
+        lean: async () => [],
+      };
+      vi.spyOn(ScanModel, 'find').mockReturnValue(chain as never);
+
+      await findExpiredActiveScanLeaseCandidates({ limit: 500 });
+      expect(selectedFields).not.toContain('lease.token');
+      expect(capturedLimit).toBe(100);
+    });
+
+    it('validates ScanDispatchOutboxModel state invariants, generation fencing, and secret redaction', async () => {
+      const base = {
+        scanId: new mongoose.Types.ObjectId(),
+        organizationId: new mongoose.Types.ObjectId(),
+        projectId: new mongoose.Types.ObjectId(),
+      };
+
+      const validPending = new ScanDispatchOutboxModel({ ...base });
+      expect(validPending.validateSync()).toBeUndefined();
+      expect(validPending.state).toBe(OutboxDispatchStateValue.PENDING);
+      expect(validPending.dispatchGeneration).toBe(1);
+
+      const invalidPendingWithDispatchedAt = new ScanDispatchOutboxModel({
+        ...base,
+        state: OutboxDispatchStateValue.PENDING,
+        dispatchedAt: new Date(),
+      });
+      await expect(invalidPendingWithDispatchedAt.validate()).rejects.toThrow(/dispatchedAt/i);
+
+      const invalidDispatchedWithoutTime = new ScanDispatchOutboxModel({
+        ...base,
+        state: OutboxDispatchStateValue.DISPATCHED,
+        dispatchedAt: null,
+      });
+      await expect(invalidDispatchedWithoutTime.validate()).rejects.toThrow(/dispatchedAt/i);
+
+      const invalidSuppressedWithoutTime = new ScanDispatchOutboxModel({
+        ...base,
+        state: OutboxDispatchStateValue.SUPPRESSED,
+        suppressedAt: null,
+      });
+      await expect(invalidSuppressedWithoutTime.validate()).rejects.toThrow(/suppressedAt/i);
+
+      const badGeneration = new ScanDispatchOutboxModel({ ...base, dispatchGeneration: 0 });
+      expect(badGeneration.validateSync()?.errors.dispatchGeneration).toBeDefined();
+
+      const badAttempts = new ScanDispatchOutboxModel({ ...base, attempts: -1 });
+      expect(badAttempts.validateSync()?.errors.attempts).toBeDefined();
+
+      const withSecretErr = new ScanDispatchOutboxModel({
+        ...base,
+        lastError:
+          'Failed redis://user:Secret99!@cache:6379 and https://github.com/org/repo?token=secret',
+      });
+      expect(withSecretErr.lastError).not.toContain('Secret99!');
+      expect(withSecretErr.lastError).not.toContain('token=secret');
+      expect(withSecretErr.lastError).toContain('[REDACTED_QUERY]');
+
+      const scanIdHex = base.scanId.toString();
+      expect(formatScanDispatchJobId(scanIdHex, 3)).toBe(`scan-${scanIdHex}-3`);
+
+      // Old dispatcher fencing checks
+      vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate').mockResolvedValueOnce(null);
+      vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockResolvedValueOnce(validPending as never);
+      await expect(
+        markScanDispatchSucceeded({ scanId: scanIdHex, dispatchGeneration: 1 })
+      ).resolves.toEqual({ status: 'STALE_GENERATION' });
+
+      vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate').mockResolvedValueOnce(null);
+      vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockResolvedValueOnce(validPending as never);
+      await expect(
+        recordScanDispatchFailure({
+          scanId: scanIdHex,
+          dispatchGeneration: 1,
+          errorMessage: 'Redis down',
+        })
+      ).resolves.toEqual({ status: 'STALE_GENERATION' });
+
+      // Suppression of terminal/cancelled scan during rearm
+      vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockReturnValueOnce({
+        session: vi.fn(async () => validPending),
+      } as never);
+      vi.spyOn(ScanModel, 'findOne').mockReturnValueOnce({
+        select: () => ({
+          session: () => ({
+            lean: async () => ({
+              _id: base.scanId,
+              status: ScanLifecycleStatusValue.CANCELLED,
+              isActive: false,
+              cancellation: { requestedAt: new Date() },
+            }),
+          }),
+        }),
+      } as never);
+      const suppressedDoc = new ScanDispatchOutboxModel({
+        ...base,
+        state: OutboxDispatchStateValue.SUPPRESSED,
+        suppressedAt: new Date(),
+      });
+      vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate').mockResolvedValueOnce(
+        suppressedDoc as never
+      );
+      const rearmRes = await rearmScanDispatchOutbox({ scanId: scanIdHex });
+      expect(rearmRes.status).toBe('SUPPRESSED_TERMINAL');
+
+      vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate').mockResolvedValueOnce(
+        suppressedDoc as never
+      );
+      await expect(suppressScanDispatchOutbox({ scanId: scanIdHex })).resolves.toMatchObject({
+        status: 'SUPPRESSED',
+      });
     });
   });
 });

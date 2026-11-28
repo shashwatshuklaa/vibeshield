@@ -127,3 +127,13 @@ export {
   type ScanAttributes,
   type ScanDocument,
 } from './scan.model.js';
+
+export {
+  OUTBOX_DISPATCH_STATES,
+  OutboxDispatchStateValue,
+  scanDispatchOutboxSchema,
+  ScanDispatchOutboxModel,
+  type OutboxDispatchState,
+  type ScanDispatchOutboxAttributes,
+  type ScanDispatchOutboxDocument,
+} from './scan-dispatch-outbox.model.js';

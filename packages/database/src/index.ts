@@ -4,3 +4,4 @@ export * from './utils/normalization.js';
 export * from './utils/redaction.js';
 export * from './models/index.js';
 export * from './scans/scan-lifecycle.js';
+export * from './scans/scan-dispatch-outbox.js';

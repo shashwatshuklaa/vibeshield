@@ -126,6 +126,7 @@ export interface PublicScanRecord {
   queuedAt: Date | string;
   startedAt: Date | string | null;
   acquiringAt: Date | string | null;
+  preparedAt: Date | string | null;
   inProgressAt: Date | string | null;
   completedAt: Date | string | null;
   failedAt: Date | string | null;

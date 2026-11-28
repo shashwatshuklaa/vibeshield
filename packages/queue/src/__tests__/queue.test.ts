@@ -1,6 +1,5 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { ScanStatus } from '@vibeshield/types';
 import {
   buildDefaultJobOptions,
   buildInternalAuthNonceKey,
@@ -266,17 +265,28 @@ describe('@vibeshield/queue Unit Tests', () => {
 
       expect(
         buildScanJobId({
-          organizationId: 'org_123',
-          projectId: 'proj_456',
-          scanId: 'scan_789',
+          scanId: '507F1F77BCF86CD799439011',
+          dispatchGeneration: 1,
         })
-      ).toBe('scan-org_123-proj_456-scan_789');
+      ).toBe('scan-507f1f77bcf86cd799439011-1');
+
+      expect(
+        buildScanJobId({
+          scanId: '507f1f77bcf86cd799439011',
+          dispatchGeneration: 2,
+        })
+      ).toBe('scan-507f1f77bcf86cd799439011-2');
 
       expect(() =>
         buildScanJobId({
-          organizationId: 'org:colon',
-          projectId: 'proj',
-          scanId: 'scan',
+          scanId: 'bad:scan-id',
+          dispatchGeneration: 1,
+        })
+      ).toThrow();
+      expect(() =>
+        buildScanJobId({
+          scanId: '507f1f77bcf86cd799439011',
+          dispatchGeneration: 0,
         })
       ).toThrow();
 
@@ -294,77 +304,38 @@ describe('@vibeshield/queue Unit Tests', () => {
       expect(JOB_PRIORITIES.HIGH).toBeLessThan(JOB_PRIORITIES.NORMAL);
     });
 
-    it('validates minimal scan payloads and rejects credentials, oversized payloads, and ownership mismatches', () => {
+    it('validates strict { scanId } payloads and rejects unknown fields, invalid IDs, and credentials', () => {
       const valid = validateScanQueueJobPayload({
-        scanId: 'scan-1',
-        organizationId: 'org-1',
-        projectId: 'proj-1',
-        installationRecordId: 'inst-1',
-        githubRepositoryId: 12345,
-        commitHash: 'abc1234def',
-        branch: 'main',
-        status: ScanStatus.QUEUED,
-        metadata: {
-          organizationId: 'org-1',
-          projectId: 'proj-1',
-          triggeredByUserId: 'user-1',
-          triggerSource: 'manual',
-          enqueuedAt: '2026-11-27T12:00:00Z',
-        },
+        scanId: ' 507F1F77BCF86CD799439011 ',
       });
-      expect(valid.scanId).toBe('scan-1');
+      expect(valid).toEqual({ scanId: '507f1f77bcf86cd799439011' });
 
       expect(() =>
         validateScanQueueJobPayload({
-          scanId: 'scan-1',
-          organizationId: 'org-1',
-          projectId: 'proj-1',
-          commitHash: 'abc1234',
+          scanId: 'not-an-object-id',
+        })
+      ).toThrow();
+
+      expect(() =>
+        validateScanQueueJobPayload({
+          scanId: '507f1f77bcf86cd799439011',
+          organizationId: '507f1f77bcf86cd799439012',
           branch: 'main',
-          status: ScanStatus.QUEUED,
+        })
+      ).toThrow(/unrecognized/i);
+
+      expect(() =>
+        validateScanQueueJobPayload({
+          scanId: '507f1f77bcf86cd799439011',
           accessToken: 'ghs_should_never_be_queued',
-          metadata: {
-            organizationId: 'org-1',
-            projectId: 'proj-1',
-            triggerSource: 'manual',
-            enqueuedAt: '2026-11-27T12:00:00Z',
-          },
         })
       ).toThrow(/sensitive key/i);
 
       expect(() =>
         validateScanQueueJobPayload({
-          scanId: 'scan-1',
-          organizationId: 'org-1',
-          projectId: 'proj-1',
-          commitHash: 'abc1234',
-          branch: 'ghp_1234567890abcdef',
-          status: ScanStatus.QUEUED,
-          metadata: {
-            organizationId: 'org-1',
-            projectId: 'proj-1',
-            triggerSource: 'manual',
-            enqueuedAt: '2026-11-27T12:00:00Z',
-          },
+          scanId: 'ghp_1234567890abcdef',
         })
       ).toThrow(/credentials/i);
-
-      expect(() =>
-        validateScanQueueJobPayload({
-          scanId: 'scan-1',
-          organizationId: 'org-1',
-          projectId: 'proj-1',
-          commitHash: 'abc1234',
-          branch: 'main',
-          status: ScanStatus.QUEUED,
-          metadata: {
-            organizationId: 'org-2',
-            projectId: 'proj-1',
-            triggerSource: 'manual',
-            enqueuedAt: '2026-11-27T12:00:00Z',
-          },
-        })
-      ).toThrow(/ownership/i);
     });
 
     it('inspects queue health and shuts down owned handles + Redis cleanly', async () => {

@@ -1,5 +1,4 @@
 import type { BackoffOptions, DefaultJobOptions, KeepJobs } from 'bullmq';
-import type { ScanStatus } from '@vibeshield/types';
 
 /**
  * Normalized Redis connection lifecycle states exposed by `@vibeshield/queue`.
@@ -64,31 +63,12 @@ export interface QueueRuntimeConfig {
 export type RedisConnectionRole = 'queue' | 'worker';
 
 /**
- * Common metadata carried with queued background jobs without secrets or large blobs.
- */
-export interface QueueJobMetadata {
-  correlationId?: string;
-  organizationId: string;
-  projectId: string;
-  triggeredByUserId?: string | null;
-  triggerSource: 'manual' | 'webhook' | 'scheduled' | 'system';
-  enqueuedAt: string;
-}
-
-/**
- * Minimal initial scan-job payload contract backed by shared `@vibeshield/types` enums.
- * Deliberately contains identifiers and execution references only (no secrets or source archives).
+ * Strictly minimal BullMQ scan-job payload carrying only the authoritative `scanId` identifier.
+ * Workers must load and verify organization, project, repository, branch, commit, and permissions
+ * directly from MongoDB rather than trusting queued fields.
  */
 export interface ScanQueueJobPayload {
   scanId: string;
-  organizationId: string;
-  projectId: string;
-  installationRecordId?: string | null;
-  githubRepositoryId?: number | null;
-  commitHash: string;
-  branch: string;
-  status: ScanStatus;
-  metadata: QueueJobMetadata;
 }
 
 /**

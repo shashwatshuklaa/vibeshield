@@ -136,6 +136,7 @@ export interface ScanAttributes {
   queuedAt: Date;
   startedAt: Date | null;
   acquiringAt: Date | null;
+  preparedAt: Date | null;
   inProgressAt: Date | null;
   completedAt: Date | null;
   failedAt: Date | null;
@@ -441,6 +442,10 @@ export const scanSchema = new Schema<ScanAttributes>(
       type: Date,
       default: null,
     },
+    preparedAt: {
+      type: Date,
+      default: null,
+    },
     inProgressAt: {
       type: Date,
       default: null,
@@ -478,7 +483,7 @@ scanSchema.pre('validate', function () {
   } else if (typeof this.status === 'string' && this.isActive !== expectedActive) {
     this.invalidate(
       'isActive',
-      'isActive must be true for QUEUED/ACQUIRING/IN_PROGRESS scans and false for terminal states'
+      'isActive must be true for active scans (QUEUED/ACQUIRING/IN_PROGRESS) and false for terminal states (PREPARED/COMPLETED/FAILED/CANCELLED)'
     );
   }
 });

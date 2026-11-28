@@ -16,10 +16,15 @@ export type ScanStatusType = `${ScanStatus}`;
 /**
  * Authoritative persistent scan lifecycle states stored in MongoDB (`ScanModel`).
  * Distinct from queue dispatch status (`ScanStatus`) and worker host readiness (`WorkerLifecycleState`).
+ *
+ * `PREPARED` represents completed repository acquisition and hardened extraction prior to
+ * security scanner integration; for this milestone it is treated as terminal/quiescent (`isActive: false`)
+ * and must not be silently reactivated without an explicit scanner-stage transition contract.
  */
 export const SCAN_LIFECYCLE_STATUSES = [
   'QUEUED',
   'ACQUIRING',
+  'PREPARED',
   'IN_PROGRESS',
   'COMPLETED',
   'FAILED',
@@ -31,6 +36,7 @@ export type ScanLifecycleStatus = (typeof SCAN_LIFECYCLE_STATUSES)[number];
 export const ScanLifecycleStatusValue = {
   QUEUED: 'QUEUED',
   ACQUIRING: 'ACQUIRING',
+  PREPARED: 'PREPARED',
   IN_PROGRESS: 'IN_PROGRESS',
   COMPLETED: 'COMPLETED',
   FAILED: 'FAILED',
@@ -38,6 +44,7 @@ export const ScanLifecycleStatusValue = {
 } as const satisfies Record<ScanLifecycleStatus, ScanLifecycleStatus>;
 
 export const TERMINAL_SCAN_LIFECYCLE_STATUSES: ReadonlySet<ScanLifecycleStatus> = new Set([
+  ScanLifecycleStatusValue.PREPARED,
   ScanLifecycleStatusValue.COMPLETED,
   ScanLifecycleStatusValue.FAILED,
   ScanLifecycleStatusValue.CANCELLED,
