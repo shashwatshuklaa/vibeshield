@@ -13,7 +13,9 @@ import {
   completeScanWithLease,
   createQueuedScan,
   failScanWithLease,
+  finalizeExpiredMaxAttemptOutboxCandidate,
   findExpiredActiveScanLeaseCandidates,
+  findExpiredMaxAttemptPendingOutboxCandidates,
   formatScanDispatchJobId,
   isValidScanLifecycleTransition,
   loadScanExecutionTarget,
@@ -1045,6 +1047,146 @@ describe('ScanModel & Scan Lifecycle Unit Tests', () => {
       await expect(suppressScanDispatchOutbox({ scanId: scanIdHex })).resolves.toMatchObject({
         status: 'SUPPRESSED',
       });
+    });
+
+    it('rejects malformed, whitespace-only, under-min, and >128-char claimTokens cleanly while accepting 128-char tokens and finalizing abandoned max-attempt records', async () => {
+      const scanIdHex = new mongoose.Types.ObjectId().toString();
+      const orgId = new mongoose.Types.ObjectId();
+      const projectId = new mongoose.Types.ObjectId();
+      const now = new Date('2026-11-28T14:00:00.000Z');
+      const updateSpy = vi.spyOn(ScanDispatchOutboxModel, 'findOneAndUpdate');
+
+      // Non-string, empty, whitespace-only, <16, and >128 claimTokens must reject BEFORE touching MongoDB
+      const invalidTokens: unknown[] = [
+        null,
+        undefined,
+        12345,
+        { $ne: null },
+        '',
+        '   '.repeat(10),
+        'a'.repeat(15),
+        'a'.repeat(129),
+        `${'a'.repeat(128)} `,
+      ];
+
+      for (const badToken of invalidTokens) {
+        await expect(
+          markScanDispatchSucceeded({
+            scanId: scanIdHex,
+            dispatchGeneration: 1,
+            claimToken: badToken as string,
+            now,
+          })
+        ).rejects.toMatchObject({ code: 'INVALID_OUTBOX_CLAIM_TOKEN' });
+
+        await expect(
+          recordScanDispatchFailure({
+            scanId: scanIdHex,
+            dispatchGeneration: 1,
+            claimToken: badToken as string,
+            errorMessage: 'Error',
+            now,
+          })
+        ).rejects.toMatchObject({ code: 'INVALID_OUTBOX_CLAIM_TOKEN' });
+      }
+      expect(updateSpy).not.toHaveBeenCalled();
+
+      // Exact 128-char token passes input validation and enforces MongoDB fencing cleanly
+      const exact128 = 'k'.repeat(128);
+      const pendingDoc = new ScanDispatchOutboxModel({
+        scanId: scanIdHex,
+        organizationId: orgId,
+        projectId,
+        state: OutboxDispatchStateValue.PENDING,
+        dispatchGeneration: 1,
+        attempts: 1,
+      });
+      updateSpy.mockResolvedValueOnce(null);
+      vi.spyOn(ScanDispatchOutboxModel, 'findOne').mockResolvedValueOnce(pendingDoc as never);
+      await expect(
+        markScanDispatchSucceeded({
+          scanId: scanIdHex,
+          dispatchGeneration: 1,
+          claimToken: exact128,
+          now,
+        })
+      ).resolves.toEqual({ status: 'STALE_CLAIM' });
+
+      // Query & finalizer guards
+      await expect(
+        finalizeExpiredMaxAttemptOutboxCandidate({ scanId: 'bad-id', now })
+      ).rejects.toMatchObject({ code: 'INVALID_SCAN_IDENTIFIER' });
+      await expect(
+        finalizeExpiredMaxAttemptOutboxCandidate({
+          scanId: scanIdHex,
+          dispatchGeneration: 0,
+          now,
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_DISPATCH_GENERATION' });
+
+      const findChain = {
+        sort: () => findChain,
+        limit: async () => [],
+      };
+      const findSpy = vi
+        .spyOn(ScanDispatchOutboxModel, 'find')
+        .mockReturnValueOnce(findChain as never);
+      await expect(
+        findExpiredMaxAttemptPendingOutboxCandidates({ limit: 25, now })
+      ).resolves.toEqual([]);
+      expect(findSpy).toHaveBeenCalledWith({
+        state: OutboxDispatchStateValue.PENDING,
+        nextAttemptAt: { $lte: now },
+        attempts: { $gte: MAX_OUTBOX_ATTEMPTS },
+      });
+
+      const exhaustedDoc = new ScanDispatchOutboxModel({
+        scanId: scanIdHex,
+        organizationId: orgId,
+        projectId,
+        state: OutboxDispatchStateValue.EXHAUSTED,
+        attempts: MAX_OUTBOX_ATTEMPTS,
+        dispatchGeneration: 2,
+        claimToken: null,
+        lastError: 'Preserved diagnostic',
+        exhaustedAt: now,
+      });
+      updateSpy.mockResolvedValueOnce(exhaustedDoc as never);
+      const res = await finalizeExpiredMaxAttemptOutboxCandidate({
+        scanId: scanIdHex,
+        dispatchGeneration: 2,
+        now,
+      });
+      expect(res).toMatchObject({
+        status: 'FINALIZED_EXHAUSTED',
+        outbox: {
+          scanId: scanIdHex,
+          state: OutboxDispatchStateValue.EXHAUSTED,
+          attempts: MAX_OUTBOX_ATTEMPTS,
+          dispatchGeneration: 2,
+          lastError: 'Preserved diagnostic',
+          exhaustedAt: now,
+        },
+      });
+      expect(updateSpy).toHaveBeenLastCalledWith(
+        {
+          scanId: scanIdHex,
+          state: OutboxDispatchStateValue.PENDING,
+          attempts: { $gte: MAX_OUTBOX_ATTEMPTS },
+          nextAttemptAt: { $lte: now },
+          dispatchGeneration: 2,
+        },
+        {
+          $set: {
+            state: OutboxDispatchStateValue.EXHAUSTED,
+            exhaustedAt: now,
+            dispatchedAt: null,
+            suppressedAt: null,
+            claimToken: null,
+          },
+        },
+        expect.objectContaining({ returnDocument: 'after', runValidators: true })
+      );
     });
   });
 });

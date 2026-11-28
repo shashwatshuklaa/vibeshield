@@ -35,12 +35,25 @@ export {
   type SuppressScanDispatchOutboxResult,
 };
 
+const MIN_OUTBOX_CLAIM_TOKEN_LENGTH = 16;
+const MAX_OUTBOX_CLAIM_TOKEN_LENGTH = 128;
+
 function sanitizeErrorSummary(message: string): string {
   return redactGitHubSecrets(redactMongoUri(message.trim())).slice(0, 500);
 }
 
 function assertValidClaimToken(claimToken: string): string {
-  if (typeof claimToken !== 'string' || claimToken.trim().length < 16) {
+  if (typeof claimToken !== 'string') {
+    throw new ScanLifecycleError(
+      'Invalid outbox claim fencing token',
+      'INVALID_OUTBOX_CLAIM_TOKEN'
+    );
+  }
+  const trimmed = claimToken.trim();
+  if (
+    trimmed.length < MIN_OUTBOX_CLAIM_TOKEN_LENGTH ||
+    claimToken.length > MAX_OUTBOX_CLAIM_TOKEN_LENGTH
+  ) {
     throw new ScanLifecycleError(
       'Invalid outbox claim fencing token',
       'INVALID_OUTBOX_CLAIM_TOKEN'
@@ -163,6 +176,102 @@ export async function findExhaustedScanDispatchOutboxCandidates(
     .limit(limit);
 
   return docs.map(toPublicScanDispatchOutboxRecord);
+}
+
+/**
+ * Queries bounded `PENDING` outbox entries whose `attempts >= MAX_OUTBOX_ATTEMPTS` and whose
+ * claim window has expired (`nextAttemptAt <= now`), e.g. when a dispatcher crashed on its final
+ * attempt before recording failure.
+ */
+export async function findExpiredMaxAttemptPendingOutboxCandidates(
+  input: {
+    limit?: number;
+    now?: Date;
+  } = {}
+): Promise<PublicScanDispatchOutboxRecord[]> {
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 50), 1), 100);
+  const now = input.now ?? new Date();
+
+  const docs = await ScanDispatchOutboxModel.find({
+    state: OutboxDispatchStateValue.PENDING,
+    nextAttemptAt: { $lte: now },
+    attempts: { $gte: MAX_OUTBOX_ATTEMPTS },
+  })
+    .sort({ nextAttemptAt: 1 })
+    .limit(limit);
+
+  return docs.map(toPublicScanDispatchOutboxRecord);
+}
+
+export type FinalizeExpiredMaxAttemptOutboxResult =
+  | { status: 'FINALIZED_EXHAUSTED'; outbox: PublicScanDispatchOutboxRecord }
+  | { status: 'NOT_ELIGIBLE'; outbox: PublicScanDispatchOutboxRecord }
+  | { status: 'NOT_FOUND' };
+
+/**
+ * Atomically finalizes an abandoned `PENDING` outbox record whose `attempts >= MAX_OUTBOX_ATTEMPTS`
+ * and whose claim window has expired (`nextAttemptAt <= now`) into `EXHAUSTED`, clearing any stale
+ * `claimToken` while preserving existing sanitized diagnostics and refusing to modify unexpired,
+ * sub-maximum, dispatched, suppressed, or generation-mismatched records.
+ */
+export async function finalizeExpiredMaxAttemptOutboxCandidate(
+  input: {
+    scanId: string;
+    dispatchGeneration?: number;
+    now?: Date;
+  },
+  session?: ClientSession
+): Promise<FinalizeExpiredMaxAttemptOutboxResult> {
+  if (!isValidObjectId(input.scanId)) {
+    throw new ScanLifecycleError('Invalid scan ObjectId identifier', 'INVALID_SCAN_IDENTIFIER');
+  }
+  const now = input.now ?? new Date();
+  const filter: Record<string, unknown> = {
+    scanId: input.scanId,
+    state: OutboxDispatchStateValue.PENDING,
+    attempts: { $gte: MAX_OUTBOX_ATTEMPTS },
+    nextAttemptAt: { $lte: now },
+  };
+  if (input.dispatchGeneration !== undefined) {
+    filter.dispatchGeneration = assertValidGeneration(input.dispatchGeneration);
+  }
+
+  const finalized = await ScanDispatchOutboxModel.findOneAndUpdate(
+    filter,
+    {
+      $set: {
+        state: OutboxDispatchStateValue.EXHAUSTED,
+        exhaustedAt: now,
+        dispatchedAt: null,
+        suppressedAt: null,
+        claimToken: null,
+      },
+    },
+    {
+      returnDocument: 'after',
+      runValidators: true,
+      ...(session ? { session } : {}),
+    }
+  );
+
+  if (finalized) {
+    return {
+      status: 'FINALIZED_EXHAUSTED',
+      outbox: toPublicScanDispatchOutboxRecord(finalized),
+    };
+  }
+
+  const existing = await applySession(
+    ScanDispatchOutboxModel.findOne({ scanId: input.scanId }),
+    session
+  );
+  if (!existing) {
+    return { status: 'NOT_FOUND' };
+  }
+  return {
+    status: 'NOT_ELIGIBLE',
+    outbox: toPublicScanDispatchOutboxRecord(existing),
+  };
 }
 
 export type ClaimPendingScanDispatchResult =

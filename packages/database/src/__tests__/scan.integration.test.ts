@@ -16,8 +16,10 @@ import {
   createQueuedScanWithOutbox,
   disconnectDatabase,
   failScanWithLease,
+  finalizeExpiredMaxAttemptOutboxCandidate,
   findExhaustedScanDispatchOutboxCandidates,
   findExpiredActiveScanLeaseCandidates,
+  findExpiredMaxAttemptPendingOutboxCandidates,
   findPendingScanDispatchOutboxCandidates,
   findScanByIdInOrganization,
   GitHubInstallationModel,
@@ -2696,6 +2698,287 @@ describe.skipIf(!REPLICA_URI)(
         GitHubInstallationModel.deleteMany({ _id: instDoc._id }),
         ProjectModel.deleteMany({ _id: projectDoc._id }),
       ]);
+    });
+
+    it('recovers abandoned final-attempt expired PENDING outbox claims safely and enforces 128-char claimToken boundaries', async () => {
+      const t0 = new Date('2026-11-28T14:00:00.000Z');
+      const tLater = new Date(t0.getTime() + 60_000);
+
+      // 1. Abandoned final-attempt scenario: attempts reaches MAX_OUTBOX_ATTEMPTS on claim, dispatcher crashes, claim expires
+      const abandoned = await createQueuedScanWithOutbox({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 7201,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+      await ScanDispatchOutboxModel.updateOne(
+        { scanId: abandoned.scan.id },
+        {
+          $set: {
+            attempts: MAX_OUTBOX_ATTEMPTS - 1,
+            lastError: 'Previous broker timeout at redis://default:Secret99!@cache:6379',
+          },
+        }
+      );
+
+      // Claim final attempt (25/25) -> unexpired claim window MUST NOT be finalized prematurely
+      const claim25 = await claimPendingScanDispatch({
+        scanId: abandoned.scan.id,
+        dispatchGeneration: 1,
+        claimWindowMs: 30_000,
+        now: t0,
+      });
+      expect(claim25.status).toBe('CLAIMED');
+      if (claim25.status !== 'CLAIMED') throw new Error('Expected CLAIMED on final attempt');
+      expect(claim25.outbox.attempts).toBe(MAX_OUTBOX_ATTEMPTS);
+
+      await expect(
+        findExpiredMaxAttemptPendingOutboxCandidates({ now: new Date(t0.getTime() + 10_000) })
+      ).resolves.toEqual([]);
+      const tooEarlyFinalize = await finalizeExpiredMaxAttemptOutboxCandidate({
+        scanId: abandoned.scan.id,
+        dispatchGeneration: 1,
+        now: new Date(t0.getTime() + 10_000),
+      });
+      expect(tooEarlyFinalize).toMatchObject({
+        status: 'NOT_ELIGIBLE',
+        outbox: { state: 'PENDING', attempts: MAX_OUTBOX_ATTEMPTS },
+      });
+
+      // After claim expiry: visible to abandoned candidate finder, not pending finder
+      expect(
+        (await findPendingScanDispatchOutboxCandidates({ now: tLater })).some(
+          (r) => r.scanId === abandoned.scan.id
+        )
+      ).toBe(false);
+      expect(
+        (await findExpiredMaxAttemptPendingOutboxCandidates({ now: tLater })).some(
+          (r) => r.scanId === abandoned.scan.id
+        )
+      ).toBe(true);
+
+      // Wrong generation fence does NOT finalize
+      await expect(
+        finalizeExpiredMaxAttemptOutboxCandidate({
+          scanId: abandoned.scan.id,
+          dispatchGeneration: 2,
+          now: tLater,
+        })
+      ).resolves.toMatchObject({
+        status: 'NOT_ELIGIBLE',
+        outbox: { state: 'PENDING', dispatchGeneration: 1 },
+      });
+
+      // Concurrent finalizers race -> exactly one FINALIZED_EXHAUSTED and one NOT_ELIGIBLE
+      const [finA, finB] = await Promise.all([
+        finalizeExpiredMaxAttemptOutboxCandidate({
+          scanId: abandoned.scan.id,
+          dispatchGeneration: 1,
+          now: tLater,
+        }),
+        finalizeExpiredMaxAttemptOutboxCandidate({
+          scanId: abandoned.scan.id,
+          dispatchGeneration: 1,
+          now: tLater,
+        }),
+      ]);
+      expect([finA.status, finB.status].sort()).toEqual(['FINALIZED_EXHAUSTED', 'NOT_ELIGIBLE']);
+
+      const finalizedDoc = await ScanDispatchOutboxModel.findOne({ scanId: abandoned.scan.id })
+        .select('+claimToken')
+        .lean();
+      expect(finalizedDoc?.state).toBe(OutboxDispatchStateValue.EXHAUSTED);
+      expect(finalizedDoc?.attempts).toBe(MAX_OUTBOX_ATTEMPTS);
+      expect(finalizedDoc?.claimToken).toBeNull();
+      expect(finalizedDoc?.exhaustedAt).toEqual(tLater);
+      expect(finalizedDoc?.lastError).toBe('Previous broker timeout at [REDACTED_REDIS_URL]');
+
+      // Discoverable via exhausted-candidate API and excluded from expired-max-attempt pending finder
+      expect(
+        (await findExhaustedScanDispatchOutboxCandidates()).some(
+          (r) => r.scanId === abandoned.scan.id
+        )
+      ).toBe(true);
+      expect(
+        (await findExpiredMaxAttemptPendingOutboxCandidates({ now: tLater })).some(
+          (r) => r.scanId === abandoned.scan.id
+        )
+      ).toBe(false);
+
+      // Old claim token cannot succeed or fail after exhaustion finalization
+      await expect(
+        markScanDispatchSucceeded({
+          scanId: abandoned.scan.id,
+          dispatchGeneration: 1,
+          claimToken: claim25.claimToken,
+          now: tLater,
+        })
+      ).resolves.toEqual({ status: 'STALE_GENERATION' });
+
+      // 2. Below MAX_OUTBOX_ATTEMPTS, DISPATCHED, and SUPPRESSED records remain untouched
+      const belowMax = await createQueuedScanWithOutbox({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 7202,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+      await ScanDispatchOutboxModel.updateOne(
+        { scanId: belowMax.scan.id },
+        { $set: { attempts: MAX_OUTBOX_ATTEMPTS - 1 } }
+      );
+      await expect(
+        finalizeExpiredMaxAttemptOutboxCandidate({ scanId: belowMax.scan.id, now: tLater })
+      ).resolves.toMatchObject({
+        status: 'NOT_ELIGIBLE',
+        outbox: { state: 'PENDING', attempts: MAX_OUTBOX_ATTEMPTS - 1 },
+      });
+
+      const dispatchedPair = await createQueuedScanWithOutbox({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 7203,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+      await ScanDispatchOutboxModel.updateOne(
+        { scanId: dispatchedPair.scan.id },
+        {
+          $set: {
+            state: OutboxDispatchStateValue.DISPATCHED,
+            attempts: MAX_OUTBOX_ATTEMPTS,
+            dispatchedAt: t0,
+          },
+        }
+      );
+      await expect(
+        finalizeExpiredMaxAttemptOutboxCandidate({ scanId: dispatchedPair.scan.id, now: tLater })
+      ).resolves.toMatchObject({
+        status: 'NOT_ELIGIBLE',
+        outbox: { state: 'DISPATCHED' },
+      });
+
+      const suppressedPair = await createQueuedScanWithOutbox({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 7204,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+      await ScanDispatchOutboxModel.updateOne(
+        { scanId: suppressedPair.scan.id },
+        {
+          $set: {
+            state: OutboxDispatchStateValue.SUPPRESSED,
+            attempts: MAX_OUTBOX_ATTEMPTS,
+            suppressedAt: t0,
+          },
+        }
+      );
+      await expect(
+        finalizeExpiredMaxAttemptOutboxCandidate({ scanId: suppressedPair.scan.id, now: tLater })
+      ).resolves.toMatchObject({
+        status: 'NOT_ELIGIBLE',
+        outbox: { state: 'SUPPRESSED' },
+      });
+
+      // 3. Session propagation + claimToken exact 128-char accepted / 129-char rejected
+      const sessionPair = await createQueuedScanWithOutbox({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 7205,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+      await runInTransaction(async (session) => {
+        await ScanDispatchOutboxModel.updateOne(
+          { scanId: sessionPair.scan.id },
+          { $set: { attempts: MAX_OUTBOX_ATTEMPTS } },
+          { session }
+        );
+        const finalizedInTx = await finalizeExpiredMaxAttemptOutboxCandidate(
+          { scanId: sessionPair.scan.id, dispatchGeneration: 1, now: tLater },
+          session
+        );
+        expect(finalizedInTx.status).toBe('FINALIZED_EXHAUSTED');
+        // Uncommitted read inside same session observes NOT_ELIGIBLE
+        const recheckInTx = await finalizeExpiredMaxAttemptOutboxCandidate(
+          { scanId: sessionPair.scan.id, dispatchGeneration: 1, now: tLater },
+          session
+        );
+        expect(recheckInTx).toMatchObject({
+          status: 'NOT_ELIGIBLE',
+          outbox: { state: 'EXHAUSTED' },
+        });
+      });
+
+      // Exact 128-char claimToken is accepted by fencing validation (returns STALE_CLAIM on mismatch), >128 rejected
+      const tokenPair = await createQueuedScanWithOutbox({
+        organizationId: orgA,
+        projectId: projectA1,
+        repositoryConnectionId: connA1,
+        githubInstallationId: 1001,
+        githubRepositoryId: 7206,
+        requestedRef: 'main',
+        triggerSource: ScanTriggerSourceValue.MANUAL,
+        createdByUserId: userA,
+        now: t0,
+      });
+      const tokenClaim = await claimPendingScanDispatch({
+        scanId: tokenPair.scan.id,
+        dispatchGeneration: 1,
+        now: t0,
+      });
+      if (tokenClaim.status !== 'CLAIMED') throw new Error('Expected CLAIMED');
+
+      await expect(
+        markScanDispatchSucceeded({
+          scanId: tokenPair.scan.id,
+          dispatchGeneration: 1,
+          claimToken: 'x'.repeat(128),
+          now: t0,
+        })
+      ).resolves.toEqual({ status: 'STALE_CLAIM' });
+
+      await expect(
+        markScanDispatchSucceeded({
+          scanId: tokenPair.scan.id,
+          dispatchGeneration: 1,
+          claimToken: 'x'.repeat(129),
+          now: t0,
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_OUTBOX_CLAIM_TOKEN' });
+
+      await expect(
+        recordScanDispatchFailure({
+          scanId: tokenPair.scan.id,
+          dispatchGeneration: 1,
+          claimToken: 'x'.repeat(129),
+          errorMessage: 'Should reject oversized token before DB query',
+          now: t0,
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_OUTBOX_CLAIM_TOKEN' });
     });
   }
 );
