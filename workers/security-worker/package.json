@@ -17,7 +17,8 @@
     "@vibeshield/database": "workspace:*",
     "@vibeshield/env": "workspace:*",
     "@vibeshield/queue": "workspace:*",
-    "@vibeshield/types": "workspace:*"
+    "@vibeshield/types": "workspace:*",
+    "tar-stream": "^3.3.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",

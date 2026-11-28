@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { DEFAULT_CONNECT_OPTIONS, isValidMongoUri } from '@vibeshield/database';
 import { type BaseEnv, baseEnvSchema, validateEnv, z } from '@vibeshield/env';
 import {
@@ -9,6 +10,22 @@ import {
 } from '@vibeshield/queue';
 
 const MIN_INTERNAL_AUTH_SECRET_LENGTH = 32;
+
+/**
+ * Validates that an optional configured workspace parent directory is an absolute path without
+ * NUL bytes and not filesystem root.
+ */
+export function isValidWorkspaceParentDir(rawDir: string): boolean {
+  if (typeof rawDir !== 'string') {
+    return false;
+  }
+  const trimmed = rawDir.trim();
+  if (trimmed.length === 0 || trimmed.includes('\0') || !path.isAbsolute(trimmed)) {
+    return false;
+  }
+  const resolved = path.resolve(trimmed);
+  return resolved !== path.parse(resolved).root;
+}
 
 /**
  * Validates that a configured internal API base URL is a clean HTTP/HTTPS origin without
@@ -148,6 +165,15 @@ const workerEnvSchema = baseEnvSchema
         message:
           'QUEUE_PREFIX must be lowercase alphanumeric/dot/hyphen/underscore and must not contain colons.',
       }),
+    WORKER_WORKSPACE_DIR: z
+      .string()
+      .trim()
+      .refine(isValidWorkspaceParentDir, {
+        message:
+          'WORKER_WORKSPACE_DIR must be an absolute non-root directory path without NUL bytes.',
+      })
+      .transform((value) => path.resolve(value))
+      .optional(),
     INTERNAL_API_BASE_URL: z
       .string()
       .trim()
@@ -238,6 +264,7 @@ export interface WorkerConfig {
   leaseDurationMs: number;
   shutdownGraceMs: number;
   queuePrefix: string;
+  workspaceParentDir?: string;
   internalApiBaseUrl?: string;
   readonly internalWorkerAuthSecret?: string;
 }
@@ -267,6 +294,9 @@ export function loadWorkerConfig(
     leaseDurationMs: parsed.WORKER_LEASE_DURATION_MS,
     shutdownGraceMs: parsed.WORKER_SHUTDOWN_GRACE_MS,
     queuePrefix: parsed.QUEUE_PREFIX,
+    ...(parsed.WORKER_WORKSPACE_DIR !== undefined
+      ? { workspaceParentDir: parsed.WORKER_WORKSPACE_DIR }
+      : {}),
     ...(parsed.INTERNAL_API_BASE_URL !== undefined
       ? { internalApiBaseUrl: parsed.INTERNAL_API_BASE_URL }
       : {}),

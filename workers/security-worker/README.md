@@ -43,18 +43,25 @@ This workspace runs separately from `apps/api`, imports no Express/HTTP server c
 | `WORKER_LEASE_DURATION_MS` | No | `60000` | `5000..600000` ms |
 | `WORKER_SHUTDOWN_GRACE_MS` | No | `10000` | `500..120000` ms |
 | `QUEUE_PREFIX` | No | `vibeshield` | Lowercase/digits/`._-`, no colons |
+| `WORKER_WORKSPACE_DIR` | No | OS temp (`vibeshield-workspaces`) | Non-root absolute directory without NUL bytes; must not be a symlink |
 | `INTERNAL_API_BASE_URL` | Conditional | — | HTTP/HTTPS origin (`http://host[:port]`); required when `INTERNAL_WORKER_AUTH_SECRET` is set |
 | `INTERNAL_WORKER_AUTH_SECRET` | Conditional | — | >= 32 non-whitespace chars, distinct from JWT/GitHub secrets; required when `INTERNAL_API_BASE_URL` is set |
 | `NODE_ENV` | No | `development` | `development \| production \| test` |
 | `LOG_LEVEL` | No | `info` | `error \| warn \| info \| http \| verbose \| debug \| silly \| silent` |
 
-## Internal Repository Acquisition Client
+## Internal Repository Acquisition & Defensive Extraction
 
 `createInternalAcquisitionClient()` exposes a bounded, non-buffering HTTP client pinned strictly to `POST /internal/v1/scans/acquire` with `x-vibeshield-service: security-worker`:
 
 - Signs exact raw UTF-8 JSON `{ scanId, leaseToken }` bytes with HMAC-SHA256, millisecond timestamp, and CSPRNG nonce (`generateInternalAuthNonce()`).
 - Rejects redirects (`3xx`) fail-closed, validates `Content-Type` (`application/gzip` / `application/x-gzip`) and `Content-Length`, caps compressed transfers at `100 MiB` (`104857600` bytes), propagates socket/stream backpressure via `Readable`, and rejects truncated/incomplete HTTP responses or premature closes.
 - Separates timeouts (`ACQUISITION_TIMEOUT`), explicit cancellation (`ACQUISITION_CANCELLED`), and worker shutdown (`WORKER_SHUTDOWN`) cleanly without leaking lease tokens, HMAC secrets, signatures, or upstream response bodies.
+
+`extractRepositoryArchive()` consumes `AcquiredRepositoryArchive` using streaming gzip decompression (`zlib.createGunzip()`) and `tar-stream` (`allowUnknownFormat: false`) into an isolated `0700` temporary workspace:
+
+- Enforces hard limits: compressed stream `<= 100 MiB`, decompressed stream `<= 512 MiB`, regular files `<= 25 MiB`, total entries `<= 25,000`, entry path length `<= 240`, entry depth `<= 24`, and PAX metadata `<= 64 KiB`.
+- Accepts strictly regular files and directories under a single consistent top-level root directory (stripped deterministically), extracting files exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW`, `0600`) and directories (`0700`) without preserving executable bits, ownership, ACLs, links, devices, FIFOs, or sparse files.
+- Guarantees idempotent containment-validated `cleanup()` on explicit release as well as on parser, limit, truncation, cancellation, or shutdown failure.
 
 ## Commands
 
